@@ -5,21 +5,23 @@ One file, no dependency beyond Python 3.8 or newer. Works on Windows, macOS and 
 Nothing but the Runpod API key is stored on this machine, in a file only your account can read.
 
   python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
+  python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
   python pod.py up image           create a pod for the image sessions (RTX 5090, 100 GB disk)
   python pod.py up video           create a pod for video (RTX PRO 6000, 200 GB disk)
   python pod.py up train           create a pod for LoRA training (RTX PRO 6000, 250 GB disk)
-  python pod.py status [profile]   GPU, data center, cost so far, ComfyUI address, last log lines
+  python pod.py status [profile]   status, GPU, data center, cost so far, ComfyUI address, last log lines
+  python pod.py logs [profile]     follow the pod's log until READY (or Ctrl+C)
   python pod.py open [profile]     open ComfyUI in your browser
   python pod.py push [profile] FILES...   copy images or videos into the pod's input folder
   python pod.py pull [profile]     download the pod's outputs into outputs/<pod name>/
   python pod.py down [profile]     pull, then terminate the pod (billing stops)
-  python pod.py ssh [profile]      a terminal on the pod, when the pod has a public IP
+  python pod.py ssh [profile]      a terminal on the pod
   python pod.py list               every pod of your account, with its hourly price
   python pod.py doctor             check Python, ssh, the API key, the configuration
 
 The pod runs bootstrap.sh from this repository at start: a health check (driver, disk speed,
-download speed), then ComfyUI at a pinned tag, then the models of the profile. Its log lines
-start with [AINVFX]; `up` and `status` read them for you.
+download speed), then ComfyUI at a pinned tag, then the models of the profile, then one test
+image. Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -31,6 +33,7 @@ import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -42,7 +45,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 API = "https://api.runpod.io/v2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
@@ -50,12 +53,15 @@ COMFY_TAG = "v0.38.2"
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
-TEMPLATE_ID = ""             # the public AInVFX template, once created; `setup --template ID` overrides
+TEMPLATE_ID = ""             # the public AInVFX template; `setup --template ID` overrides
+HF_SECRET = "huggingface_token"                   # the Runpod Secret holding your Hugging Face token
+HF_SECRET_REF = "{{ RUNPOD_SECRET_%s }}" % HF_SECRET   # Runpod substitutes the value when the pod boots
 WINDOWS = platform.system() == "Windows"
 CONFIG_DIR = Path.home() / ".ainvfx-runpod"
 CONFIG = CONFIG_DIR / "config.json"
 HERE = Path(__file__).resolve().parent
 OUTPUTS = HERE / "outputs"
+FINAL = ("EXITED", "ERROR", "TERMINATED")
 
 PROFILES = {
     "image": dict(disk=100, gpus=["NVIDIA GeForce RTX 5090",
@@ -67,8 +73,10 @@ PROFILES = {
     "train": dict(disk=250, gpus=["NVIDIA RTX PRO 6000 Blackwell Server Edition",
                                   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]),
 }
-START_CMD = ('bash -c "curl -fsSL {raw}/bootstrap.sh -o /tmp/ainvfx-bootstrap.sh '
-             '&& bash /tmp/ainvfx-bootstrap.sh"').format(raw=REPO_RAW)
+# The same command as the public template. If GitHub cannot be reached, the pod falls back to
+# Runpod's own /start.sh (SSH and JupyterLab), so the error can be read instead of a restart loop.
+START_CMD = ('bash -c "curl -fsSL --retry 5 --retry-delay 3 {raw}/bootstrap.sh -o /tmp/ainvfx-bootstrap.sh '
+             '&& bash /tmp/ainvfx-bootstrap.sh || /start.sh"').format(raw=REPO_RAW)
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -87,7 +95,7 @@ def load_config():
             return json.loads(CONFIG.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             die("{} is unreadable: delete it and run `setup` again".format(CONFIG))
-    return {"api_key": "", "region": "", "template_id": "", "ssh_key": "", "pods": {}}
+    return {"api_key": "", "region": "", "template_id": "", "ssh_key": "", "hf_secret": False, "pods": {}}
 
 
 def save_config(cfg):
@@ -116,8 +124,34 @@ def api_key(cfg):
     return key
 
 
-def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None):
-    """One HTTP request with urllib. Returns parsed JSON (or bytes with raw=True)."""
+class ApiError(Exception):
+    def __init__(self, code, text, url):
+        self.code, self.text, self.url = code, text, url
+        self.detail, self.errors, self.retry_after = text, None, None
+        try:                       # Runpod errors are application/problem+json: title, status, detail, errors
+            prob = json.loads(text)
+            self.detail = prob.get("detail") or prob.get("title") or text
+            self.errors = prob.get("errors")
+        except (ValueError, AttributeError):
+            pass
+        super().__init__("HTTP {} on {}: {}".format(code, url, self.detail))
+
+    def hint(self):
+        if self.code == 401:
+            return "The API key is missing, wrong or expired. Runpod console > Settings > API Keys. Then:  python pod.py setup"
+        if self.code == 403:
+            return "The API key does not allow this call: add the permission to the key (Pods, read and write), or create a new key."
+        if self.code == 402:
+            return "Insufficient balance on the Runpod account: add credit, then try again."
+        if self.code == 429:
+            return "Too many requests: wait a minute, then try again."
+        if self.code == 0:
+            return "No network, or api.runpod.io unreachable from this machine."
+        return ""
+
+
+def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False):
+    """One HTTP request with urllib. Returns parsed JSON, bytes (raw=True), or the open response (stream=True)."""
     data = None
     hdrs = {"Accept": "application/json", "User-Agent": "ainvfx-runpod/" + VERSION}
     if key:
@@ -129,13 +163,18 @@ def request(method, url, key=None, body=None, timeout=60, raw=False, headers=Non
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = r.read()
+        r = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
-        text = e.read().decode("utf-8", "replace")[:600]
-        raise ApiError(e.code, text, url)
+        text = e.read().decode("utf-8", "replace")[:1000]
+        err = ApiError(e.code, text, url)
+        err.retry_after = e.headers.get("Retry-After")
+        raise err
     except urllib.error.URLError as e:
         raise ApiError(0, str(e.reason), url)
+    if stream:
+        return r
+    with r:
+        payload = r.read()
     if raw:
         return payload
     if not payload:
@@ -146,40 +185,8 @@ def request(method, url, key=None, body=None, timeout=60, raw=False, headers=Non
         return {"_text": payload.decode("utf-8", "replace")}
 
 
-class ApiError(Exception):
-    def __init__(self, code, text, url):
-        super().__init__("HTTP {} on {}: {}".format(code, url, text))
-        self.code, self.text, self.url = code, text, url
-
-    def hint(self):
-        if self.code in (401, 403):
-            return ("The API key is missing, wrong, or lacks the permission (pods read and write). "
-                    "Runpod console > Settings > API Keys. Then:  python pod.py setup")
-        if self.code == 0:
-            return "No network, or api.runpod.io unreachable from this machine."
-        return ""
-
-
-def rp(method, path, cfg, body=None, timeout=60, raw=False, headers=None):
-    return request(method, API + path, api_key(cfg), body, timeout, raw, headers)
-
-
-def find(d, *names):
-    """First value found for any of the names, searching nested dicts and lists."""
-    if isinstance(d, dict):
-        for n in names:
-            if n in d and d[n] not in (None, "", [], {}):
-                return d[n]
-        for v in d.values():
-            r = find(v, *names)
-            if r is not None:
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = find(v, *names)
-            if r is not None:
-                return r
-    return None
+def rp(method, path, cfg, body=None, timeout=60, raw=False, headers=None, stream=False):
+    return request(method, API + path, api_key(cfg), body, timeout, raw, headers, stream)
 
 
 def pod_url(pod_id, port=COMFY_PORT):
@@ -187,7 +194,7 @@ def pod_url(pod_id, port=COMFY_PORT):
 
 
 def region_of(dc_id):
-    p = dc_id.upper()
+    p = (dc_id or "").upper()
     if p.startswith(("EU", "EUR")):
         return "EU"
     if p.startswith(("US", "CA")):
@@ -225,32 +232,47 @@ def fmt_money(x):
     return "{:.2f} USD".format(x)
 
 
+def parse_time(s):
+    """An RFC 3339 timestamp from the API ('2026-10-07T14:50:00Z') as an aware datetime."""
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
 # ----------------------------------------------------------------------------- Runpod calls
+# Field names below are those of the Runpod REST API v2 (https://api.runpod.io/v2/openapi.json):
+# status, cost (USD per hour), gpu.id, dataCenterId, cudaVersion, ssh.direct and ssh.proxy,
+# runtime.ports, createdAt. The logs endpoint is a Server-Sent Events stream.
 def get_pod(cfg, pod_id):
     return rp("GET", "/pods/" + pod_id, cfg)
 
 
 def pod_status(pod):
-    s = find(pod, "desiredStatus", "status", "state") or "?"
-    return str(s).upper()
+    return str(pod.get("status") or "?").upper()
 
 
 def pod_price(pod):
-    v = find(pod, "costPerHr", "pricePerHr", "hourlyPrice")
     try:
-        return float(v)
+        return float(pod.get("cost"))
     except (TypeError, ValueError):
         return None
 
 
 def pod_summary(pod):
-    gpu = find(pod, "gpuTypeId", "gpuType", "displayName") or "?"
-    if isinstance(gpu, dict):
-        gpu = gpu.get("displayName") or gpu.get("id") or "?"
-    dc = find(pod, "dataCenterId", "dataCenter") or "?"
-    if isinstance(dc, dict):
-        dc = dc.get("id", "?")
+    gpu = (pod.get("gpu") or {}).get("id") or "?"
+    dc = pod.get("dataCenterId") or "?"
     return str(gpu), str(dc), pod_price(pod)
+
+
+def pod_ssh(pod):
+    """(kind, host, port, user): 'direct' (full ssh, scp, rsync) if 22/tcp got a public port, else 'proxy' (shell only)."""
+    ssh = pod.get("ssh") or {}
+    for kind in ("direct", "proxy"):
+        c = ssh.get(kind)
+        if c and c.get("host") and c.get("port") and c.get("username"):
+            return kind, c["host"], int(c["port"]), c["username"]
+    return None, None, None, None
 
 
 def gpu_catalog(cfg, gpu_id):
@@ -258,26 +280,93 @@ def gpu_catalog(cfg, gpu_id):
     return rp("GET", "/catalog/gpus/{}?{}".format(urllib.parse.quote(gpu_id, safe=""), q), cfg)
 
 
-def pod_logs(cfg, pod_id, max_bytes=200_000):
-    """The pod's container log as text. The endpoint streams; we read a bounded chunk."""
+def list_pods(cfg, quiet=False):
+    pods, cursor = [], None
+    while True:
+        q = "?" + urllib.parse.urlencode({"cursor": cursor}) if cursor else ""
+        data = rp("GET", "/pods" + q, cfg)
+        pods += data.get("pods") or []
+        cursor = (data.get("pagination") or {}).get("nextCursor")
+        if not cursor:
+            break
+    if not quiet:
+        if not pods:
+            say("No pod in your account.")
+        for p in pods:
+            gpu, dc, price = pod_summary(p)
+            say("{:<28} {:<12} {:<40} {:<10} {}".format(
+                str(p.get("name") or "?")[:28], pod_status(p)[:12], gpu[:40], dc[:10],
+                (fmt_money(price) + "/h") if price else ""))
+            say("    id {}   ComfyUI {}".format(p.get("id"), pod_url(str(p.get("id")))))
+    return pods
+
+
+def secrets_named(cfg):
+    data = rp("GET", "/account/secrets?" + urllib.parse.urlencode({"name": HF_SECRET}), cfg)
+    items = data if isinstance(data, list) else (data.get("secrets") or data.get("items") or [])
+    return [s for s in items if isinstance(s, dict) and str(s.get("name", "")).lower() == HF_SECRET]
+
+
+def secret_exists(cfg):
+    """True when the account holds the Hugging Face secret; None when the key cannot list secrets."""
     try:
-        data = rp("GET", "/pods/{}/logs".format(pod_id), cfg, timeout=25, raw=True,
-                  headers={"Accept": "text/plain, application/json"})
+        return bool(secrets_named(cfg))
+    except ApiError:
+        return None
+
+
+def log_stream(cfg, pod_id, tail=200, last_id=None, source=None, idle=20):
+    """Yield (event_id, source, line) from GET /pods/{id}/logs, a Server-Sent Events stream
+    (one `id:` line and one `data:` JSON line per event, with ts, source and line).
+    `tail` lines are sent first, then live lines. Stops after `idle` seconds without data."""
+    q = {}
+    hdrs = {"Accept": "text/event-stream"}
+    if last_id:
+        hdrs["Last-Event-ID"] = last_id      # resume where the previous read stopped
+    else:
+        q["tail"] = tail
+    if source:
+        q["source"] = source
+    url = "/pods/{}/logs".format(pod_id) + ("?" + urllib.parse.urlencode(q) if q else "")
+    r = rp("GET", url, cfg, timeout=idle, headers=hdrs, stream=True)
+    eid = None
+    try:
+        while True:
+            try:
+                raw = r.readline()
+            except (socket.timeout, TimeoutError, OSError):
+                return
+            if not raw:
+                return
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("id:"):
+                eid = line[3:].strip()
+            elif line.startswith("data:"):
+                payload = line[5:].strip()
+                try:
+                    ev = json.loads(payload)
+                except ValueError:
+                    ev = {"line": payload}
+                if isinstance(ev, dict):
+                    yield eid, str(ev.get("source") or ""), str(ev.get("line") or "")
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def pod_logs(cfg, pod_id, tail=400, seconds=10):
+    """The last `tail` container log lines, as a list of strings (the stream is left after `seconds`)."""
+    lines, t0 = [], time.time()
+    try:
+        for _, _, line in log_stream(cfg, pod_id, tail=tail, source="container", idle=3):
+            if line:
+                lines.append(line)
+            if time.time() - t0 > seconds:
+                break
     except ApiError as e:
         return None, e
-    text = data.decode("utf-8", "replace")[-max_bytes:]
-    lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("data:"):              # server-sent events
-            line = line[5:].strip()
-        if line.startswith("{"):                  # JSON lines
-            try:
-                line = str(find(json.loads(line), "message", "log", "line", "text") or line)
-            except ValueError:
-                pass
-        if line:
-            lines.append(line)
     return lines, None
 
 
@@ -285,26 +374,73 @@ def ainvfx_lines(lines):
     return [l for l in lines if "[AINVFX]" in l]
 
 
+def comfy_alive(pod_id):
+    try:
+        request("GET", pod_url(pod_id) + "/system_stats", timeout=8)
+        return True
+    except ApiError:
+        return False
+
+
+def follow_logs(cfg, pod_id, minutes=25):
+    """Print the [AINVFX] lines as they appear, until READY, a dead pod, or the time runs out."""
+    deadline = time.time() + minutes * 60
+    seen, last_id, told, last_check = set(), None, False, time.time()
+    while time.time() < deadline:
+        try:
+            for eid, _, line in log_stream(cfg, pod_id, tail=500 if last_id is None else 0,
+                                           last_id=last_id, idle=30):
+                last_id = eid or last_id
+                if "[AINVFX]" in line and line not in seen:
+                    seen.add(line)
+                    say("  " + line[line.index("[AINVFX]"):])
+                    if "READY" in line:
+                        return True
+                if time.time() > deadline:
+                    break
+        except ApiError as e:
+            if not told:
+                say("(the log cannot be read through the API from here: {}. Follow it in the console, "
+                    "Pods > your pod > Logs. The ComfyUI address answers once the log says COMFYUI UP.)".format(e.detail))
+                told = True
+            if comfy_alive(pod_id):
+                say("ComfyUI answers: {}".format(pod_url(pod_id)))
+                return True
+            time.sleep(15)
+        # the stream went quiet: make sure the pod is still alive
+        if time.time() - last_check > 45:
+            last_check = time.time()
+            try:
+                st = pod_status(get_pod(cfg, pod_id))
+                if st in FINAL:
+                    say("The pod is {}. Read its log in the console, then `python pod.py down` and `up` again.".format(st))
+                    return False
+            except ApiError:
+                pass
+    say("Still working after {} minutes: check `python pod.py status`.".format(minutes))
+    return False
+
+
 # ----------------------------------------------------------------------------- commands
 def cmd_setup(args):
     cfg = load_config()
     say("ainvfx-runpod {} · setup".format(VERSION))
-    key = args.key or os.environ.get("RUNPOD_API_KEY", "")
+    key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
     if not key:
         say("\n1. Your Runpod API key. Console > Settings > API Keys > Create API Key.")
-        say("   Permission: Restricted, with Read/Write on Pods (nothing else is needed).")
+        say("   Permission: Restricted, with read and write on Pods (add Secrets and SSH keys if you use")
+        say("   `--hf-token` or `pod.py ssh`; otherwise do those two in the console).")
         say("   Paste it below (nothing shows while you type), then Enter.")
         key = getpass.getpass("   API key: ").strip()
     if not key:
         die("empty key")
     cfg["api_key"] = key
-    say("   checking the key...", )
+    say("   checking the key...")
     try:
-        pods = rp("GET", "/pods", cfg)
+        pods = list_pods(cfg, quiet=True)
     except ApiError as e:
         die("the key does not work: {}\n{}".format(e, e.hint()))
-    n = len(pods if isinstance(pods, list) else find(pods, "pods", "items") or [])
-    say("   ok ({} pod(s) in the account right now)".format(n))
+    say("   ok ({} pod(s) in the account right now)".format(len(pods)))
 
     region = args.region or cfg.get("region") or local_region()
     say("\n2. Your region, for the nearest data centers: {} (EU or NA; `setup --region NA` to change)".format(region))
@@ -315,7 +451,36 @@ def cmd_setup(args):
         cfg["template_id"] = TEMPLATE_ID
     say("   template: {}".format(cfg["template_id"] or "none (the pod is described by this script itself)"))
 
-    say("\n3. SSH key (optional: only for `pod.py ssh`; everything else goes through the browser).")
+    say("\n3. Hugging Face token (optional: only the gated LTX files need it, for the video and LoRA sessions).")
+    if args.hf_token:
+        say("   The token is stored on Runpod as the secret '{}' and never on this machine. Pods created".format(HF_SECRET))
+        say("   by `up` receive it as HF_TOKEN. A read token from https://huggingface.co/settings/tokens.")
+        token = getpass.getpass("   Hugging Face token: ").strip()
+        if token:
+            try:
+                rp("POST", "/account/secrets", cfg,
+                   body={"name": HF_SECRET, "value": token, "description": "Hugging Face read token (ainvfx-runpod)"})
+                say("   secret '{}' created".format(HF_SECRET))
+                cfg["hf_secret"] = True
+            except ApiError as e:
+                if e.code == 409:              # the name exists: rotate its value
+                    try:
+                        sid = secrets_named(cfg)[0]["id"]
+                        rp("PATCH", "/account/secrets/" + sid, cfg, body={"value": token})
+                        say("   secret '{}' updated".format(HF_SECRET))
+                        cfg["hf_secret"] = True
+                    except (ApiError, IndexError, KeyError) as e2:
+                        say("   could not update the secret: {}".format(e2))
+                else:
+                    say("   could not store the secret ({}): {}".format(e.code, e.hint() or e.detail))
+                    say("   Console > Settings > Secrets > name '{}', value: your token.".format(HF_SECRET))
+    else:
+        found = secret_exists(cfg)
+        cfg["hf_secret"] = bool(found)
+        say("   secret '{}': {}. To store a token:  python pod.py setup --hf-token".format(
+            HF_SECRET, "present" if found else "absent" if found is False else "unknown (the key cannot list secrets)"))
+
+    say("\n4. SSH key (optional: only for `pod.py ssh`; everything else goes through the browser).")
     if shutil.which("ssh") and shutil.which("ssh-keygen"):
         keyfile = Path(cfg.get("ssh_key") or Path.home() / ".ssh" / "id_ed25519")
         pub = keyfile.with_name(keyfile.name + ".pub")
@@ -328,12 +493,9 @@ def cmd_setup(args):
         if pub.exists():
             pubkey = pub.read_text(encoding="utf-8").strip()
             try:
-                current = rp("GET", "/account/ssh-keys", cfg)
-                keys = find(current, "keys") or []
-                keys = [k for k in keys if isinstance(k, str)]
+                keys = [k for k in (rp("GET", "/account/ssh-keys", cfg).get("keys") or []) if isinstance(k, str)]
                 if not any(pubkey.split()[1] in k for k in keys if len(k.split()) > 1):
-                    keys.append(pubkey)
-                    rp("PUT", "/account/ssh-keys", cfg, body={"keys": keys})
+                    rp("PUT", "/account/ssh-keys", cfg, body={"keys": keys + [pubkey]})   # PUT replaces the full set
                     say("   public key registered on your Runpod account")
                 else:
                     say("   public key already registered")
@@ -341,13 +503,37 @@ def cmd_setup(args):
                 if WINDOWS:
                     restrict(keyfile)
             except ApiError as e:
-                say("   could not register the key ({}): `pod.py ssh` will not work, the rest will".format(e.code))
+                say("   could not register the key ({}): `pod.py ssh` will not work, the rest will. "
+                    "Console > Settings > SSH Public Keys.".format(e.code))
     else:
         say("   no `ssh` on this machine: skipped. JupyterLab's terminal replaces it on the pod.")
     cfg.setdefault("pods", {})
     save_config(cfg)
     say("\nSaved in {} (readable by your account only).".format(CONFIG))
     say("Next:  python pod.py up image")
+
+
+def create_pod(cfg, body, where):
+    """POST /pods for one candidate. Returns the pod, or None to try the next candidate.
+    Retry rules from the API reference: 422 fix and stop, 402 stop, 400 next candidate,
+    403 skip, 429 wait then retry, 5xx retry once."""
+    for attempt in range(3):
+        try:
+            return rp("POST", "/pods", cfg, body=body, timeout=120)
+        except ApiError as e:
+            if e.code in (401, 402, 404, 422):
+                detail = e.detail if not e.errors else "{} {}".format(e.detail, json.dumps(e.errors)[:400])
+                die("{}: {}\n{}".format(e.code, detail, e.hint()))
+            if e.code == 429:
+                wait = int(e.retry_after or 10)
+                say("   rate limited: waiting {} s".format(wait)); time.sleep(wait); continue
+            if e.code >= 500 and attempt < 2:
+                say("   {}: Runpod error {}, retrying".format(where, e.code)); time.sleep(5); continue
+            if e.code == 403:
+                say("   {}: not accessible with this account (403), skipped".format(where)); return None
+            say("   {}: no machine ({}: {})".format(where, e.code, e.detail[:160].replace("\n", " ")))
+            return None
+    return None
 
 
 def cmd_up(args):
@@ -360,7 +546,7 @@ def cmd_up(args):
         try:
             pod = get_pod(cfg, old["id"])
             st = pod_status(pod)
-            if "TERMINATED" not in st and "EXITED" not in st and st != "?":
+            if st not in FINAL and st != "?":
                 say("A pod already exists for '{}': {} ({}). Address: {}".format(
                     profile, old.get("name"), st, pod_url(old["id"])))
                 say("Use it, or terminate it first:  python pod.py down {}".format(profile))
@@ -376,17 +562,19 @@ def cmd_up(args):
     gpus = [args.gpu] if args.gpu else spec["gpus"]
     name = "ainvfx-{}-{}".format(profile, datetime.now().strftime("%m%d-%H%M"))
     env = {"AINVFX_PROFILE": profile, "AINVFX_COMFY_TAG": COMFY_TAG}
-    if os.environ.get("HF_TOKEN"):
-        env["HF_TOKEN"] = os.environ["HF_TOKEN"]
+    if cfg.get("hf_secret") or secret_exists(cfg):
+        env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
+    if not args.selftest:
+        env["AINVFX_SELFTEST"] = "0"
 
     created = None
     for gpu in gpus:
         try:
             cat = gpu_catalog(cfg, gpu)
         except ApiError as e:
-            say("catalog: {} ({})".format(gpu, e.code))
+            say("catalog: {} ({}: {})".format(gpu, e.code, e.detail[:100]))
             continue
-        price = cat.get("price", {}) if isinstance(cat, dict) else {}
+        price = cat.get("price") or {}
         p_secure, p_comm = price.get("secure"), price.get("community")
         dcs = [d.get("id") for d in (cat.get("dataCenters") or []) if d.get("id")
                and str(d.get("availability", "")).upper() not in ("NONE", "")]
@@ -407,34 +595,31 @@ def cmd_up(args):
             attempts.append(("COMMUNITY", []))
         for cloud, dc_list in attempts:
             body = {"name": name, "cloud": cloud, "disk": disk, "env": env,
-                    "ports": ["{}/http".format(COMFY_PORT), "{}/http".format(JUPYTER_PORT), "22/tcp"],
                     "startSsh": True, "startJupyter": True,
                     "gpu": {"id": gpu, "count": 1, "minCudaVersion": MIN_CUDA}}
             if dc_list:
                 body["dataCenterIds"] = dc_list
             if cfg.get("template_id"):
-                body["templateId"] = cfg["template_id"]
+                body["templateId"] = cfg["template_id"]      # image, command, ports come from the template
             else:
                 body["image"] = IMAGE
                 body["args"] = START_CMD
+                body["ports"] = ["{}/http".format(COMFY_PORT), "{}/http".format(JUPYTER_PORT), "22/tcp"]
             where = "{} {}".format(cloud, dc_list[0] if dc_list else "(any data center)")
-            try:
-                created = rp("POST", "/pods", cfg, body=body, timeout=120)
-                say("   created on {}: pod {}".format(where, created.get("id", "?")))
+            created = create_pod(cfg, body, where)
+            if created and created.get("id"):
+                say("   created on {}: pod {}".format(where, created["id"]))
                 break
-            except ApiError as e:
-                if e.code in (401, 403):
-                    die("{}\n{}".format(e, e.hint()))
-                say("   {}: no machine ({}: {})".format(where, e.code, e.text[:120].replace("\n", " ")))
+            created = None
         if created:
             break
-    if not created or not created.get("id"):
+    if not created:
         die("no pod could be created. Try again in a few minutes, another profile, or the Runpod console.")
 
     pod_id = created["id"]
     cfg["pods"][profile] = {"id": pod_id, "name": name, "created": datetime.now(timezone.utc).isoformat()}
     save_config(cfg)
-    say("\nWaiting for the machine...")
+    say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
     wait_until = time.time() + 15 * 60
     pod = created
     while time.time() < wait_until:
@@ -443,49 +628,24 @@ def cmd_up(args):
         except ApiError:
             pass
         st = pod_status(pod)
-        if "RUNNING" in st:
+        if st == "RUNNING":
             break
+        if st in FINAL:
+            die("the pod is {} before it ran. Read its log in the console, then `python pod.py down {}` and try again.".format(st, profile))
         time.sleep(8)
     gpu, dc, price = pod_summary(pod)
-    say("Pod {} · {} · {} · {}".format(name, gpu, dc, (fmt_money(price) + " per hour") if price else "price in the console"))
+    say("Pod {} · {} · {} · CUDA {} · {}".format(name, gpu, dc, pod.get("cudaVersion") or "?",
+                                                   (fmt_money(price) + " per hour") if price else "price in the console"))
     say("ComfyUI address (ready once the log says COMFYUI UP): {}".format(pod_url(pod_id)))
-    say("JupyterLab: {}  (password under Connect in the console)\n".format(pod_url(pod_id, JUPYTER_PORT)))
+    say("JupyterLab: {}  (token under Connect in the console)\n".format(pod_url(pod_id, JUPYTER_PORT)))
     follow_logs(cfg, pod_id, minutes=args.wait)
     say("\nWhen you are done:  python pod.py down {}".format(profile))
 
 
-def follow_logs(cfg, pod_id, minutes=25):
-    """Print the [AINVFX] lines as they appear, until READY or the time runs out."""
-    seen = set()
-    deadline = time.time() + minutes * 60
-    unavailable_told = False
-    while time.time() < deadline:
-        lines, err = pod_logs(cfg, pod_id)
-        if err is not None:
-            if not unavailable_told:
-                say("(the log cannot be read through the API from here: {}. Follow it in the console, "
-                    "Pods > your pod > Logs. The address above answers once the log says COMFYUI UP.)".format(err.code))
-                unavailable_told = True
-            if comfy_alive(pod_id):
-                say("ComfyUI answers: {}".format(pod_url(pod_id)))
-                return
-        else:
-            for l in ainvfx_lines(lines):
-                if l not in seen:
-                    seen.add(l)
-                    say("  " + l[l.index("[AINVFX]"):])
-                    if "READY" in l:
-                        return
-        time.sleep(10)
-    say("Still working after {} minutes: check `python pod.py status`.".format(minutes))
-
-
-def comfy_alive(pod_id):
-    try:
-        request("GET", pod_url(pod_id) + "/system_stats", timeout=8)
-        return True
-    except ApiError:
-        return False
+def cmd_logs(args):
+    cfg = load_config()
+    rec = recorded_pod(cfg, profile_of(cfg, args.profile))
+    follow_logs(cfg, rec["id"], minutes=args.wait)
 
 
 def cmd_status(args):
@@ -500,19 +660,23 @@ def cmd_status(args):
         die("{}\n{}".format(e, e.hint()))
     gpu, dc, price = pod_summary(pod)
     st = pod_status(pod)
-    say("{} · {} · {} · {}".format(rec.get("name"), gpu, dc, st))
-    try:
-        created = datetime.fromisoformat(rec["created"])
+    say("{} · {} · {} · CUDA {} · {}".format(rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
+    created = parse_time(pod.get("createdAt") or "") or parse_time(rec.get("created", ""))
+    if created and price:
         hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
-        if price:
-            say("running for {:.1f} h · about {} spent so far at {} per hour".format(hours, fmt_money(hours * price), fmt_money(price)))
-    except (KeyError, ValueError):
-        pass
+        say("running for {:.1f} h · about {} spent so far at {} per hour".format(hours, fmt_money(hours * price), fmt_money(price)))
+    rt = pod.get("runtime") or {}
+    if rt.get("gpus"):
+        g = rt["gpus"][0]
+        say("GPU in use: {}% · VRAM {}%".format(g.get("util", "?"), g.get("memoryUtil", "?")))
     say("ComfyUI: {}  ({})".format(pod_url(rec["id"]), "answers" if comfy_alive(rec["id"]) else "not answering yet"))
     say("JupyterLab: {}".format(pod_url(rec["id"], JUPYTER_PORT)))
+    kind, host, port, user = pod_ssh(pod)
+    if kind:
+        say("SSH ({}): ssh -p {} {}@{}".format(kind, port, user, host))
     lines, err = pod_logs(cfg, rec["id"])
     if err is not None:
-        say("log: not readable through the API ({}); open it in the console".format(err.code))
+        say("log: not readable through the API ({}); open it in the console".format(err.detail))
     else:
         for l in ainvfx_lines(lines)[-15:]:
             say("  " + l[l.index("[AINVFX]"):])
@@ -570,6 +734,7 @@ def cmd_pull(args):
 
 
 def pull(cfg, rec):
+    """Every output file listed in ComfyUI's history, through the pod's own HTTP endpoints."""
     base = pod_url(rec["id"])
     if not comfy_alive(rec["id"]):
         say("ComfyUI does not answer on the pod: nothing to pull through it.")
@@ -621,7 +786,7 @@ def cmd_down(args):
             say("Kept running. Remember: it bills until terminated.")
             return
     try:
-        rp("DELETE", "/pods/" + rec["id"], cfg)
+        rp("DELETE", "/pods/" + rec["id"], cfg)          # DELETE /pods/{id}: terminate, 204 no body
         say("Terminated: {}".format(rec.get("name")))
     except ApiError as e:
         if e.code == 404:
@@ -630,29 +795,17 @@ def cmd_down(args):
             die("{}\n{}".format(e, e.hint()))
     cfg["pods"].pop(profile, None)
     save_config(cfg)
-    remaining = list_pods(cfg, quiet=True)
-    running = [p for p in remaining if "RUNNING" in pod_status(p)]
+    try:
+        remaining = list_pods(cfg, quiet=True)
+    except ApiError:
+        return
+    running = [p for p in remaining if pod_status(p) not in FINAL]
     if running:
-        say("Attention: {} other pod(s) still running in your account:".format(len(running)))
+        say("Attention: {} other pod(s) still in your account:".format(len(running)))
         for p in running:
-            say("  - {}".format(find(p, "name") or find(p, "id")))
+            say("  - {} ({})".format(p.get("name") or p.get("id"), pod_status(p)))
     else:
         say("No pod running in your account. Nothing bills.")
-
-
-def list_pods(cfg, quiet=False):
-    data = rp("GET", "/pods", cfg)
-    pods = data if isinstance(data, list) else (find(data, "pods", "items") or [])
-    if not quiet:
-        if not pods:
-            say("No pod in your account.")
-        for p in pods:
-            gpu, dc, price = pod_summary(p)
-            say("{:<28} {:<10} {:<36} {:<10} {}".format(
-                str(find(p, "name") or "?")[:28], pod_status(p)[:10], gpu[:36], dc[:10],
-                (fmt_money(price) + "/h") if price else ""))
-            say("    id {}   ComfyUI {}".format(find(p, "id"), pod_url(str(find(p, "id")))))
-    return pods
 
 
 def cmd_list(args):
@@ -664,21 +817,16 @@ def cmd_ssh(args):
     cfg = load_config()
     rec = recorded_pod(cfg, profile_of(cfg, args.profile))
     pod = get_pod(cfg, rec["id"])
-    ip = find(pod, "publicIp", "ip")
-    port = None
-    for m in (find(pod, "portMappings", "ports") or []):
-        if isinstance(m, dict):
-            internal = m.get("privatePort") or m.get("internalPort") or m.get("private")
-            if str(internal) == "22":
-                port = m.get("publicPort") or m.get("externalPort") or m.get("public")
-                ip = m.get("ip") or m.get("publicIp") or ip
-        elif isinstance(m, str) and m.startswith("22"):
-            port = m.split(":")[-1]
-    if not ip or not port:
-        die("this pod has no public SSH port (Community Cloud pods often do not). "
-            "Use JupyterLab's terminal: " + pod_url(rec["id"], JUPYTER_PORT))
-    key = cfg.get("ssh_key") or str(Path.home() / ".ssh" / "id_ed25519")
-    cmd = ["ssh", "-p", str(port), "-i", key, "-o", "StrictHostKeyChecking=accept-new", "root@{}".format(ip)]
+    kind, host, port, user = pod_ssh(pod)
+    if not kind:
+        die("no SSH address yet (the pod is {}). Use JupyterLab's terminal: {}".format(
+            pod_status(pod), pod_url(rec["id"], JUPYTER_PORT)))
+    if kind == "proxy":
+        say("(through Runpod's SSH proxy: a shell only, no scp or rsync; the pod has no public port for 22/tcp)")
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=accept-new"]
+    if cfg.get("ssh_key"):
+        cmd += ["-i", cfg["ssh_key"]]
+    cmd.append("{}@{}".format(user, host))
     if args.command:
         cmd += args.command
     say(" ".join(cmd))
@@ -699,6 +847,9 @@ def cmd_doctor(args):
             say("  API          ok, {} pod(s) in the account".format(len(pods)))
         except ApiError as e:
             say("  API          FAILED: {} · {}".format(e, e.hint()))
+        found = secret_exists(cfg)
+        say("  HF secret    {}".format("present" if found else "absent (setup --hf-token)" if found is False
+                                       else "unknown: the key cannot list secrets"))
     for prof, rec in (cfg.get("pods") or {}).items():
         say("  pod {:<8} {} ({})".format(prof, rec.get("name"), rec.get("id")))
 
@@ -709,10 +860,11 @@ def main():
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("setup", help="API key, region, SSH key")
+    p = sub.add_parser("setup", help="API key, region, Hugging Face secret, SSH key")
     p.add_argument("--key", help="the Runpod API key (otherwise asked, hidden)")
     p.add_argument("--region", choices=["EU", "NA"], help="nearest data centers first")
     p.add_argument("--template", help="a Runpod template id to create pods from")
+    p.add_argument("--hf-token", action="store_true", help="store a Hugging Face token as the Runpod secret")
     p.add_argument("-y", "--yes", action="store_true")
     p.set_defaults(func=cmd_setup)
 
@@ -722,11 +874,17 @@ def main():
     p.add_argument("--disk", type=int, help="container disk in GB")
     p.add_argument("--region", choices=["EU", "NA"])
     p.add_argument("--secure-only", action="store_true", help="never fall back to Community Cloud")
+    p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
     p.set_defaults(func=cmd_up)
 
-    for name, fn, hlp in (("status", cmd_status, "GPU, cost, address, log"),
+    p = sub.add_parser("logs", help="follow the log until READY")
+    p.add_argument("profile", nargs="?")
+    p.add_argument("--wait", type=int, default=25, help="minutes (default 25)")
+    p.set_defaults(func=cmd_logs)
+
+    for name, fn, hlp in (("status", cmd_status, "status, GPU, cost, address, log"),
                           ("open", cmd_open, "open ComfyUI in the browser"),
                           ("pull", cmd_pull, "download the outputs")):
         p = sub.add_parser(name, help=hlp)
