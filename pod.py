@@ -20,9 +20,10 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py doctor             check Python, ssh, the API key, the configuration
 
 The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
-(driver, disk speed, download speed), then ComfyUI at a pinned tag, then the models of the profile,
-then one test image. Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you.
-On the test pod (RTX 5090, 4 Oct 2026) the log said READY about 15 minutes after creation.
+(driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each with its
+download speed), then one test image. Its log lines start with [AINVFX]; `up`, `logs` and `status`
+read them for you, from the API log stream and from the copy the pod serves through its proxy.
+Measured on two RTX 5090 pods (4 and 5 Oct 2026): READY 5 to 15 minutes after creation.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -43,11 +44,11 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.3"
-API = "https://api.runpod.io/v2"
+VERSION = "0.3.0"
+API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
 COMFY_TAG = "v0.38.2"
@@ -61,7 +62,7 @@ WINDOWS = platform.system() == "Windows"
 CONFIG_DIR = Path.home() / ".ainvfx-runpod"
 CONFIG = CONFIG_DIR / "config.json"
 HERE = Path(__file__).resolve().parent
-OUTPUTS = HERE / "outputs"
+OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")   # where `pull` puts the files
 FINAL = ("EXITED", "ERROR", "TERMINATED")
 
 PROFILES = {
@@ -191,7 +192,30 @@ def rp(method, path, cfg, body=None, timeout=60, raw=False, headers=None, stream
 
 
 def pod_url(pod_id, port=COMFY_PORT):
-    return "https://{}-{}.proxy.runpod.net".format(pod_id, port)
+    fmt = os.environ.get("AINVFX_PROXY_FMT", "https://{id}-{port}.proxy.runpod.net")   # the test harness overrides it
+    return fmt.format(id=pod_id, port=port)
+
+
+# The bootstrap writes its log inside ComfyUI's input folder, so the log is also readable through the
+# proxy once ComfyUI answers: a second way to see READY when the API log stream misses it.
+LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
+
+
+def proxy_log(pod_id):
+    """The [AINVFX] lines of the bootstrap log, read through the pod's own ComfyUI; [] when not readable."""
+    try:
+        data = request("GET", pod_url(pod_id) + LOG_VIEW, timeout=10, raw=True)
+    except ApiError:
+        return []
+    return [l for l in data.decode("utf-8", "replace").splitlines() if "[AINVFX]" in l]
+
+
+REGION_NAMES = {"EU": "Europe", "NA": "North America"}
+# Runpod data center ids start with the country: CA-MTL-1, US-TX-3, EU-FR-1, EUR-IS-2, EU-CZ-1.
+CANADA_ZONES = ("Toronto", "Montreal", "Vancouver", "Edmonton", "Winnipeg", "Halifax", "Regina", "St_Johns",
+                "Moncton", "Whitehorse", "Yellowknife", "Iqaluit", "Calgary")
+EUROPE_CITY_COUNTRY = {"Paris": "FR", "Prague": "CZ", "Bucharest": "RO", "Amsterdam": "NL", "Stockholm": "SE",
+                       "Reykjavik": "IS", "Oslo": "NO"}
 
 
 def region_of(dc_id):
@@ -203,10 +227,59 @@ def region_of(dc_id):
     return "OTHER"
 
 
+def country_of(dc_id):
+    """'CA' for CA-MTL-1, 'FR' for EU-FR-1, 'IS' for EUR-IS-2, 'US' for US-TX-3."""
+    parts = (dc_id or "").upper().split("-")
+    if len(parts) >= 3 and parts[0] in ("EU", "EUR"):
+        return parts[1]
+    return parts[0] if parts else ""
+
+
+def local_zone():
+    """This computer's time zone name (America/Toronto, Europe/Paris, or a Windows name), or ''."""
+    tz = os.environ.get("TZ", "")
+    if tz:
+        return tz
+    try:
+        if WINDOWS:
+            return subprocess.run(["tzutil", "/g"], capture_output=True, text=True, timeout=5).stdout.strip()
+        for cand in ("/etc/localtime", "/var/db/timezone/localtime"):
+            if os.path.islink(cand):
+                target = os.readlink(cand)
+                if "zoneinfo/" in target:
+                    return target.split("zoneinfo/", 1)[1]
+        if os.path.exists("/etc/timezone"):
+            return open("/etc/timezone", encoding="utf-8").read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def local_place():
+    """(region, country) guessed from this computer's clock: ('NA', 'CA') for America/Toronto,
+    ('EU', 'FR') for Europe/Paris, ('EU', '') for Europe/Berlin, ('NA', 'US') for America/Chicago."""
+    zone = local_zone()
+    city = zone.split("/")[-1] if "/" in zone else ""
+    if zone.startswith("Canada/") or (zone.startswith("America/") and city in CANADA_ZONES):
+        return "NA", "CA"
+    if zone.startswith(("America/", "US/")) or zone.endswith("Standard Time") and any(
+            k in zone for k in ("Eastern", "Central", "Mountain", "Pacific", "Atlantic", "Alaskan", "Hawaiian")):
+        return "NA", "US"
+    if zone.startswith("Europe/"):
+        return "EU", EUROPE_CITY_COUNTRY.get(city, "")
+    offset_h = (time.localtime().tm_gmtoff or 0) / 3600          # no zone name: the UTC offset decides
+    return ("NA", "") if offset_h <= -2 else ("EU", "")
+
+
 def local_region():
-    """EU or NA from this machine's UTC offset; a guess the person can change in `setup`."""
-    offset_h = (time.localtime().tm_gmtoff or 0) / 3600
-    return "NA" if offset_h <= -2 else "EU"
+    return local_place()[0]
+
+
+def dc_order(dc_id, region, country):
+    """Sort key: the person's country first, then the rest of their region, then the other main region."""
+    same_region = region_of(dc_id) == region
+    return (0 if country and same_region and country_of(dc_id) == country else
+            1 if same_region else 2 if region_of(dc_id) in REGION_NAMES else 3)
 
 
 def profile_of(cfg, name):
@@ -316,14 +389,15 @@ def secret_exists(cfg):
         return None
 
 
-def log_stream(cfg, pod_id, tail=200, last_id=None, source=None, idle=20):
+def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20):
     """Yield (event_id, source, line) from GET /pods/{id}/logs, a Server-Sent Events stream
-    (one `id:` line and one `data:` JSON line per event, with ts, source and line).
-    `tail` lines are sent first, then live lines. Stops after `idle` seconds without data."""
+    (one `id:` line and one `data:` JSON line per event, with ts, source and line; the id is the ts).
+    `tail` lines are sent first, then live lines; with `since` (an RFC 3339 time) the stream resumes
+    from that time instead. Stops after `idle` seconds without data."""
     q = {}
     hdrs = {"Accept": "text/event-stream"}
-    if last_id:
-        hdrs["Last-Event-ID"] = last_id      # resume where the previous read stopped
+    if since:
+        q["since"] = since
     else:
         q["tail"] = tail
     if source:
@@ -383,32 +457,47 @@ def comfy_alive(pod_id):
         return False
 
 
+def resume_point(event_id, seconds=5):
+    """An RFC 3339 time a few seconds before the given event id (itself a time), so that a reconnect
+    overlaps the lines already seen instead of skipping those written in the same second."""
+    t = parse_time(event_id or "")
+    if not t:
+        return None
+    return (t - timedelta(seconds=seconds)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def follow_logs(cfg, pod_id, minutes=25):
-    """Print the [AINVFX] lines as they appear, until READY, a dead pod, or the time runs out."""
+    """Print the [AINVFX] lines as they appear, until READY, a dead pod, or the time runs out.
+    Two sources: the API log stream (reconnected with an overlap when it goes quiet) and, once
+    ComfyUI answers, the copy of the log the pod serves through the proxy."""
     deadline = time.time() + minutes * 60
-    seen, last_id, told, last_check = set(), None, False, time.time()
+    seen, printed, last_id, told, last_check = set(), set(), None, False, time.time()
+
+    def show(line, key):
+        if key in seen or line in printed:
+            return False
+        seen.add(key); printed.add(line)
+        say("  " + line[line.index("[AINVFX]"):])
+        return "READY" in line
+
     while time.time() < deadline:
         try:
-            for eid, _, line in log_stream(cfg, pod_id, tail=500 if last_id is None else 0,
-                                           last_id=last_id, idle=30):
+            for eid, _, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=30):
                 last_id = eid or last_id
-                if "[AINVFX]" in line and line not in seen:
-                    seen.add(line)
-                    say("  " + line[line.index("[AINVFX]"):])
-                    if "READY" in line:
-                        return True
+                if "[AINVFX]" in line and show(line, (eid, line)):
+                    return True
                 if time.time() > deadline:
                     break
         except ApiError as e:
             if not told:
                 say("(the log cannot be read through the API from here: {}. Follow it in the console, "
-                    "Pods > your pod > Logs. The ComfyUI address answers once the log says COMFYUI UP.)".format(e.detail))
+                    "Pods > your pod > Logs, or wait: the pod's own copy is read below.)".format(e.detail))
                 told = True
-            if comfy_alive(pod_id):
-                say("ComfyUI answers: {}".format(pod_url(pod_id)))
+            time.sleep(10)
+        # the stream went quiet: the pod's own copy of the log is the second source
+        for line in proxy_log(pod_id):
+            if show(line, ("proxy", line)):
                 return True
-            time.sleep(15)
-        # the stream went quiet: make sure the pod is still alive
         if time.time() - last_check > 45:
             last_check = time.time()
             try:
@@ -418,7 +507,7 @@ def follow_logs(cfg, pod_id, minutes=25):
                     return False
             except ApiError:
                 pass
-    say("Still working after {} minutes: check `python pod.py status`.".format(minutes))
+    say("Still working after {} minutes: `python pod.py status` shows where it is.".format(minutes))
     return False
 
 
@@ -429,6 +518,7 @@ def cmd_setup(args):
     key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
     if not key:
         say("\n1. Your Runpod API key. Console > Account > Credentials > API Keys > Create API Key.")
+        say("   Name: ainvfx-runpod (any name works; this one says what the key is for).")
         say("   Permission: Restricted. Then two lines appear:")
         say("     api.runpod.io/graphql  ->  Read / Write   (the API this script uses: pods, catalog, secrets, SSH keys)")
         say("     api.runpod.ai          ->  None           (Serverless endpoints, not used here)")
@@ -444,9 +534,15 @@ def cmd_setup(args):
         die("the key does not work: {}\n{}".format(e, e.hint()))
     say("   ok ({} pod(s) in the account right now)".format(len(pods)))
 
-    region = args.region or cfg.get("region") or local_region()
-    say("\n2. Your region, for the nearest data centers: {} (EU or NA; `setup --region NA` to change)".format(region))
-    cfg["region"] = region
+    guess_region, guess_country = local_place()
+    region = args.region or cfg.get("region") or guess_region
+    country = (args.country or cfg.get("country") or (guess_country if region == guess_region else "")).upper()
+    cfg["region"], cfg["country"] = region, country
+    zone = local_zone() or "UTC offset only"
+    say("\n2. Nearest data centers first: {}{} (from this computer's clock: {}).".format(
+        REGION_NAMES.get(region, region), ", " + country + " first" if country else "", zone))
+    say("   Runpod names them by country: CA-MTL-1, US-TX-3, EU-FR-1, EUR-IS-2... `up` tries yours first,")
+    say("   then the rest of the region, then the other region. Change with `setup --region EU --country FR`.")
     if args.template:
         cfg["template_id"] = args.template
     elif not cfg.get("template_id"):
@@ -560,6 +656,7 @@ def cmd_up(args):
         save_config(cfg)
 
     region = args.region or cfg.get("region") or local_region()
+    country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
     disk = args.disk or spec["disk"]
     gpus = [args.gpu] if args.gpu else spec["gpus"]
     name = "ainvfx-{}-{}".format(profile, datetime.now().strftime("%m%d-%H%M"))
@@ -580,12 +677,17 @@ def cmd_up(args):
         p_secure, p_comm = price.get("secure"), price.get("community")
         dcs = [d.get("id") for d in (cat.get("dataCenters") or []) if d.get("id")
                and str(d.get("availability", "")).upper() not in ("NONE", "")]
-        dcs.sort(key=lambda d: (0 if region_of(d) == region else 1 if region_of(d) in ("EU", "NA") else 2))
+        dcs.sort(key=lambda d: dc_order(d, region, country))
         avail = str(cat.get("availability", "?")).upper()
-        say("\n{}: availability {} on Secure Cloud with CUDA {}+; data centers in stock: {}".format(
-            cat.get("name", gpu), avail, MIN_CUDA, ", ".join(dcs) or "none"))
+        mine = [d for d in dcs if region_of(d) == region]
+        other = [d for d in dcs if region_of(d) != region]
+        say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(cat.get("name", gpu), avail, MIN_CUDA))
+        say("   in stock in {}: {}".format(REGION_NAMES.get(region, region), ", ".join(mine) or "none right now"))
+        say("   elsewhere: {}".format(", ".join(other) or "none"))
         say("   price per hour: {} Secure, {} Community".format(
             fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?"))
+        if dcs:
+            say("   tried first: {}".format(dcs[0]))
         if not dcs and args.secure_only:
             continue
         if not args.yes:
@@ -640,14 +742,24 @@ def cmd_up(args):
                                                    (fmt_money(price) + " per hour") if price else "price in the console"))
     say("ComfyUI address (ready once the log says COMFYUI UP): {}".format(pod_url(pod_id)))
     say("JupyterLab: {}  (token under Connect in the console)\n".format(pod_url(pod_id, JUPYTER_PORT)))
-    follow_logs(cfg, pod_id, minutes=args.wait)
+    try:
+        follow_logs(cfg, pod_id, minutes=args.wait)
+    except KeyboardInterrupt:
+        say("\nStopped following the log. The pod keeps running: `python pod.py logs {0}` to follow again, "
+            "`python pod.py down {0}` to terminate.".format(profile))
+        sys.exit(130)
     say("\nWhen you are done:  python pod.py down {}".format(profile))
 
 
 def cmd_logs(args):
     cfg = load_config()
-    rec = recorded_pod(cfg, profile_of(cfg, args.profile))
-    follow_logs(cfg, rec["id"], minutes=args.wait)
+    profile = profile_of(cfg, args.profile)
+    rec = recorded_pod(cfg, profile)
+    try:
+        follow_logs(cfg, rec["id"], minutes=args.wait)
+    except KeyboardInterrupt:
+        say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(profile))
+        sys.exit(130)
 
 
 def cmd_status(args):
@@ -676,12 +788,16 @@ def cmd_status(args):
     kind, host, port, user = pod_ssh(pod)
     if kind:
         say("SSH ({}): ssh -p {} {}@{}".format(kind, port, user, host))
-    lines, err = pod_logs(cfg, rec["id"])
-    if err is not None:
-        say("log: not readable through the API ({}); open it in the console".format(err.detail))
-    else:
-        for l in ainvfx_lines(lines)[-15:]:
-            say("  " + l[l.index("[AINVFX]"):])
+    lines = proxy_log(rec["id"])              # the pod's own copy of the log is complete; the API stream is the fallback
+    err = None
+    if not lines:
+        lines, err = pod_logs(cfg, rec["id"])
+        lines = ainvfx_lines(lines or [])
+    if not lines:
+        say("log: nothing readable yet{}; open it in the console, Pods > your pod > Logs".format(
+            " (the API said: {})".format(err.detail) if err is not None else ""))
+    for l in lines[-15:]:
+        say("  " + l[l.index("[AINVFX]"):])
 
 
 def cmd_open(args):
@@ -840,7 +956,9 @@ def cmd_doctor(args):
     say("ainvfx-runpod {} · Python {} on {}".format(VERSION, sys.version.split()[0], platform.platform()))
     say("  ssh          {}".format(shutil.which("ssh") or "absent (JupyterLab replaces it)"))
     say("  config       {} ({})".format(CONFIG, "present" if CONFIG.exists() else "absent: run `setup`"))
-    say("  region       {}".format(cfg.get("region") or local_region() + " (guessed)"))
+    region, country = cfg.get("region") or local_region(), cfg.get("country") or ""
+    say("  nearest      {}{}{}".format(REGION_NAMES.get(region, region), ", " + country + " first" if country else "",
+                                        "" if cfg.get("region") else " (guessed from the clock: {})".format(local_zone() or "offset")))
     say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID or "none: the script describes the pod itself"))
     say("  ComfyUI tag  {} · image {}".format(COMFY_TAG, IMAGE))
     if cfg.get("api_key") or os.environ.get("RUNPOD_API_KEY"):
@@ -864,7 +982,8 @@ def main():
 
     p = sub.add_parser("setup", help="API key, region, Hugging Face secret, SSH key")
     p.add_argument("--key", help="the Runpod API key (otherwise asked, hidden)")
-    p.add_argument("--region", choices=["EU", "NA"], help="nearest data centers first")
+    p.add_argument("--region", choices=["EU", "NA"], help="EU or NA: the data centers to try first")
+    p.add_argument("--country", help="two letters (CA, US, FR, CZ, RO, NL, SE, IS, NO): tried before the rest of the region")
     p.add_argument("--template", help="a Runpod template id to create pods from")
     p.add_argument("--hf-token", action="store_true", help="store a Hugging Face token as the Runpod secret")
     p.add_argument("-y", "--yes", action="store_true")

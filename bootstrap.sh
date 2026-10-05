@@ -3,22 +3,23 @@
 #
 # What it does, in order (every line it prints starts with [AINVFX], so the log is easy to read):
 #   0. start Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
-#   1. health check: GPU and driver, disk speed, download speed from Hugging Face (one stream: the
-#      models step, which downloads with hf and several streams, measured 3 times faster on the test pod)
+#   1. health check: GPU and driver, disk speed (the download speed is measured in step 4, on real files)
 #   2. install: uv, Python 3.13, PyTorch stable for CUDA 13.0, ComfyUI at a pinned tag, the Manager
 #   3. start ComfyUI, listening for Runpod's proxy on port 8188, and check the proxy from here
 #   4. download the models of the profile (AINVFX_PROFILE: image, video or train), resumable
 #   5. one test image with Z-Image Turbo (proves the GPU, the kernels and the models), then READY
 #
-# v3 (4 Oct 2026, after the first real pod, RTX 5090 in EUR-IS-2): the probe file no longer lands in the
-# ComfyUI folder before the clone (git clone refused the non-empty folder); ComfyUI is fetched with
-# git init + fetch, which tolerates a folder that already holds models; the install marker is written
-# only when main.py exists; each model download logs its time and speed; the one-stream probe warns
-# under 25 MB/s instead of 100 (it measured 39 MB/s where hf then downloaded at about 100 MB/s).
-# The disk threshold drops from 1000 to 300 MB/s: the test pod read at 660 MB/s (dd, direct I/O) and
-# loaded Z-Image Turbo for a 2 s image, so 1000 flagged a healthy pod.
-# Measured on that pod: JupyterLab up in 2 minutes, PyTorch cu130 in 90 s, 63 GB of models in about
-# 10 minutes, the self-test in 2 s once the models are in RAM, READY about 15 minutes after creation.
+# v4 (5 Oct 2026, after two real pods): the one-stream curl probe is gone (it read 21 to 39 MB/s on pods
+# that then downloaded at 100 to 1300 MB/s with hf, and warned for nothing); the download speed is now
+# judged on the first model file over 1 GB. The log lives in ComfyUI's input folder
+# (input/ainvfx/bootstrap.log, with /workspace/ainvfx-bootstrap.log pointing to it), so pod.py can
+# also read it through the proxy once ComfyUI answers. MODELS DONE reports the total time and the
+# average speed. The unresolved-secret message is plain information, not a warning.
+# v3 (4 Oct 2026): ComfyUI is fetched with git init + fetch, which tolerates a folder that already holds
+# files; the install marker is written only when main.py exists; each model download logs its speed;
+# the disk threshold is 300 MB/s (a healthy pod read 660 MB/s with dd and rendered in 2 s).
+# Measured: EUR-IS-2 pod, 63 GB in 10 minutes, READY at 15 minutes; EU-CZ-1 pod, 59 GB in 90 seconds,
+# READY at about 5 minutes. The self-test takes 16 to 106 s on the first load, 2 s once cached.
 #
 # Environment variables, all optional:
 #   AINVFX_PROFILE    image (default) · video · train
@@ -40,13 +41,14 @@ SELFTEST="${AINVFX_SELFTEST:-1}"
 ROOT=/workspace
 COMFY=$ROOT/ComfyUI
 VENV=$ROOT/venv
-LOG=$ROOT/ainvfx-bootstrap.log
+LOG=$COMFY/input/ainvfx/bootstrap.log   # inside ComfyUI's input folder: readable through the proxy
 STAGE=$ROOT/.hfdl
 PORT=8188
 PROXY="https://${RUNPOD_POD_ID:-<pod id>}-$PORT.proxy.runpod.net"
 export HF_XET_HIGH_PERFORMANCE=1
 export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$ROOT"
+mkdir -p "$(dirname "$LOG")"
+ln -sfn "$LOG" $ROOT/ainvfx-bootstrap.log
 exec > >(tee -a "$LOG") 2>&1
 
 say()  { echo "[AINVFX] $*"; }
@@ -59,10 +61,10 @@ say "bootstrap start · profile $PROFILE · ComfyUI $TAG · $(date -u +'%F %T') 
 # A placeholder Runpod did not substitute (no secret in the account) must not reach Hugging Face:
 # an invalid token makes it refuse even public files.
 if [ -n "${HF_TOKEN:-}" ] && case "$HF_TOKEN" in *"{{"*) true;; *) false;; esac; then
-  warn "HF_TOKEN holds an unresolved placeholder (no secret named huggingface_token in this Runpod account): ignored"
+  say "no Runpod secret named huggingface_token in this account: HF_TOKEN ignored"
   unset HF_TOKEN
 fi
-if [ -n "${HF_TOKEN:-}" ]; then say "HF_TOKEN present: gated files allowed"; else say "no HF_TOKEN: gated files (LTX) will be skipped"; fi
+if [ -n "${HF_TOKEN:-}" ]; then say "HF_TOKEN present: gated files (LTX) allowed"; else say "no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"; fi
 
 # ---------------------------------------------------------------- 0. SSH and JupyterLab now
 if [ -x /start.sh ] && ! pgrep -f "jupyter lab" >/dev/null 2>&1; then
@@ -95,21 +97,6 @@ rm -f $ROOT/.probe
 say "disk: write $WR MB/s · read $RD MB/s"
 [ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
 
-# The probe file lands outside the ComfyUI folder (git clone refuses a non-empty folder) and is
-# moved into models/vae/ once ComfyUI is installed.
-PROBE_URL="https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
-PROBE_OUT=$COMFY/models/vae/ae.safetensors
-PROBE_TMP=$ROOT/.probe/ae.safetensors
-if [ ! -s "$PROBE_OUT" ] && [ ! -s "$PROBE_TMP" ]; then
-  mkdir -p "$(dirname "$PROBE_TMP")"
-  T0=$(now); curl -fsSL --retry 3 "$PROBE_URL" -o "$PROBE_TMP"; T1=$(now)
-  BYTES=$(stat -c %s "$PROBE_TMP" 2>/dev/null || echo 0)
-  DL=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
-  say "download from Hugging Face, one stream: $DL MB/s (ae.safetensors, $((BYTES/1000000)) MB); the models step shows the real speed per file"
-  [ "$DL" -lt 25 ] 2>/dev/null && warn "DOWNLOAD UNDER 25 MB/s ON ONE STREAM: 60 GB of models could take over 30 minutes. Consider another pod."
-else
-  say "download probe skipped: ae.safetensors already present"
-fi
 
 # ---------------------------------------------------------------- 2. install
 say "step 2/5 install (uv, Python 3.13, PyTorch cu130, ComfyUI $TAG)"
@@ -154,9 +141,6 @@ else
   say "install already done ($(cat "$MARK") UTC)"
 fi
 [ -f $COMFY/main.py ] || warn "COMFYUI IS NOT INSTALLED ($COMFY/main.py missing): read the lines above"
-if [ -s "$PROBE_TMP" ]; then
-  mkdir -p $COMFY/models/vae && mv -f "$PROBE_TMP" "$PROBE_OUT" && rmdir "$(dirname "$PROBE_TMP")" 2>/dev/null
-fi
 say "ComfyUI $(cd $COMFY 2>/dev/null && git describe --tags 2>/dev/null || echo '?') in $COMFY · environment $VENV"
 
 # ---------------------------------------------------------------- 3. start ComfyUI
@@ -193,7 +177,7 @@ if [ ! -s "$MODELS_JSON" ]; then
   warn "models.json could not be fetched: no model downloaded. Use the Manager's model library."
 else
   mkdir -p "$STAGE"
-  TOTAL=0; DONE=0; SKIPPED=0
+  TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
   while IFS='|' read -r repo path dir gated gb; do
     [ -z "$repo" ] && continue
     TOTAL=$((TOTAL+1))
@@ -214,8 +198,14 @@ else
       BYTES=$(stat -c %s "$STAGE/$path" 2>/dev/null || echo 0)
       SECS=$(python3 -c "print(int($T1-$T0))")
       mv -f "$STAGE/$path" "$dest/$name"
-      DONE=$((DONE+1))
-      say "models $TOTAL: $name in $SECS s · $(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")") MB/s"
+      DONE=$((DONE+1)); BYTES_ALL=$((BYTES_ALL+BYTES))
+      SPEED=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
+      say "models $TOTAL: $name in $SECS s · $SPEED MB/s"
+      # the speed judgement, once, on the first file over 1 GB (small files measure latency, not speed)
+      if [ "$SPEED_JUDGED" = "0" ] && [ "$BYTES" -gt 1000000000 ]; then
+        SPEED_JUDGED=1
+        [ "$SPEED" -lt 50 ] 2>/dev/null && warn "DOWNLOAD UNDER 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
+      fi
     else
       warn "download failed: $path from $repo (path changed, or access refused)"
     fi
@@ -242,14 +232,17 @@ for k in keys:
 PY
 )
   rm -rf "$STAGE"
-  say "MODELS DONE $DONE/$TOTAL present${SKIPPED:+ · $SKIPPED skipped (gated, no token)} · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk"
+  T_ALL1=$(now)
+  TOTALS=""
+  [ "$BYTES_ALL" -gt 0 ] && TOTALS=" · $((BYTES_ALL/1000000000)) GB downloaded in $(python3 -c "print(int($T_ALL1-$T_ALL0))") s ($(mbps "$BYTES_ALL" "$(python3 -c "print($T_ALL1-$T_ALL0)")") MB/s)"
+  say "MODELS DONE $DONE/$TOTAL present${SKIPPED:+ · $SKIPPED skipped (gated, no token)} · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk$TOTALS"
   say "press r in ComfyUI to refresh the model lists"
 fi
 
 # ---------------------------------------------------------------- 5. self-test, then READY
 say "step 5/5 self-test"
 if [ "$SELFTEST" = "1" ] && [ -s $COMFY/models/diffusion_models/z_image_turbo_int8_convrot.safetensors ] \
-   && [ -s $COMFY/models/text_encoders/qwen_3_4b_fp8_mixed.safetensors ] && [ -s "$PROBE_OUT" ] \
+   && [ -s $COMFY/models/text_encoders/qwen_3_4b_fp8_mixed.safetensors ] && [ -s $COMFY/models/vae/ae.safetensors ] \
    && curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
   python - "$PORT" <<'PY'
 import json, sys, time, urllib.request
