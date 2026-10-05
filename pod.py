@@ -28,9 +28,14 @@ The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab firs
 (driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each with its
 download speed), then one test image. settings.env, next to this script, holds every choice the
 pod makes (the ComfyUI tag, Python, PyTorch, the models list, custom nodes, the checks): edit it,
-then `up`; its values travel with the pod as environment variables. Its log lines start with [AINVFX]; `up`, `logs` and `status`
-read them for you, from the API log stream and from the copy the pod serves through its proxy.
-Measured on two RTX 5090 pods (4 and 5 Oct 2026): READY 5 to 15 minutes after creation.
+then `up`; its values travel with the pod as environment variables. Its log lines start with
+[AINVFX]; `up`, `logs` and `status` read them for you, from the API log stream and from the copy
+the pod serves through its proxy. Before the first [AINVFX] line, Runpod's own system log tells
+what the host is doing (fetching the image, starting the container): `up` shows it as [RUNPOD]
+lines, with one summary of the image download (layers done, extracting, downloading) so a long
+pull never looks like a hang. Measured on two RTX 5090 pods (4 and 5 Oct 2026): READY 5 to 15
+minutes after creation. A pod with no container 8 minutes after creation gets a warning: the
+usual answer is `down`, then `up` again, usually in another data center.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -38,9 +43,11 @@ billing it.
 """
 import argparse
 import getpass
+import http.client
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -54,10 +61,15 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
-IMAGE = "runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404"      # Ubuntu 24.04, CUDA 13.0, official Runpod image
+# The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
+# of its own templates on its hosts, so a pod on it starts within seconds; any other tag has to be
+# fetched from Docker Hub first (about 9 GB, 19 layers, 5 to 15 minutes on 5 Oct 2026 with the
+# 1.0.7-cu1300 tag). The image's own PyTorch and CUDA toolkit are not used: bootstrap.sh builds its
+# environment with the cu130 PyTorch wheels, which carry their own CUDA 13 libraries.
+IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 
 
 def load_settings():
@@ -100,6 +112,14 @@ FINAL = ("EXITED", "ERROR", "TERMINATED")
 # seconds the copy of the log that the pod serves itself is read. Both overridable for the tests.
 STREAM_MAX_AGE = int(os.environ.get("AINVFX_STREAM_MAX_AGE", "60"))
 PROXY_POLL = int(os.environ.get("AINVFX_PROXY_POLL", "15"))
+# While the host fetches the image, the container has not started and nothing of ours is in the log:
+# `up` prints a summary of the download every PULL_SUMMARY seconds, a heartbeat after HEARTBEAT
+# seconds of silence, and a warning when no container has started STALL_MINUTES after creation.
+PULL_SUMMARY = int(os.environ.get("AINVFX_PULL_SUMMARY", "15"))
+HEARTBEAT = int(os.environ.get("AINVFX_HEARTBEAT", "60"))
+STALL_MINUTES = float(os.environ.get("AINVFX_STALL_MINUTES", "8"))
+STATUS_POLL = int(os.environ.get("AINVFX_STATUS_POLL", "45"))      # seconds between two reads of the pod's status
+STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds without a byte before the stream is reopened
 
 PROFILES = {
     "image": dict(disk=100, gpus=["NVIDIA GeForce RTX 5090",
@@ -183,14 +203,23 @@ class ApiError(Exception):
             return "Insufficient balance on the Runpod account: add credit, then try again."
         if self.code == 429:
             return "Too many requests: wait a minute, then try again."
+        if self.code == 0 and self.timed_out:
+            return "The server accepted the request but did not answer in time: a host that is not responding, or a slow link. Try again; `python pod.py status` shows the pod."
         if self.code == 0:
             return "No network, or api.runpod.io unreachable from this machine."
         return ""
 
+    @property
+    def timed_out(self):
+        return "timed out" in (self.detail or "").lower()
 
-def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False):
-    """One HTTP request with urllib. Returns parsed JSON, bytes (raw=True), or the open response (stream=True)."""
-    data = None
+
+def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
+    """One HTTP request with urllib. Returns parsed JSON, bytes (raw=True), or the open response (stream=True).
+    `body` is sent as JSON; `data` as given (bytes), with the Content-Type of `headers`.
+    Every network failure, including a timeout while the server prepares its answer, is an ApiError
+    with code 0: nothing here raises a bare socket error (a pod on a host that does not respond
+    once made `up` stop with a traceback)."""
     hdrs = {"Accept": "application/json", "User-Agent": "ainvfx-runpod/" + VERSION}
     if key:
         hdrs["Authorization"] = "Bearer " + key
@@ -208,11 +237,23 @@ def request(method, url, key=None, body=None, timeout=60, raw=False, headers=Non
         err.retry_after = e.headers.get("Retry-After")
         raise err
     except urllib.error.URLError as e:
-        raise ApiError(0, str(e.reason), url)
+        reason = e.reason
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise ApiError(0, "timed out after {} s (connecting)".format(timeout), url)
+        raise ApiError(0, str(reason), url)
+    except (socket.timeout, TimeoutError):
+        raise ApiError(0, "timed out after {} s (no answer)".format(timeout), url)
+    except (OSError, http.client.HTTPException) as e:
+        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
     if stream:
         return r
-    with r:
-        payload = r.read()
+    try:
+        with r:
+            payload = r.read()
+    except (socket.timeout, TimeoutError):
+        raise ApiError(0, "timed out after {} s (reading the answer)".format(timeout), url)
+    except (OSError, http.client.HTTPException) as e:
+        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
     if raw:
         return payload
     if not payload:
@@ -491,11 +532,12 @@ def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20, max_age=
             pass
 
 
-def pod_logs(cfg, pod_id, tail=400, seconds=10):
-    """The last `tail` container log lines, as a list of strings (the stream is left after `seconds`)."""
+def pod_logs(cfg, pod_id, tail=400, seconds=10, source="container"):
+    """The last `tail` log lines of one source (container, or system), as a list of strings (the
+    stream is left after `seconds`)."""
     lines, t0 = [], time.time()
     try:
-        for _, _, line in log_stream(cfg, pod_id, tail=tail, source="container", idle=3, max_age=seconds):
+        for _, _, line in log_stream(cfg, pod_id, tail=tail, source=source, idle=3, max_age=seconds):
             if line:
                 lines.append(line)
     except ApiError as e:
@@ -524,22 +566,115 @@ def resume_point(event_id, seconds=5):
     return (t - timedelta(seconds=seconds)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def follow_logs(cfg, pod_id, minutes=25):
-    """Print the [AINVFX] lines as they appear, until READY, a dead pod, or the time runs out.
-    Two sources, because the API stream has been seen staying open and silent while the pod wrote
-    lines that only the stored log held: the stream is reopened every STREAM_MAX_AGE seconds a few
-    seconds back (duplicates are dropped), and every PROXY_POLL seconds the copy of the log that the
-    pod serves through its own ComfyUI is read."""
+# Runpod's system log narrates the image download one Docker layer at a time ("38e4c3f3c358 Extracting",
+# "7f1a... Pull complete"), many lines per layer. They are counted into one summary line instead.
+LAYER_DONE = ("Pull complete", "Already exists")
+LAYER_RE = re.compile(r"^([0-9a-f]{12})\s+(Pulling fs layer|Waiting|Downloading|Verifying Checksum|"
+                      r"Download complete|Extracting|Pull complete|Already exists)\b")
+
+
+class ImagePull:
+    """The state of the image download, from the layer lines of the system log."""
+    def __init__(self):
+        self.layers, self.started = {}, None
+
+    def feed(self, line):
+        """True when the line is a layer line (and was counted)."""
+        m = LAYER_RE.match(line.strip())
+        if not m:
+            return False
+        self.layers[m.group(1)] = m.group(2)
+        self.started = self.started or time.time()
+        return True
+
+    def counts(self):
+        done = sum(1 for s in self.layers.values() if s in LAYER_DONE)
+        extracting = sum(1 for s in self.layers.values() if s == "Extracting")
+        return len(self.layers), done, extracting, len(self.layers) - done - extracting
+
+    def summary(self):
+        n, done, extracting, downloading = self.counts()
+        elapsed = int(time.time() - (self.started or time.time()))
+        return "image download: {} layers · {} done · {} extracting · {} downloading ({} min {:02d} s)".format(
+            n, done, extracting, downloading, elapsed // 60, elapsed % 60)
+
+
+def fmt_since(t):
+    """'3 min' from an aware datetime to now."""
+    if not t:
+        return "?"
+    secs = int((datetime.now(timezone.utc) - t).total_seconds())
+    return "{} min".format(secs // 60) if secs >= 60 else "{} s".format(secs)
+
+
+def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
+    """Print the pod's log as it appears, until READY, a dead pod, or the time runs out.
+
+    Two kinds of lines. [AINVFX] lines come from bootstrap.sh, through two sources, because the API
+    stream has been seen staying open and silent while the pod wrote lines that only the stored log
+    held: the stream is reopened every STREAM_MAX_AGE seconds a few seconds back (duplicates are
+    dropped), and every PROXY_POLL seconds the copy of the log that the pod serves through its own
+    ComfyUI is read. [RUNPOD] lines are Runpod's system log, what the host does before our script
+    runs (fetching the image, starting the container): the image download is one summary line every
+    PULL_SUMMARY seconds, the rest is printed once. A heartbeat shows after HEARTBEAT seconds without
+    anything to print, and a warning when no container has started STALL_MINUTES after creation.
+    Every API error, a timeout included, is a message, never a traceback: the pod exists and bills."""
     deadline = time.time() + minutes * 60
-    seen, printed, last_id, told = set(), set(), None, False
-    last_check = last_poll = time.time()
+    seen, printed, last_id = set(), set(), None
+    last_poll = time.time()
+    created = created or parse_time((pod or {}).get("createdAt") or "")   # when this machine saw the pod created
+    pull, pull_shown, pull_done = ImagePull(), 0.0, False
+    state = {"container": False, "stall_told": False, "stream_told": False, "status": pod_status(pod) if pod else "?"}
+
+    def out(text):
+        say("  " + text)
+        state["last_output"] = time.time()
+
+    state["last_output"] = time.time()
 
     def show(line, key):
+        """An [AINVFX] line, once. True on READY."""
         if key in seen or line in printed:
             return False
         seen.add(key); printed.add(line)
-        say("  " + line[line.index("[AINVFX]"):])
+        state["container"] = True
+        out(line[line.index("[AINVFX]"):])
         return "READY" in line
+
+    def system(line):
+        """A line of Runpod's system log."""
+        text = line.strip()
+        if not text:
+            return
+        if pull.feed(text):
+            pull_summary(False)
+            return
+        if text in printed:
+            return
+        printed.add(text)
+        out("[RUNPOD] " + text[:200])
+
+    def pull_summary(final):
+        nonlocal pull_shown, pull_done
+        if not pull.layers or pull_done:
+            return
+        if not pull_shown and not final and time.time() - pull.started < 3:
+            return                          # let the backlog of layer lines arrive before judging
+        n, done, extracting, downloading = pull.counts()
+        finished = n and done == n
+        if not (final or finished or time.time() - pull_shown >= PULL_SUMMARY):
+            return
+        if not pull_shown and finished:
+            out("[RUNPOD] the image is already on the host ({} layers present): the container starts now".format(n))
+            pull_shown, pull_done = time.time(), True
+            return
+        if not pull_shown:
+            out("[RUNPOD] the host is fetching the pod's image from Docker Hub (several minutes; a host "
+                "that already has it starts the container within seconds)")
+        pull_shown = time.time()
+        out("[RUNPOD] " + pull.summary())
+        if finished:
+            pull_done = True
 
     def poll_proxy():
         for line in proxy_log(pod_id):
@@ -547,37 +682,76 @@ def follow_logs(cfg, pod_id, minutes=25):
                 return True
         return False
 
+    def check_pod():
+        """Every 45 s: the pod's status, and the warning when the container has not started."""
+        if time.time() - last_check_box[0] < STATUS_POLL:
+            return None
+        last_check_box[0] = time.time()
+        try:
+            current = get_pod(cfg, pod_id)
+        except ApiError:
+            return None
+        st = pod_status(current)
+        state["status"] = st
+        if st in FINAL:
+            out("the pod is {}. Read its log in the console, then `python pod.py down` and `up` again.".format(st))
+            return False
+        if not state["container"] and current.get("runtime") is None and created \
+                and (datetime.now(timezone.utc) - created).total_seconds() > STALL_MINUTES * 60 \
+                and not state["stall_told"]:
+            state["stall_told"] = True
+            gpu, dc, _ = pod_summary(current)
+            out("WARNING: NO CONTAINER {} AFTER CREATION (status {}, {}). The host is still fetching the image, or "
+                "does not respond; the console (Pods > your pod) shows its log and any maintenance notice. "
+                "The pod bills meanwhile. Usual answer:  python pod.py down <pod>  then  python pod.py up  again, "
+                "usually in another data center.".format(fmt_since(created), st, dc if dc != "?" else "data center not reported"))
+        return None
+
+    last_check_box = [time.time()]
+
+    def heartbeat():
+        if time.time() - state["last_output"] >= HEARTBEAT:
+            out("[RUNPOD] waiting: pod {}, {}{} since creation".format(
+                state["status"], "no container yet, " if not state["container"] else "", fmt_since(created)))
+
     while time.time() < deadline:
         try:
-            for eid, _, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=30,
-                                           max_age=STREAM_MAX_AGE):
-                if line and "[AINVFX]" in line and show(line, (eid, line)):
-                    return True
+            for eid, source, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=STREAM_IDLE,
+                                                max_age=STREAM_MAX_AGE):
+                if line and "[AINVFX]" in line:
+                    if show(line, (eid, line)):
+                        pull_summary(True)
+                        return True
+                elif line and source == "system":
+                    system(line)
                 last_id = eid or last_id
                 if time.time() - last_poll > PROXY_POLL:
                     last_poll = time.time()
                     if poll_proxy():
                         return True
+                if check_pod() is False:
+                    return False
+                pull_summary(False)
+                heartbeat()
                 if time.time() > deadline:
                     break
         except ApiError as e:
-            if not told:
-                say("(the log cannot be read through the API from here: {}. Follow it in the console, "
-                    "Pods > your pod > Logs, or wait: the pod's own copy is read below.)".format(e.detail))
-                told = True
+            if e.code == 0 and e.timed_out:
+                if not state["stream_told"]:
+                    state["stream_told"] = True
+                    out("[RUNPOD] the log stream did not answer ({}): the host may not be ready; retrying".format(e.detail))
+            elif not state["stream_told"]:
+                state["stream_told"] = True
+                out("(the log cannot be read through the API from here: {}. Follow it in the console, "
+                    "Pods > your pod > Logs, or wait: the pod's own copy is read as well.)".format(e.detail))
             time.sleep(min(PROXY_POLL, 10))
         last_poll = time.time()
         if poll_proxy():
             return True
-        if time.time() - last_check > 45:
-            last_check = time.time()
-            try:
-                st = pod_status(get_pod(cfg, pod_id))
-                if st in FINAL:
-                    say("The pod is {}. Read its log in the console, then `python pod.py down` and `up` again.".format(st))
-                    return False
-            except ApiError:
-                pass
+        if check_pod() is False:
+            return False
+        pull_summary(False)
+        heartbeat()
     say("Still working after {} minutes: `python pod.py status` shows where it is.".format(minutes))
     return False
 
@@ -795,7 +969,8 @@ def cmd_up(args):
         die("no pod could be created. Try again in a few minutes, another profile, or the Runpod console.")
 
     pod_id = created["id"]
-    cfg["pods"][tag] = {"id": pod_id, "name": name, "profile": profile, "created": datetime.now(timezone.utc).isoformat()}
+    created_at = datetime.now(timezone.utc)
+    cfg["pods"][tag] = {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()}
     save_config(cfg)
     say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
     wait_until = time.time() + 15 * 60
@@ -811,25 +986,46 @@ def cmd_up(args):
         if st in FINAL:
             die("the pod is {} before it ran. Read its log in the console, then `python pod.py down {}` and try again.".format(st, profile))
         time.sleep(8)
+    for _ in range(4):                     # the data center and the price arrive a few seconds after RUNNING
+        gpu, dc, price = pod_summary(pod)
+        if dc != "?" and price:
+            break
+        time.sleep(5)
+        try:
+            pod = get_pod(cfg, pod_id)
+        except ApiError:
+            pass
     gpu, dc, price = pod_summary(pod)
-    say("Pod {} · {} · {} · CUDA {} · {}".format(name, gpu, dc, pod.get("cudaVersion") or "?",
-                                                   (fmt_money(price) + " per hour") if price else "price in the console"))
+    say("Pod {} · {} · {} · CUDA {} · {}".format(
+        name, gpu, dc if dc != "?" else "data center not reported yet (the console shows it)",
+        pod.get("cudaVersion") or "?", (fmt_money(price) + " per hour") if price else "price in the console"))
     say("ComfyUI address (ready once the log says COMFYUI UP): {}".format(pod_url(pod_id)))
-    say("JupyterLab: {}  (token under Connect in the console)\n".format(pod_url(pod_id, JUPYTER_PORT)))
+    say("JupyterLab: {}  (token under Connect in the console)".format(pod_url(pod_id, JUPYTER_PORT)))
+    say("The pod bills from now on; `python pod.py down {}` terminates it at any time.\n".format(tag))
     try:
-        follow_logs(cfg, pod_id, minutes=args.wait)
+        ready = follow_logs(cfg, pod_id, minutes=args.wait, pod=pod, created=created_at)
     except KeyboardInterrupt:
         say("\nStopped following the log. The pod keeps running: `python pod.py logs {0}` to follow again, "
             "`python pod.py down {0}` to terminate.".format(tag))
         sys.exit(130)
+    except ApiError as e:
+        say("\nThe log could not be followed ({}). {}".format(e.detail, e.hint()))
+        say("The pod keeps running: `python pod.py status {0}` shows it, `python pod.py down {0}` terminates it.".format(tag))
+        sys.exit(1)
     say("\nWhen you are done:  python pod.py down {}".format(tag))
+    if not ready:
+        sys.exit(1)
 
 
 def cmd_logs(args):
     cfg = load_config()
     tag, rec = which_pod(cfg, args.profile)
     try:
-        follow_logs(cfg, rec["id"], minutes=args.wait)
+        pod = get_pod(cfg, rec["id"])
+    except ApiError:
+        pod = None
+    try:
+        follow_logs(cfg, rec["id"], minutes=args.wait, pod=pod, created=parse_time(rec.get("created") or ""))
     except KeyboardInterrupt:
         say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(tag))
         sys.exit(130)
@@ -855,6 +1051,8 @@ def cmd_status(args):
     if rt.get("gpus"):
         g = rt["gpus"][0]
         say("GPU in use: {}% · VRAM {}%".format(g.get("util", "?"), g.get("memoryUtil", "?")))
+    elif st == "RUNNING" and pod.get("runtime") is None:
+        say("container: not started yet (the host is fetching the image, or has a problem): Runpod's system log below says which")
     say("ComfyUI: {}  ({})".format(pod_url(rec["id"]), "answers" if comfy_alive(rec["id"]) else "not answering yet"))
     say("JupyterLab: {}".format(pod_url(rec["id"], JUPYTER_PORT)))
     kind, host, port, user = pod_ssh(pod)
@@ -866,8 +1064,16 @@ def cmd_status(args):
         lines, err = pod_logs(cfg, rec["id"])
         lines = ainvfx_lines(lines or [])
     if not lines:
-        say("log: nothing readable yet{}; open it in the console, Pods > your pod > Logs".format(
+        say("log: nothing from the pod's script yet{}; open it in the console, Pods > your pod > Logs".format(
             " (the API said: {})".format(err.detail) if err is not None else ""))
+        system, err2 = pod_logs(cfg, rec["id"], tail=40, source="system")
+        if system:
+            pull = ImagePull()
+            others = [l for l in system if not pull.feed(l)]
+            if pull.layers:
+                say("  [RUNPOD] " + pull.summary())
+            for l in others[-5:]:
+                say("  [RUNPOD] " + l.strip()[:200])
     for l in lines[-15:]:
         say("  " + l[l.index("[AINVFX]"):])
 
@@ -904,14 +1110,11 @@ def cmd_push(args):
         die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
     for f in files:
         body, ctype = multipart({"overwrite": "true", "type": "input"}, "image", f)
-        req = urllib.request.Request(base + "/upload/image", data=body, method="POST",
-                                     headers={"Content-Type": ctype, "User-Agent": "ainvfx-runpod/" + VERSION})
         try:
-            with urllib.request.urlopen(req, timeout=600) as r:
-                r.read()
+            request("POST", base + "/upload/image", data=body, headers={"Content-Type": ctype}, timeout=600, raw=True)
             say("  {}  ({:.1f} MB) -> input/".format(f.name, f.stat().st_size / 1e6))
-        except urllib.error.HTTPError as e:
-            die("upload of {} failed: HTTP {} {}".format(f.name, e.code, e.read()[:200]))
+        except ApiError as e:
+            die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
     say("Done. The files are in the lists of the Load Image and Load Video nodes.")
 
 
@@ -1127,6 +1330,12 @@ def main():
     except KeyboardInterrupt:
         say("\nStopped.")
         sys.exit(130)
+    except Exception as e:                    # never a bare traceback: the pods keep running and billing
+        if os.environ.get("AINVFX_DEBUG"):
+            raise
+        die("unexpected error: {}: {}\nYour pods keep running: `python pod.py list` shows them, `python pod.py down` "
+            "terminates one. Run the command again with AINVFX_DEBUG=1 for the full trace, and report it at "
+            "https://github.com/AInVFX/ainvfx-runpod/issues".format(type(e).__name__, str(e)[:300]))
 
 
 if __name__ == "__main__":

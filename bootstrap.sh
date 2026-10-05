@@ -25,8 +25,15 @@
 # the root of the repository; pod.py sends that file's values with each pod, and a browser user sets
 # the same variables on the deploy page. New: AINVFX_PYTHON, AINVFX_TORCH, AINVFX_TORCH_INDEX,
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
-# bootstrap, fetched and run instead of this one). The template image is now
-# runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404 (CUDA 13.0 toolkit, Ubuntu 24.04).
+# bootstrap, fetched and run instead of this one).
+#
+# v5.1 (5 Oct 2026, comment only): the template image is runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404,
+# the image of Runpod's own "Runpod Pytorch 2.8.0" template, which Runpod keeps on its hosts: the
+# container starts within seconds. The 1.0.7-cu1300-torch291 tag tried on 5 Oct had to be fetched from
+# Docker Hub on every pod (19 layers, about 9 GB, over 5 minutes). This script does not use the image's
+# PyTorch or CUDA toolkit: the venv it builds takes the cu130 wheels, which carry their own CUDA 13
+# libraries. A custom node that compiles a kernel against CUDA 13 would need
+# `uv pip install nvidia-cuda-nvcc==13.0.88` in the venv first; no course step does.
 #
 # Environment variables, all optional (the defaults are the bootcamp's; settings.env documents them):
 #   AINVFX_PROFILE        image (default) · video · train: which set of models.json to download
