@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://www.ainvfx.com/"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://www.ainvfx.com/assets/images/logo-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="https://www.ainvfx.com/assets/images/logo-dark.png">
     <img src="assets/ainvfx-logo-light.png" alt="AInVFX" height="40">
   </picture></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
