@@ -49,7 +49,7 @@ Profiles: `up image` rents an RTX 5090 with a 100 GB disk; `up video` an RTX PRO
 
 - **Python 3.8 or newer.** Windows: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`. macOS and Linux usually have it: `python3 --version`. Or install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run `uv run pod.py ...`, which fetches a Python for you.
 - **Git**, to clone and update this repository. Without Git, GitHub's "Download ZIP" button works too.
-- **A Runpod API key**: in the console, Settings, API Keys, "Create API Key", permission *Restricted* with Read and Write on Pods (add Secrets if you use `setup --hf-token`, and SSH Keys if you use `pod.py ssh`). The script keeps the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
+- **A Runpod API key**: in the console, Account, Credentials, API Keys, "Create API Key", permission *Restricted* with Read and Write on Pods (add Secrets if you use `setup --hf-token`, and SSH Public Keys if you use `pod.py ssh`). The old Settings page now redirects there. The script keeps the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
 - **`ssh` is optional.** Only `pod.py ssh` uses it. Everything else goes through the browser and Runpod's proxy.
 
 The script uses Python's standard library only: nothing to install.
@@ -77,7 +77,7 @@ Measured on the first real pod (RTX 5090, Secure Cloud, EUR-IS-2, 4 October 2026
 
 The gated repositories (LTX 2.5) need a Hugging Face read token. The token never travels in a slide, a chat or a file:
 
-- `python pod.py setup --hf-token` stores it on Runpod as the secret `huggingface_token` (or do it in the console: Settings, Secrets, same name).
+- `python pod.py setup --hf-token` stores it on Runpod as the secret `huggingface_token` (or do it in the console: Account, Credentials, Secrets, same name).
 - Pods receive it as the variable `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots.
 - Without a secret of that name, the pod receives the placeholder unchanged, notices it, ignores it and skips the gated files. The log says so. Nothing else breaks.
 

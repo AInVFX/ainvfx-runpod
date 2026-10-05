@@ -46,7 +46,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 API = "https://api.runpod.io/v2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
@@ -139,7 +139,7 @@ class ApiError(Exception):
 
     def hint(self):
         if self.code == 401:
-            return "The API key is missing, wrong or expired. Runpod console > Settings > API Keys. Then:  python pod.py setup"
+            return "The API key is missing, wrong or expired. Runpod console > Account > Credentials > API Keys. Then:  python pod.py setup"
         if self.code == 403:
             return "The API key does not allow this call: add the permission to the key (Pods, read and write), or create a new key."
         if self.code == 402:
@@ -428,7 +428,7 @@ def cmd_setup(args):
     say("ainvfx-runpod {} · setup".format(VERSION))
     key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
     if not key:
-        say("\n1. Your Runpod API key. Console > Settings > API Keys > Create API Key.")
+        say("\n1. Your Runpod API key. Console > Account > Credentials > API Keys > Create API Key.")
         say("   Permission: Restricted, with read and write on Pods (add Secrets and SSH keys if you use")
         say("   `--hf-token` or `pod.py ssh`; otherwise do those two in the console).")
         say("   Paste it below (nothing shows while you type), then Enter.")
@@ -474,7 +474,7 @@ def cmd_setup(args):
                         say("   could not update the secret: {}".format(e2))
                 else:
                     say("   could not store the secret ({}): {}".format(e.code, e.hint() or e.detail))
-                    say("   Console > Settings > Secrets > name '{}', value: your token.".format(HF_SECRET))
+                    say("   Console > Account > Credentials > Secrets > name '{}', value: your token.".format(HF_SECRET))
     else:
         found = secret_exists(cfg)
         cfg["hf_secret"] = bool(found)
@@ -505,7 +505,7 @@ def cmd_setup(args):
                     restrict(keyfile)
             except ApiError as e:
                 say("   could not register the key ({}): `pod.py ssh` will not work, the rest will. "
-                    "Console > Settings > SSH Public Keys.".format(e.code))
+                    "Console > Account > Credentials > SSH Public Keys.".format(e.code))
     else:
         say("   no `ssh` on this machine: skipped. JupyterLab's terminal replaces it on the pod.")
     cfg.setdefault("pods", {})
