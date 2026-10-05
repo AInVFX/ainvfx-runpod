@@ -9,12 +9,14 @@ real ~/.ainvfx-runpod is untouched (the end-to-end tests run with HOME in a temp
 Two groups. `Helpers` are unit tests of the pure functions (data center order, the place guessed
 from the clock, the stream resume point, the error hints). `EndToEnd` starts a fake Runpod API v2
 and a fake ComfyUI on 127.0.0.1 and runs the real commands (setup, doctor, up, status, pull, push,
-list, down) through subprocess, as a user would. The fake reproduces what the real log stream
-does: events carry a timestamp as id, a `since` cursor is exclusive at one-second resolution, and
-the server closes the stream after a few events. Before 0.3.0, READY (written in the same second
-as SELFTEST OK) was skipped on reconnect and `up` waited for its deadline. A second scenario makes
-the log endpoint answer 403 (a key without log access): READY must then come through the pod's
-own copy of the log, served by ComfyUI.
+list, down) through subprocess, as a user would. The fake reproduces what the real log stream was
+seen doing on 4 and 5 October 2026: events carry a timestamp as id, a `since` cursor is exclusive
+at one-second resolution, the stream stays open with keepalive lines, and the lines written after
+SELFTEST OK (READY, remember) never arrive on a live connection: only a fresh request serves them.
+Before 0.3.1, `up` therefore sat on SELFTEST OK until its deadline. Three scenarios: both sources
+available; the pod's own copy of the log unavailable (READY must come from a reopened stream);
+the log endpoint answering 403 (READY must come from the pod's own copy). Then several pods at
+once: `up --name`, commands by name or id, attaching a pod created elsewhere, `down --all`.
 """
 import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -47,15 +49,23 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (7, "[AINVFX] remember: terminate the pod when you are done"),
 ]
 STEP = 0.4            # one scripted second of pod time = 0.4 real seconds
-STATE = {"pod": None, "t0": None, "posts": [], "logs_403": False, "uploads": [], "deleted": False}
+LIVE_LIMIT = 16       # BOOT lines from this index on are never sent on a live connection
+STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0}
 
 
-def pod_seconds():
-    return (time.time() - STATE["t0"]) / STEP if STATE["t0"] else 0
+def pod_seconds(pod):
+    return (time.time() - pod["t0"]) / STEP
 
 
-def visible_lines():
-    return [(s, l) for s, l in BOOT if s <= pod_seconds()]
+def visible_lines(pod):
+    return [(s, l) for s, l in BOOT if s <= pod_seconds(pod)]
+
+
+def pod_of(path):
+    for pid, pod in STATE["pods"].items():
+        if "/" + pid in path:
+            return pid, pod
+    return None, None
 
 
 def ts_of(sec):
@@ -92,16 +102,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != "Bearer fake-key":
             return self.problem(401, "bad key")
         if p == "/v2/pods":
-            pods = [STATE["pod"]] if STATE["pod"] and not STATE["deleted"] else []
+            pods = [self.view_of(pod) for pod in STATE["pods"].values() if not pod["deleted"]]
             return self.send_json(200, {"pods": pods, "pagination": {"nextCursor": None}})
         if p.startswith("/v2/pods/") and p.endswith("/logs"):
-            return self.logs(q)
+            pid, pod = pod_of(p)
+            return self.logs(q, pod) if pod and not pod["deleted"] else self.problem(404, "pod not found")
         if p.startswith("/v2/pods/"):
-            if not STATE["pod"] or STATE["deleted"]:
+            pid, pod = pod_of(p)
+            if not pod or pod["deleted"]:
                 return self.problem(404, "pod not found")
-            pod = dict(STATE["pod"])
-            pod["status"] = "RUNNING" if pod_seconds() >= 1 else "STARTING"
-            return self.send_json(200, pod)
+            return self.send_json(200, self.view_of(pod))
         if p.startswith("/v2/catalog/gpus/"):
             return self.send_json(200, {
                 "id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "availability": "LOW",
@@ -126,14 +136,26 @@ class Handler(BaseHTTPRequestHandler):
             STATE["posts"].append(body)
             if body.get("dataCenterIds") == ["EU-CZ-1"]:
                 return self.problem(400, "no capacity in EU-CZ-1")   # the first candidate fails: the loop must go on
-            STATE["t0"] = time.time()
-            STATE["pod"] = {"id": "fakepod1", "name": body["name"], "status": "STARTING", "cost": 0.99,
-                            "gpu": {"id": body["gpu"]["id"], "count": 1}, "dataCenterId": (body.get("dataCenterIds") or ["?"])[0],
-                            "cudaVersion": "13.3", "createdAt": ts_of(0), "template": None,
-                            "ssh": {"direct": {"host": "81.27.69.177", "port": 32554, "username": "root"}},
-                            "runtime": {"gpus": [{"util": 0, "memoryUtil": 0}]}}
-            return self.send_json(201, STATE["pod"])
+            pod = self.new_pod(body["name"], body["gpu"]["id"], (body.get("dataCenterIds") or ["?"])[0])
+            return self.send_json(201, self.view_of(pod))
         return self.problem(404, "no route")
+
+    @staticmethod
+    def new_pod(name, gpu, dc):
+        STATE["count"] += 1
+        pid = "fakepod{}".format(STATE["count"])
+        pod = {"id": pid, "name": name, "cost": 0.99, "gpu": {"id": gpu, "count": 1}, "dataCenterId": dc,
+               "cudaVersion": "13.3", "createdAt": ts_of(0), "template": None,
+               "ssh": {"direct": {"host": "81.27.69.177", "port": 32554, "username": "root"}},
+               "runtime": {"gpus": [{"util": 0, "memoryUtil": 0}]}, "t0": time.time(), "deleted": False}
+        STATE["pods"][pid] = pod
+        return pod
+
+    @staticmethod
+    def view_of(pod):
+        v = {k: val for k, val in pod.items() if k not in ("t0", "deleted")}
+        v["status"] = "RUNNING" if pod_seconds(pod) >= 1 else "STARTING"
+        return v
 
     def do_PUT(self):
         self.body()
@@ -142,11 +164,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if self.headers.get("Authorization") != "Bearer fake-key":
             return self.problem(401, "bad key")
-        STATE["deleted"] = True
+        pid, pod = pod_of(self.path)
+        if not pod:
+            return self.problem(404, "pod not found")
+        pod["deleted"] = True
         self.send_response(204)
         self.end_headers()
 
-    def logs(self, q):
+    def logs(self, q, pod):
         if STATE["logs_403"]:
             return self.problem(403, "this key cannot read logs")
         self.send_response(200)
@@ -154,42 +179,51 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         since = q.get("since", [None])[0]
         tail = int(q.get("tail", ["100"])[0])
-        sent = 0
         if since:
             # exclusive at second resolution, like the real cursor
             start = [i for i, (s, _) in enumerate(BOOT) if ts_of(s) > since]
-            idx = start[0] if start else len(visible_lines())
+            idx = start[0] if start else len(visible_lines(pod))
         else:
-            idx = max(0, len(visible_lines()) - tail)
-        deadline = time.time() + 60
+            idx = max(0, len(visible_lines(pod)) - tail)
+        backlog = len(visible_lines(pod))          # what the stored log holds at connection time
+        deadline, last_keepalive = time.time() + 60, time.time()
         while time.time() < deadline:
-            vis = visible_lines()
+            vis = visible_lines(pod)
             while idx < len(vis):
+                if idx >= LIVE_LIMIT and idx >= backlog:
+                    break                          # written after SELFTEST OK: never delivered live
                 s, line = vis[idx]
                 ev = "id: {}\ndata: {}\n\n".format(ts_of(s), json.dumps({"ts": ts_of(s), "source": "container", "line": line}))
                 try:
                     self.wfile.write(ev.encode()); self.wfile.flush()
                 except BrokenPipeError:
                     return
-                idx += 1; sent += 1
-                if "SELFTEST OK" in line or sent >= 6:   # the server closes the stream often, and right after SELFTEST OK
+                idx += 1
+            if time.time() - last_keepalive > 1:   # keepalives defeat an idle timeout
+                last_keepalive = time.time()
+                try:
+                    self.wfile.write(b": keepalive\n\n"); self.wfile.flush()
+                except BrokenPipeError:
                     return
             time.sleep(0.1)
 
     # ------------------------------------------------------------- fake ComfyUI behind the proxy
     def proxy_get(self, p, q):
-        up = pod_seconds() >= 4 and not STATE["deleted"]
+        pid, pod = pod_of(p)
+        up = pod and not pod["deleted"] and pod_seconds(pod) >= 4
         if not up:
             return self.problem(502, "no comfy yet")
         if p.endswith("/system_stats"):
             return self.send_json(200, {"system": {"comfyui_version": "0.38.2"}})
         if p.endswith("/history"):
-            done = pod_seconds() >= 7
+            done = pod_seconds(pod) >= 7
             return self.send_json(200, {"p1": {"outputs": {"9": {"images": [{"filename": "ainvfx_selftest_00001_.png",
                                         "subfolder": "", "type": "output"}]}}, "status": {"completed": True}}} if done else {})
         if p.endswith("/view"):
             if q.get("type") == ["input"] and q.get("filename") == ["bootstrap.log"] and q.get("subfolder") == ["ainvfx"]:
-                data = "\n".join(l for _, l in visible_lines()).encode()
+                if STATE["no_proxy_log"]:
+                    return self.problem(404, "no such file")
+                data = "\n".join(l for _, l in visible_lines(pod)).encode()
             else:
                 data = b"\x89PNG fake image bytes"
             self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
@@ -268,12 +302,13 @@ class EndToEnd(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
-        STATE.update({"pod": None, "t0": None, "posts": [], "logs_403": False, "uploads": [], "deleted": False})
+        STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
                         AINVFX_API_BASE="http://127.0.0.1:{}/v2".format(self.port),
-                        AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port)
+                        AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port,
+                        AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3")
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -295,7 +330,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(STATE["posts"][0].get("templateId"), "4i789znkrd")
         self.assertEqual(STATE["posts"][0].get("dataCenterIds"), ["CA-MTL-1"], "the country comes first")
         self.assertIn("SELFTEST OK", out, out)
-        self.assertIn("READY", out, "READY must be printed even when the stream skips the second it was written in")
+        self.assertIn("READY", out, "READY must be printed although the live stream never delivers it")
         self.assertNotIn("Still working", out, "`up` must return on READY, not on its deadline")
         self.assertEqual(rc, 0, out)
         out, rc = self.run_pod("status")
@@ -311,18 +346,52 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("-> input/", out, out)
         out, rc = self.run_pod("list")
         self.assertIn("fakepod1", out, out)
+        self.assertIn("here: `image`", out, out)
         out, rc = self.run_pod("down", "-y")
-        self.assertTrue(STATE["deleted"], out)
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
         self.assertIn("Nothing bills", out, out)
 
-    def test_whole_session_with_the_api_log_stream(self):
-        """The stream has an exclusive timestamp cursor and closes often (right after SELFTEST OK)."""
+    def test_whole_session_with_both_log_sources(self):
+        """The live stream keeps its keepalives and never delivers READY; the pod's copy does."""
+        self.whole_session()
+
+    def test_whole_session_when_the_pods_log_copy_is_unavailable(self):
+        """Only the API stream: READY must come from a reopened connection, a few seconds back."""
+        STATE["no_proxy_log"] = True
         self.whole_session()
 
     def test_whole_session_when_the_key_cannot_read_logs(self):
         """The logs endpoint answers 403: READY must come through the pod's own copy of the log."""
         STATE["logs_403"] = True
         self.whole_session()
+
+    def test_several_pods_at_once(self):
+        """Two training pods by name, one pod attached from the account, down --all."""
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "train", "--name", "jar-lora", "-y", "--wait", "1", timeout=90)
+        self.assertIn("READY", out, out)
+        self.assertEqual(STATE["posts"][-1]["name"], "ainvfx-train-jar-lora")
+        out, rc = self.run_pod("up", "train", "--name", "bottle-lora", "-y", "--wait", "1", timeout=90)
+        self.assertIn("READY", out, out)
+        out, rc = self.run_pod("up", "train", "--name", "jar-lora", "-y")
+        self.assertIn("already exists as `jar-lora`", out, out)
+        out, rc = self.run_pod("status")
+        self.assertNotEqual(rc, 0, "two pods recorded: the command must ask which one")
+        self.assertIn("jar-lora", out, out)
+        out, rc = self.run_pod("status", "bottle-lora")
+        self.assertIn("`bottle-lora`", out, out)
+        out, rc = self.run_pod("status", "ainvfx-train-jar-lora")
+        self.assertIn("`jar-lora`", out, "a pod name resolves to its tag")
+        Handler.new_pod("ainvfx-image-console", "NVIDIA GeForce RTX 5090", "CA-MTL-1")   # created from the console
+        out, rc = self.run_pod("list")
+        self.assertIn("not recorded here", out, out)
+        out, rc = self.run_pod("status", "fakepod3")
+        self.assertIn("attached to ainvfx-image-console", out, out)
+        out, rc = self.run_pod("list")
+        self.assertIn("here: `ainvfx-image-console`", out, out)
+        out, rc = self.run_pod("down", "--all", "-y")
+        self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [True, True, True], out)
+        self.assertIn("Nothing bills", out, out)
 
 
 if __name__ == "__main__":
