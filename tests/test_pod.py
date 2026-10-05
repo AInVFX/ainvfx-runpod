@@ -16,7 +16,10 @@ SELFTEST OK (READY, remember) never arrive on a live connection: only a fresh re
 Before 0.3.1, `up` therefore sat on SELFTEST OK until its deadline. Three scenarios: both sources
 available; the pod's own copy of the log unavailable (READY must come from a reopened stream);
 the log endpoint answering 403 (READY must come from the pod's own copy). Then several pods at
-once: `up --name`, commands by name or id, attaching a pod created elsewhere, `down --all`.
+once: `up --name`, commands by name or id, attaching a pod created elsewhere, `down --all`. Then
+what the 5 October pods taught: Runpod's system log (the image pull, layer by layer) shown as one
+summary, a container that does not start (the stall warning), and a log route that does not answer
+(a message, not a traceback).
 """
 import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -48,17 +51,53 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (7, "[AINVFX] READY · ComfyUI https://fakepod1-8188.proxy.runpod.net · JupyterLab port 8888 · log /workspace/ComfyUI/input/ainvfx/bootstrap.log"),
     (7, "[AINVFX] remember: terminate the pod when you are done"),
 ]
+# Runpod's own system log, as seen on a real pod on 5 October 2026: the host fetches the image one
+# Docker layer at a time (many "<layer> Extracting" lines), then starts the container. PULL_START
+# lines are scripted from creation; PULL_END lines from the container start (STATE["pull_seconds"]).
+PULL_START = [
+    (0, "create container runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"),
+    (0, "1.0.2-cu1281-torch280-ubuntu2404 Pulling from runpod/pytorch"),
+    (0, "38e4c3f3c358 Pulling fs layer"), (0, "a1b2c3d4e5f6 Pulling fs layer"), (0, "0123456789ab Pulling fs layer"),
+    (1, "0123456789ab Already exists"), (1, "38e4c3f3c358 Downloading"), (1, "a1b2c3d4e5f6 Downloading"),
+    (2, "38e4c3f3c358 Extracting"), (3, "38e4c3f3c358 Extracting"), (4, "38e4c3f3c358 Extracting"),
+    (5, "a1b2c3d4e5f6 Download complete"), (6, "38e4c3f3c358 Extracting"),
+]
+PULL_END = [
+    (-2, "38e4c3f3c358 Pull complete"), (-1, "a1b2c3d4e5f6 Extracting"), (-1, "a1b2c3d4e5f6 Pull complete"),
+    (-1, "Status: Downloaded newer image for runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"),
+    (0, "start container for runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404: begin"),
+]
 STEP = 0.4            # one scripted second of pod time = 0.4 real seconds
 LIVE_LIMIT = 16       # BOOT lines from this index on are never sent on a live connection
-STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0}
+NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
+STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
+         "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
+         "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
 
 def pod_seconds(pod):
     return (time.time() - pod["t0"]) / STEP
 
 
+def container_started(pod):
+    return pod_seconds(pod) >= STATE["pull_seconds"]
+
+
+def all_events(pod):
+    """Every scripted (second, source, line) of this pod, in order."""
+    pull = STATE["pull_seconds"]
+    ev = [(s, "system", l) for s, l in PULL_START if pull] + [(pull + s, "system", l) for s, l in PULL_END if pull]
+    ev += [(pull + s, "container", l) for s, l in BOOT]
+    return sorted(ev, key=lambda e: e[0])
+
+
+def visible_events(pod):
+    return [e for e in all_events(pod) if e[0] <= pod_seconds(pod)]
+
+
 def visible_lines(pod):
-    return [(s, l) for s, l in BOOT if s <= pod_seconds(pod)]
+    """The container lines written so far, as (second, line): what the pod's own log copy holds."""
+    return [(s, l) for s, src, l in visible_events(pod) if src == "container"]
 
 
 def pod_of(path):
@@ -99,6 +138,9 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path
         if p.startswith("/proxy/"):
             return self.proxy_get(p, q)
+        if p == "/v2/slow":                 # answers after 3 s: a host that does not respond
+            time.sleep(3)
+            return self.send_json(200, {"slow": True})
         if self.headers.get("Authorization") != "Bearer fake-key":
             return self.problem(401, "bad key")
         if p == "/v2/pods":
@@ -155,6 +197,10 @@ class Handler(BaseHTTPRequestHandler):
     def view_of(pod):
         v = {k: val for k, val in pod.items() if k not in ("t0", "deleted")}
         v["status"] = "RUNNING" if pod_seconds(pod) >= 1 else "STARTING"
+        if not container_started(pod):
+            v["runtime"] = None              # no container reported yet: image pull, create or boot
+        if pod_seconds(pod) < 2:
+            v["dataCenterId"] = None         # the scheduler reports it a few seconds after RUNNING
         return v
 
     def do_PUT(self):
@@ -174,26 +220,30 @@ class Handler(BaseHTTPRequestHandler):
     def logs(self, q, pod):
         if STATE["logs_403"]:
             return self.problem(403, "this key cannot read logs")
+        while time.time() - pod["t0"] < STATE["logs_hang_for"]:
+            time.sleep(0.1)                        # a host that does not answer: no headers at all
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
         since = q.get("since", [None])[0]
         tail = int(q.get("tail", ["100"])[0])
+        source = q.get("source", [None])[0]
+        events = [e for e in all_events(pod) if not source or e[1] == source]
         if since:
             # exclusive at second resolution, like the real cursor
-            start = [i for i, (s, _) in enumerate(BOOT) if ts_of(s) > since]
-            idx = start[0] if start else len(visible_lines(pod))
+            start = [i for i, e in enumerate(events) if ts_of(e[0]) > since]
+            idx = start[0] if start else len([e for e in events if e[0] <= pod_seconds(pod)])
         else:
-            idx = max(0, len(visible_lines(pod)) - tail)
-        backlog = len(visible_lines(pod))          # what the stored log holds at connection time
+            idx = max(0, len([e for e in events if e[0] <= pod_seconds(pod)]) - tail)
+        backlog = len([e for e in events if e[0] <= pod_seconds(pod)])   # what the stored log holds at connection time
         deadline, last_keepalive = time.time() + 60, time.time()
         while time.time() < deadline:
-            vis = visible_lines(pod)
+            vis = [e for e in events if e[0] <= pod_seconds(pod)]
             while idx < len(vis):
-                if idx >= LIVE_LIMIT and idx >= backlog:
+                s, src, line = vis[idx]
+                if line in NEVER_LIVE and idx >= backlog:
                     break                          # written after SELFTEST OK: never delivered live
-                s, line = vis[idx]
-                ev = "id: {}\ndata: {}\n\n".format(ts_of(s), json.dumps({"ts": ts_of(s), "source": "container", "line": line}))
+                ev = "id: {}\ndata: {}\n\n".format(ts_of(s), json.dumps({"ts": ts_of(s), "source": src, "line": line}))
                 try:
                     self.wfile.write(ev.encode()); self.wfile.flush()
                 except BrokenPipeError:
@@ -210,13 +260,13 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- fake ComfyUI behind the proxy
     def proxy_get(self, p, q):
         pid, pod = pod_of(p)
-        up = pod and not pod["deleted"] and pod_seconds(pod) >= 4
+        up = pod and not pod["deleted"] and pod_seconds(pod) >= STATE["pull_seconds"] + 4
         if not up:
             return self.problem(502, "no comfy yet")
         if p.endswith("/system_stats"):
             return self.send_json(200, {"system": {"comfyui_version": "0.38.2"}})
         if p.endswith("/history"):
-            done = pod_seconds(pod) >= 7
+            done = pod_seconds(pod) >= STATE["pull_seconds"] + 7
             return self.send_json(200, {"p1": {"outputs": {"9": {"images": [{"filename": "ainvfx_selftest_00001_.png",
                                         "subfolder": "", "type": "output"}]}}, "status": {"completed": True}}} if done else {})
         if p.endswith("/view"):
@@ -302,6 +352,24 @@ class Helpers(unittest.TestCase):
             pod.SETTINGS = old
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_image_pull_counts_layer_lines(self):
+        pull = pod.ImagePull()
+        self.assertTrue(pull.feed("38e4c3f3c358 Extracting"))
+        self.assertTrue(pull.feed("38e4c3f3c358 Extracting"))        # repeats of the same layer count once
+        self.assertTrue(pull.feed("a1b2c3d4e5f6 Pull complete"))
+        self.assertTrue(pull.feed("0123456789ab Already exists"))
+        self.assertTrue(pull.feed("fedcba987654 Downloading"))
+        self.assertFalse(pull.feed("start container for runpod/pytorch: begin"))
+        self.assertFalse(pull.feed("[AINVFX] step 1/5 health check"))
+        self.assertEqual(pull.counts(), (4, 2, 1, 1))
+        self.assertIn("4 layers · 2 done · 1 extracting · 1 downloading", pull.summary())
+
+    def test_api_error_timeout_hint(self):
+        e = pod.ApiError(0, "timed out after 30 s (no answer)", "u")
+        self.assertTrue(e.timed_out)
+        self.assertIn("did not answer in time", e.hint())
+        self.assertFalse(pod.ApiError(0, "[Errno -2] Name or service not known", "u").timed_out)
+
     def test_profiles_and_start_command(self):
         self.assertEqual(sorted(pod.PROFILES), ["image", "train", "video"])
         self.assertIn("bootstrap.sh", pod.START_CMD)
@@ -321,13 +389,16 @@ class EndToEnd(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
-        STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0})
+        STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
+                      "pull_seconds": 0, "logs_hang_for": 0})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
                         AINVFX_API_BASE="http://127.0.0.1:{}/v2".format(self.port),
                         AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port,
-                        AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3",
+                        AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3", AINVFX_STATUS_POLL="3",
+                        AINVFX_PULL_SUMMARY="2", AINVFX_HEARTBEAT="4", AINVFX_STALL_MINUTES="0.1",
+                        AINVFX_STREAM_IDLE="2",
                         AINVFX_SETTINGS=os.path.join(self.home, "settings.env"))
         with open(self.env["AINVFX_SETTINGS"], "w", encoding="utf-8") as f:
             f.write("AINVFX_COMFY_TAG=v0.38.2\nAINVFX_SELFTEST=0\n")
@@ -390,6 +461,44 @@ class EndToEnd(unittest.TestCase):
         """The logs endpoint answers 403: READY must come through the pod's own copy of the log."""
         STATE["logs_403"] = True
         self.whole_session()
+
+    def test_request_timeout_is_a_message_not_a_traceback(self):
+        """A server that accepts the request and never answers: an ApiError, code 0, flagged as a timeout."""
+        with self.assertRaises(pod.ApiError) as cm:
+            pod.request("GET", "http://127.0.0.1:{}/v2/slow".format(self.port), timeout=1)
+        self.assertEqual(cm.exception.code, 0)
+        self.assertTrue(cm.exception.timed_out, cm.exception.detail)
+
+    def test_up_shows_the_image_download_and_warns_on_a_stalled_container(self):
+        """The host fetches the image for 40 scripted seconds (16 real): the terminal must show the
+        download, then the stall warning (STALL_MINUTES is 0.1 here), then READY once the container runs."""
+        STATE["pull_seconds"] = 40
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("[RUNPOD] create container runpod/pytorch", out, out)
+        self.assertIn("the host is fetching the pod's image", out, out)
+        self.assertIn("[RUNPOD] image download: 3 layers", out, out)
+        self.assertIn("WARNING: NO CONTAINER", out, out)
+        self.assertIn("3 done · 0 extracting · 0 downloading", out, "the final summary once every layer is done")
+        self.assertIn("[RUNPOD] start container for runpod/pytorch", out, out)
+        self.assertIn("[AINVFX] step 1/5 health check", out, out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(out.count("the host is fetching the pod's image"), 1, "the explanation is printed once")
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_up_survives_a_log_stream_that_does_not_answer(self):
+        """The logs route sends nothing for the first 12 s of the pod (`up` reaches it after about 9 s,
+        the stream timeout is 2 s here): once a traceback, now a [RUNPOD] line, then the normal follow."""
+        STATE["logs_hang_for"] = 12
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("the log stream did not answer", out, out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
 
     def test_several_pods_at_once(self):
         """Two training pods by name, one pod attached from the account, down --all."""
