@@ -46,7 +46,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 API = "https://api.runpod.io/v2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
@@ -141,7 +141,7 @@ class ApiError(Exception):
         if self.code == 401:
             return "The API key is missing, wrong or expired. Runpod console > Account > Credentials > API Keys. Then:  python pod.py setup"
         if self.code == 403:
-            return "The API key does not allow this call: add the permission to the key (Pods, read and write), or create a new key."
+            return "The API key does not allow this call. Console > Account > Credentials > API Keys: edit the key and set api.runpod.io/graphql to Read / Write, or create a new key with that permission."
         if self.code == 402:
             return "Insufficient balance on the Runpod account: add credit, then try again."
         if self.code == 429:
@@ -429,8 +429,9 @@ def cmd_setup(args):
     key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
     if not key:
         say("\n1. Your Runpod API key. Console > Account > Credentials > API Keys > Create API Key.")
-        say("   Permission: Restricted, with read and write on Pods (add Secrets and SSH keys if you use")
-        say("   `--hf-token` or `pod.py ssh`; otherwise do those two in the console).")
+        say("   Permission: Restricted. Then two lines appear:")
+        say("     api.runpod.io/graphql  ->  Read / Write   (the API this script uses: pods, catalog, secrets, SSH keys)")
+        say("     api.runpod.ai          ->  None           (Serverless endpoints, not used here)")
         say("   Paste it below (nothing shows while you type), then Enter.")
         key = getpass.getpass("   API key: ").strip()
     if not key:

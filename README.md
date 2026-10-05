@@ -49,7 +49,7 @@ Profiles: `up image` rents an RTX 5090 with a 100 GB disk; `up video` an RTX PRO
 
 - **Python 3.8 or newer.** Windows: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`. macOS and Linux usually have it: `python3 --version`. Or install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run `uv run pod.py ...`, which fetches a Python for you.
 - **Git**, to clone and update this repository. Without Git, GitHub's "Download ZIP" button works too.
-- **A Runpod API key**: in the console, Account, Credentials, API Keys, "Create API Key", permission *Restricted* with Read and Write on Pods (add Secrets if you use `setup --hf-token`, and SSH Public Keys if you use `pod.py ssh`). The old Settings page now redirects there. The script keeps the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
+- **A Runpod API key**: in the console, Account, Credentials, API Keys, "Create API Key". Choose *Restricted*, then set **api.runpod.io/graphql** to **Read / Write** (the API the script uses for pods, the catalog, secrets and SSH keys) and leave **api.runpod.ai** on **None** (Serverless endpoints, not used here). The old Settings page now redirects to Credentials. The script keeps the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
 - **`ssh` is optional.** Only `pod.py ssh` uses it. Everything else goes through the browser and Runpod's proxy.
 
 The script uses Python's standard library only: nothing to install.
