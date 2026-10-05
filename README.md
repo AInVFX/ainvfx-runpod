@@ -24,9 +24,9 @@ Two ways to create a pod. Both give the same machine.
 ## Quick start, browser only
 
 1. Open [the AInVFX template](https://console.runpod.io/deploy?template=4i789znkrd&ref=iad0yzht) (template id `4i789znkrd`).
-2. Pick the GPU: **RTX 5090** for image work. If it is out of stock, switch to Community Cloud or pick a slice of the RTX PRO 6000.
+2. Pick the GPU: **RTX 5090** for image work. If it is out of stock, open the **Filter** button of the Compute section and set **Cloud type** to **Community** (machines owned by third parties, cheaper and often better stocked; the console shows a warning), or pick a slice of the RTX PRO 6000.
 3. Click **Deploy On-Demand**. The pod appears under Pods; its **Logs** button shows the install running.
-4. Wait for the line `READY`: 5 to 15 minutes depending on the data center. Open `https://<pod id>-8188.proxy.runpod.net` (also behind the pod's **Connect** button): that is your ComfyUI.
+4. Wait for the line `READY`: 5 to 15 minutes depending on the data center. Open `https://<pod id>-8188.proxy.runpod.net` (also behind the pod's **Connect** button): that is your ComfyUI. If the button opens a blank "403" page, press Enter in the address bar: ComfyUI refuses a page opened by a click from another site (its protection against sites that would drive it), never the address typed or opened by `pod.py open`.
 5. When you are done: download your results (the Assets panel in ComfyUI), then **Terminate** the pod. Stop is not enough: a stopped pod keeps a dead entry and may keep billing storage.
 
 ## Quick start, script
@@ -35,6 +35,7 @@ Two ways to create a pod. Both give the same machine.
 git clone https://github.com/AInVFX/ainvfx-runpod
 cd ainvfx-runpod
 python pod.py setup        # once: your Runpod API key, your nearest data centers, your SSH key (optional)
+python pod.py setup --hf-token   # optional: your Hugging Face token, stored on Runpod as a secret (gated files)
 python pod.py up image     # creates the pod, follows its log until READY
 python pod.py open         # opens ComfyUI in your browser
 python pod.py pull         # downloads the pod's outputs into outputs/<pod name>/
@@ -42,6 +43,8 @@ python pod.py down         # pulls, then terminates (billing stops)
 ```
 
 The other commands: `logs` (follow the log again), `status` (GPU, cost so far, address, last log lines), `push file.png` (copy a file into the pod's input folder), `ssh` (a terminal on the pod), `list` (every pod of your account), `doctor` (check your setup). `python pod.py --help` lists them all. Ctrl+C while a log is followed stops the following only; the pod keeps running until `down`.
+
+**Several pods at once** (LoRA training, for example): `up train --name jar-lora` creates a second pod of the same profile, known to the script as `jar-lora`. Every command then takes that name, the pod's full name or its id: `status jar-lora`, `pull ainvfx-train-jar-lora`, `down jar-lora`. `list` shows every pod of your account and which ones this machine knows; a pod created from the console or from another machine is attached by its first command (`python pod.py status <name or id>`). `down --all` terminates every pod recorded here.
 
 Profiles: `up image` rents an RTX 5090 with a 100 GB disk; `up video` an RTX PRO 6000 (96 GB) with a 200 GB disk, for LTX 2.5; `up train` the same card with 250 GB, for LoRA training.
 
@@ -67,6 +70,8 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 | 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one, each with its time and speed; the first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped | `MODELS DONE 14/14` with the total time and the average speed |
 | 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` |
 
+`up` and `logs` read the log from two places, because Runpod's live log stream has been seen staying open and silent while the pod wrote its last lines: the stream is reopened every minute a few seconds back, and every 15 seconds the script reads the copy of the log that the pod serves itself. Whichever shows `READY` first ends the wait.
+
 If GitHub cannot be reached, the start command falls back to Runpod's own `/start.sh`: the pod still boots with SSH and JupyterLab, and the error can be read.
 
 Profile sizes (Hugging Face, 4 October 2026): `image` 14 files, about 63 GB; `video` 36 files, about 150 GB; `train` 38 files, about 215 GB.
@@ -77,7 +82,7 @@ The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reac
 
 ## The Hugging Face token
 
-The gated repositories (LTX 2.5) need a Hugging Face read token. The token never travels in a slide, a chat or a file:
+The gated repositories (LTX 2.5) need a Hugging Face read token: a free Hugging Face account, the licence accepted once on the model's page ("Agree and access repository"), then a token of type Read from Settings, Access Tokens. The token never travels in a slide, a chat or a file:
 
 - `python pod.py setup --hf-token` stores it on Runpod as the secret `huggingface_token` (or do it in the console: Account, Credentials, Secrets, same name).
 - Pods receive it as the variable `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots.

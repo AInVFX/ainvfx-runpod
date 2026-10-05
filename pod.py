@@ -9,15 +9,20 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py up image           create a pod for the image sessions (RTX 5090, 100 GB disk)
   python pod.py up video           create a pod for video (RTX PRO 6000, 200 GB disk)
   python pod.py up train           create a pod for LoRA training (RTX PRO 6000, 250 GB disk)
-  python pod.py status [profile]   status, GPU, data center, cost so far, ComfyUI address, last log lines
-  python pod.py logs [profile]     follow the pod's log until READY (or Ctrl+C)
-  python pod.py open [profile]     open ComfyUI in your browser
-  python pod.py push [profile] FILES...   copy images or videos into the pod's input folder
-  python pod.py pull [profile]     download the pod's outputs into outputs/<pod name>/
-  python pod.py down [profile]     pull, then terminate the pod (billing stops)
-  python pod.py ssh [profile]      a terminal on the pod
+  python pod.py up train --name jar-lora   a second training pod, known here as `jar-lora`
+  python pod.py status [pod]       status, GPU, data center, cost so far, ComfyUI address, last log lines
+  python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
+  python pod.py open [pod]         open ComfyUI in your browser
+  python pod.py push [pod] FILES...   copy images or videos into the pod's input folder
+  python pod.py pull [pod]         download the pod's outputs into outputs/<pod name>/
+  python pod.py down [pod]         pull, then terminate the pod (billing stops); `down --all` for every pod
+  python pod.py ssh [pod]          a terminal on the pod
   python pod.py list               every pod of your account, with its hourly price
   python pod.py doctor             check Python, ssh, the API key, the configuration
+
+[pod] is the profile, the name given to `up --name`, the pod's name or its id; it can be left out
+when one pod is recorded. A pod created from the console or another machine is attached by its
+first command: `python pod.py status <name or id>`.
 
 The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
 (driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each with its
@@ -47,7 +52,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
@@ -64,6 +69,11 @@ CONFIG = CONFIG_DIR / "config.json"
 HERE = Path(__file__).resolve().parent
 OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")   # where `pull` puts the files
 FINAL = ("EXITED", "ERROR", "TERMINATED")
+# The API log stream can stay open and silent while the pod writes lines that the stored log holds:
+# every STREAM_MAX_AGE seconds the stream is reopened a few seconds back, and every PROXY_POLL
+# seconds the copy of the log that the pod serves itself is read. Both overridable for the tests.
+STREAM_MAX_AGE = int(os.environ.get("AINVFX_STREAM_MAX_AGE", "60"))
+PROXY_POLL = int(os.environ.get("AINVFX_PROXY_POLL", "15"))
 
 PROFILES = {
     "image": dict(disk=100, gpus=["NVIDIA GeForce RTX 5090",
@@ -282,24 +292,36 @@ def dc_order(dc_id, region, country):
             1 if same_region else 2 if region_of(dc_id) in REGION_NAMES else 3)
 
 
-def profile_of(cfg, name):
-    if name is None:
-        pods = cfg.get("pods", {})
+def which_pod(cfg, ref):
+    """The pod a command targets: (tag, record). `ref` is a tag (a profile name, or the `--name`
+    given to `up`), a pod name, a pod id, or nothing when one pod is recorded. A pod that exists in
+    the account but not here (created from the console, or from another machine) is attached: its
+    record is written to the configuration under its name, so the next commands can use it."""
+    pods = cfg.setdefault("pods", {})
+    if ref is None:
         if len(pods) == 1:
-            return next(iter(pods))
+            tag = next(iter(pods))
+            return tag, pods[tag]
         if not pods:
-            die("no pod recorded. First:  python pod.py up image")
-        die("several pods recorded ({}): name the profile".format(", ".join(pods)))
-    if name not in PROFILES:
-        die("unknown profile '{}'. Choose: {}".format(name, ", ".join(PROFILES)))
-    return name
-
-
-def recorded_pod(cfg, profile):
-    pod = cfg.get("pods", {}).get(profile)
-    if not pod:
-        die("no pod recorded for '{}'. First:  python pod.py up {}".format(profile, profile))
-    return pod
+            die("no pod recorded here. `python pod.py up image` creates one; "
+                "`python pod.py list` shows the account's pods, then `python pod.py status <name or id>` attaches to one.")
+        die("several pods recorded, name one: {}".format(
+            "  ".join("{} ({})".format(t, r.get("name")) for t, r in pods.items())))
+    if ref in pods:
+        return ref, pods[ref]
+    for tag, rec in pods.items():
+        if ref in (rec.get("id"), rec.get("name")):
+            return tag, rec
+    for p in list_pods(cfg, quiet=True):
+        pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
+        if ref in (pid, pname) or (pname and pname.startswith(ref)):
+            rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
+                   "created": p.get("createdAt") or ""}
+            pods[pname or pid] = rec
+            save_config(cfg)
+            say("attached to {} ({})".format(rec["name"], pid))
+            return pname or pid, rec
+    die("no pod '{}' recorded here or in your account. `python pod.py list` shows them.".format(ref))
 
 
 def fmt_money(x):
@@ -366,12 +388,18 @@ def list_pods(cfg, quiet=False):
     if not quiet:
         if not pods:
             say("No pod in your account.")
+        tags = {r.get("id"): t for t, r in (cfg.get("pods") or {}).items()}
         for p in pods:
             gpu, dc, price = pod_summary(p)
             say("{:<28} {:<12} {:<40} {:<10} {}".format(
                 str(p.get("name") or "?")[:28], pod_status(p)[:12], gpu[:40], dc[:10],
                 (fmt_money(price) + "/h") if price else ""))
-            say("    id {}   ComfyUI {}".format(p.get("id"), pod_url(str(p.get("id")))))
+            tag = tags.get(p.get("id"))
+            say("    id {}   {}   ComfyUI {}".format(
+                p.get("id"), "here: `{}`".format(tag) if tag else "not recorded here", pod_url(str(p.get("id")))))
+        if pods:
+            say("Commands take the name in backquotes, the pod name or the id: `python pod.py status <that>`. "
+                "A pod not recorded here is attached by its first command.")
     return pods
 
 
@@ -389,12 +417,14 @@ def secret_exists(cfg):
         return None
 
 
-def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20):
+def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20, max_age=None):
     """Yield (event_id, source, line) from GET /pods/{id}/logs, a Server-Sent Events stream
     (one `id:` line and one `data:` JSON line per event, with ts, source and line; the id is the ts).
     `tail` lines are sent first, then live lines; with `since` (an RFC 3339 time) the stream resumes
-    from that time instead. Stops after `idle` seconds without data."""
+    from that time instead. Stops after `idle` seconds without any data, or after `max_age` seconds
+    in all cases. Yields (None, None, None) on keepalive lines, so the caller can do periodic work."""
     q = {}
+    opened = time.time()
     hdrs = {"Accept": "text/event-stream"}
     if since:
         q["since"] = since
@@ -407,6 +437,8 @@ def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20):
     eid = None
     try:
         while True:
+            if max_age and time.time() - opened > max_age:
+                return
             try:
                 raw = r.readline()
             except (socket.timeout, TimeoutError, OSError):
@@ -424,6 +456,8 @@ def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20):
                     ev = {"line": payload}
                 if isinstance(ev, dict):
                     yield eid, str(ev.get("source") or ""), str(ev.get("line") or "")
+            else:
+                yield None, None, None          # a blank or comment line: a keepalive
     finally:
         try:
             r.close()
@@ -435,11 +469,9 @@ def pod_logs(cfg, pod_id, tail=400, seconds=10):
     """The last `tail` container log lines, as a list of strings (the stream is left after `seconds`)."""
     lines, t0 = [], time.time()
     try:
-        for _, _, line in log_stream(cfg, pod_id, tail=tail, source="container", idle=3):
+        for _, _, line in log_stream(cfg, pod_id, tail=tail, source="container", idle=3, max_age=seconds):
             if line:
                 lines.append(line)
-            if time.time() - t0 > seconds:
-                break
     except ApiError as e:
         return None, e
     return lines, None
@@ -468,10 +500,13 @@ def resume_point(event_id, seconds=5):
 
 def follow_logs(cfg, pod_id, minutes=25):
     """Print the [AINVFX] lines as they appear, until READY, a dead pod, or the time runs out.
-    Two sources: the API log stream (reconnected with an overlap when it goes quiet) and, once
-    ComfyUI answers, the copy of the log the pod serves through the proxy."""
+    Two sources, because the API stream has been seen staying open and silent while the pod wrote
+    lines that only the stored log held: the stream is reopened every STREAM_MAX_AGE seconds a few
+    seconds back (duplicates are dropped), and every PROXY_POLL seconds the copy of the log that the
+    pod serves through its own ComfyUI is read."""
     deadline = time.time() + minutes * 60
-    seen, printed, last_id, told, last_check = set(), set(), None, False, time.time()
+    seen, printed, last_id, told = set(), set(), None, False
+    last_check = last_poll = time.time()
 
     def show(line, key):
         if key in seen or line in printed:
@@ -480,12 +515,23 @@ def follow_logs(cfg, pod_id, minutes=25):
         say("  " + line[line.index("[AINVFX]"):])
         return "READY" in line
 
+    def poll_proxy():
+        for line in proxy_log(pod_id):
+            if show(line, ("proxy", line)):
+                return True
+        return False
+
     while time.time() < deadline:
         try:
-            for eid, _, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=30):
-                last_id = eid or last_id
-                if "[AINVFX]" in line and show(line, (eid, line)):
+            for eid, _, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=30,
+                                           max_age=STREAM_MAX_AGE):
+                if line and "[AINVFX]" in line and show(line, (eid, line)):
                     return True
+                last_id = eid or last_id
+                if time.time() - last_poll > PROXY_POLL:
+                    last_poll = time.time()
+                    if poll_proxy():
+                        return True
                 if time.time() > deadline:
                     break
         except ApiError as e:
@@ -493,11 +539,10 @@ def follow_logs(cfg, pod_id, minutes=25):
                 say("(the log cannot be read through the API from here: {}. Follow it in the console, "
                     "Pods > your pod > Logs, or wait: the pod's own copy is read below.)".format(e.detail))
                 told = True
-            time.sleep(10)
-        # the stream went quiet: the pod's own copy of the log is the second source
-        for line in proxy_log(pod_id):
-            if show(line, ("proxy", line)):
-                return True
+            time.sleep(min(PROXY_POLL, 10))
+        last_poll = time.time()
+        if poll_proxy():
+            return True
         if time.time() - last_check > 45:
             last_check = time.time()
             try:
@@ -636,30 +681,32 @@ def create_pod(cfg, body, where):
 
 def cmd_up(args):
     cfg = load_config()
-    profile = profile_of(cfg, args.profile)
+    profile = args.profile
     spec = PROFILES[profile]
     api_key(cfg)
-    old = cfg.get("pods", {}).get(profile)
+    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile
+    cfg.setdefault("pods", {})
+    old = cfg["pods"].get(tag)
     if old:
         try:
             pod = get_pod(cfg, old["id"])
             st = pod_status(pod)
             if st not in FINAL and st != "?":
-                say("A pod already exists for '{}': {} ({}). Address: {}".format(
-                    profile, old.get("name"), st, pod_url(old["id"])))
-                say("Use it, or terminate it first:  python pod.py down {}".format(profile))
+                say("A pod already exists as `{}`: {} ({}). Address: {}".format(tag, old.get("name"), st, pod_url(old["id"])))
+                say("Use it, terminate it first (python pod.py down {}), or create another one with `up {} --name <name>`."
+                    .format(tag, profile))
                 return
         except ApiError as e:
             if e.code != 404:
                 die("{}\n{}".format(e, e.hint()))
-        cfg["pods"].pop(profile, None)
+        cfg["pods"].pop(tag, None)
         save_config(cfg)
 
     region = args.region or cfg.get("region") or local_region()
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
     disk = args.disk or spec["disk"]
     gpus = [args.gpu] if args.gpu else spec["gpus"]
-    name = "ainvfx-{}-{}".format(profile, datetime.now().strftime("%m%d-%H%M"))
+    name = "ainvfx-{}-{}".format(profile, tag if tag != profile else datetime.now().strftime("%m%d-%H%M"))
     env = {"AINVFX_PROFILE": profile, "AINVFX_COMFY_TAG": COMFY_TAG}
     if cfg.get("hf_secret") or secret_exists(cfg):
         env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
@@ -721,7 +768,7 @@ def cmd_up(args):
         die("no pod could be created. Try again in a few minutes, another profile, or the Runpod console.")
 
     pod_id = created["id"]
-    cfg["pods"][profile] = {"id": pod_id, "name": name, "created": datetime.now(timezone.utc).isoformat()}
+    cfg["pods"][tag] = {"id": pod_id, "name": name, "profile": profile, "created": datetime.now(timezone.utc).isoformat()}
     save_config(cfg)
     say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
     wait_until = time.time() + 15 * 60
@@ -746,26 +793,24 @@ def cmd_up(args):
         follow_logs(cfg, pod_id, minutes=args.wait)
     except KeyboardInterrupt:
         say("\nStopped following the log. The pod keeps running: `python pod.py logs {0}` to follow again, "
-            "`python pod.py down {0}` to terminate.".format(profile))
+            "`python pod.py down {0}` to terminate.".format(tag))
         sys.exit(130)
-    say("\nWhen you are done:  python pod.py down {}".format(profile))
+    say("\nWhen you are done:  python pod.py down {}".format(tag))
 
 
 def cmd_logs(args):
     cfg = load_config()
-    profile = profile_of(cfg, args.profile)
-    rec = recorded_pod(cfg, profile)
+    tag, rec = which_pod(cfg, args.profile)
     try:
         follow_logs(cfg, rec["id"], minutes=args.wait)
     except KeyboardInterrupt:
-        say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(profile))
+        say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(tag))
         sys.exit(130)
 
 
 def cmd_status(args):
     cfg = load_config()
-    profile = profile_of(cfg, args.profile)
-    rec = recorded_pod(cfg, profile)
+    tag, rec = which_pod(cfg, args.profile)
     try:
         pod = get_pod(cfg, rec["id"])
     except ApiError as e:
@@ -774,7 +819,7 @@ def cmd_status(args):
         die("{}\n{}".format(e, e.hint()))
     gpu, dc, price = pod_summary(pod)
     st = pod_status(pod)
-    say("{} · {} · {} · CUDA {} · {}".format(rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
+    say("`{}` · {} · {} · {} · CUDA {} · {}".format(tag, rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
     created = parse_time(pod.get("createdAt") or "") or parse_time(rec.get("created", ""))
     if created and price:
         hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
@@ -802,7 +847,7 @@ def cmd_status(args):
 
 def cmd_open(args):
     cfg = load_config()
-    rec = recorded_pod(cfg, profile_of(cfg, args.profile))
+    _, rec = which_pod(cfg, args.profile)
     url = pod_url(rec["id"])
     say(url)
     webbrowser.open(url)
@@ -822,7 +867,7 @@ def multipart(fields, filefield, path):
 
 def cmd_push(args):
     cfg = load_config()
-    rec = recorded_pod(cfg, profile_of(cfg, args.profile))
+    _, rec = which_pod(cfg, args.profile)
     base = pod_url(rec["id"])
     files = [Path(f).expanduser() for f in args.files]
     for f in files:
@@ -845,10 +890,9 @@ def cmd_push(args):
 
 def cmd_pull(args):
     cfg = load_config()
-    profile = profile_of(cfg, args.profile)
-    rec = recorded_pod(cfg, profile)
+    _, rec = which_pod(cfg, args.profile)
     n = pull(cfg, rec)
-    say("{} file(s) new in {}".format(n, OUTPUTS / rec.get("name", profile)))
+    say("{} file(s) new in {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
 
 
 def pull(cfg, rec):
@@ -893,26 +937,32 @@ def pull(cfg, rec):
 
 def cmd_down(args):
     cfg = load_config()
-    profile = profile_of(cfg, args.profile)
-    rec = recorded_pod(cfg, profile)
-    if not args.no_pull:
-        n = pull(cfg, rec)
-        say("{} file(s) pulled into {}".format(n, OUTPUTS / rec.get("name", profile)))
+    if args.all:
+        targets = list((cfg.get("pods") or {}).items())
+        if not targets:
+            die("no pod recorded here. `python pod.py list` shows the account's pods.")
+    else:
+        targets = [which_pod(cfg, args.profile)]
     if not args.yes:
-        ans = input("Terminate pod {} now? Its disk is erased, billing stops. [Y/n] ".format(rec.get("name"))).strip().lower()
+        names = ", ".join(r.get("name") or r["id"] for _, r in targets)
+        ans = input("Terminate {} now? The disk is erased, billing stops. [Y/n] ".format(names)).strip().lower()
         if ans not in ("", "y", "yes"):
-            say("Kept running. Remember: it bills until terminated.")
+            say("Kept running. Remember: a pod bills until terminated.")
             return
-    try:
-        rp("DELETE", "/pods/" + rec["id"], cfg)          # DELETE /pods/{id}: terminate, 204 no body
-        say("Terminated: {}".format(rec.get("name")))
-    except ApiError as e:
-        if e.code == 404:
-            say("Already gone from Runpod.")
-        else:
-            die("{}\n{}".format(e, e.hint()))
-    cfg["pods"].pop(profile, None)
-    save_config(cfg)
+    for tag, rec in targets:
+        if not args.no_pull:
+            n = pull(cfg, rec)
+            say("{} file(s) pulled into {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
+        try:
+            rp("DELETE", "/pods/" + rec["id"], cfg)          # DELETE /pods/{id}: terminate, 204 no body
+            say("Terminated: {}".format(rec.get("name")))
+        except ApiError as e:
+            if e.code == 404:
+                say("{}: already gone from Runpod.".format(rec.get("name")))
+            else:
+                die("{}\n{}".format(e, e.hint()))
+        cfg["pods"].pop(tag, None)
+        save_config(cfg)
     try:
         remaining = list_pods(cfg, quiet=True)
     except ApiError:
@@ -933,7 +983,7 @@ def cmd_list(args):
 
 def cmd_ssh(args):
     cfg = load_config()
-    rec = recorded_pod(cfg, profile_of(cfg, args.profile))
+    _, rec = which_pod(cfg, args.profile)
     pod = get_pod(cfg, rec["id"])
     kind, host, port, user = pod_ssh(pod)
     if not kind:
@@ -970,8 +1020,8 @@ def cmd_doctor(args):
         found = secret_exists(cfg)
         say("  HF secret    {}".format("present" if found else "absent (setup --hf-token)" if found is False
                                        else "unknown: the key cannot list secrets"))
-    for prof, rec in (cfg.get("pods") or {}).items():
-        say("  pod {:<8} {} ({})".format(prof, rec.get("name"), rec.get("id")))
+    for tag, rec in (cfg.get("pods") or {}).items():
+        say("  pod `{}`: {} ({})".format(tag, rec.get("name"), rec.get("id")))
 
 
 def main():
@@ -991,6 +1041,8 @@ def main():
 
     p = sub.add_parser("up", help="create a pod")
     p.add_argument("profile", nargs="?", default="image", choices=sorted(PROFILES))
+    p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`); "
+                                  "the other commands then take that name")
     p.add_argument("--gpu", help="exact GPU type id, instead of the profile's list")
     p.add_argument("--disk", type=int, help="container disk in GB")
     p.add_argument("--region", choices=["EU", "NA"])
@@ -1000,8 +1052,9 @@ def main():
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
     p.set_defaults(func=cmd_up)
 
+    POD_REF = "which pod: the profile, the name given to `up --name`, the pod's name or its id (optional with one pod)"
     p = sub.add_parser("logs", help="follow the log until READY")
-    p.add_argument("profile", nargs="?")
+    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
     p.add_argument("--wait", type=int, default=25, help="minutes (default 25)")
     p.set_defaults(func=cmd_logs)
 
@@ -1009,31 +1062,32 @@ def main():
                           ("open", cmd_open, "open ComfyUI in the browser"),
                           ("pull", cmd_pull, "download the outputs")):
         p = sub.add_parser(name, help=hlp)
-        p.add_argument("profile", nargs="?")
+        p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
         p.set_defaults(func=fn)
 
     p = sub.add_parser("push", help="upload files into the pod's input folder")
-    p.add_argument("profile", nargs="?")
+    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
     p.add_argument("files", nargs="+")
     p.set_defaults(func=cmd_push)
 
     p = sub.add_parser("down", help="pull, then terminate")
-    p.add_argument("profile", nargs="?")
+    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
+    p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("-y", "--yes", action="store_true")
     p.set_defaults(func=cmd_down)
 
     p = sub.add_parser("ssh", help="a terminal on the pod")
-    p.add_argument("profile", nargs="?")
+    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
     p.add_argument("command", nargs="*")
     p.set_defaults(func=cmd_ssh)
 
-    sub.add_parser("list", help="every pod of the account").set_defaults(func=cmd_list)
+    sub.add_parser("list", help="every pod of the account, and which ones are recorded here").set_defaults(func=cmd_list)
     sub.add_parser("doctor", help="check this machine and the configuration").set_defaults(func=cmd_doctor)
 
     args = ap.parse_args()
-    # `push image file.png` and `push file.png` both work
-    if args.cmd == "push" and args.profile and args.profile not in PROFILES:
+    # `push image file.png` and `push file.png` both work: a first argument that is a file is a file
+    if args.cmd == "push" and args.profile and Path(args.profile).expanduser().exists():
         args.files.insert(0, args.profile)
         args.profile = None
     try:
