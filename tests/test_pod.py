@@ -283,6 +283,25 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.pod_ssh(p), ("direct", "81.27.69.177", 32554, "root"))
         self.assertEqual(pod.pod_ssh({})[0], None)
 
+    def test_settings_file_parsing(self):
+        d = tempfile.mkdtemp(prefix="ainvfx-settings-")
+        f = os.path.join(d, "settings.env")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("# comment\nAINVFX_COMFY_TAG=master\nAINVFX_TORCH=\"--pre torch torchvision\"\n"
+                     "AINVFX_SELFTEST=\nOTHER=1\n  AINVFX_PYTHON = 3.14 \n")
+        old = pod.SETTINGS
+        pod.SETTINGS = pod.Path(f)
+        try:
+            self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "master", "AINVFX_TORCH": "--pre torch torchvision",
+                                                   "AINVFX_PYTHON": "3.14"})
+            self.assertEqual(pod.comfy_tag(), "master")
+            pod.SETTINGS = pod.Path(d) / "missing.env"
+            self.assertEqual(pod.load_settings(), {})
+            self.assertEqual(pod.comfy_tag(), "v0.38.2")
+        finally:
+            pod.SETTINGS = old
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_profiles_and_start_command(self):
         self.assertEqual(sorted(pod.PROFILES), ["image", "train", "video"])
         self.assertIn("bootstrap.sh", pod.START_CMD)
@@ -308,7 +327,10 @@ class EndToEnd(unittest.TestCase):
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
                         AINVFX_API_BASE="http://127.0.0.1:{}/v2".format(self.port),
                         AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port,
-                        AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3")
+                        AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3",
+                        AINVFX_SETTINGS=os.path.join(self.home, "settings.env"))
+        with open(self.env["AINVFX_SETTINGS"], "w", encoding="utf-8") as f:
+            f.write("AINVFX_COMFY_TAG=v0.38.2\nAINVFX_SELFTEST=0\n")
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -329,6 +351,10 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("elsewhere: EU-CZ-1", out, out)
         self.assertEqual(STATE["posts"][0].get("templateId"), "4i789znkrd")
         self.assertEqual(STATE["posts"][0].get("dataCenterIds"), ["CA-MTL-1"], "the country comes first")
+        sent = STATE["posts"][0].get("env") or {}
+        self.assertEqual(sent.get("AINVFX_PROFILE"), "image")
+        self.assertEqual(sent.get("AINVFX_SELFTEST"), "0", "settings.env values travel with the pod")
+        self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "v0.38.2")
         self.assertIn("SELFTEST OK", out, out)
         self.assertIn("READY", out, "READY must be printed although the live stream never delivers it")
         self.assertNotIn("Still working", out, "`up` must return on READY, not on its deadline")
