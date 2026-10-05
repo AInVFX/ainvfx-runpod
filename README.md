@@ -1,13 +1,7 @@
 <p align="center">
-  <a href="https://www.ainvfx.com/"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://www.ainvfx.com/assets/images/logo.webp">
-    <img src="https://www.ainvfx.com/assets/images/logo.webp" alt="AInVFX" height="40">
-  </picture></a>
+  <a href="https://www.ainvfx.com/"><img src="https://www.ainvfx.com/assets/images/logo.webp" alt="AInVFX" height="40"></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.runpod.io/"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://cdn.prod.website-files.com/69ce570adca53340abab8376/69f047dba6113c1d43463ddd_logo-white.svg">
-    <img src="https://cdn.prod.website-files.com/69ce570adca53340abab8376/69f047dba6113c1d43463ddd_logo-white.svg" alt="Runpod" height="40">
-  </picture></a>
+  <a href="https://www.runpod.io/"><img src="https://cdn.prod.website-files.com/69ce570adca53340abab8376/69f047dba6113c1d43463ddd_logo-white.svg" alt="Runpod" height="40"></a>
 </p>
 
 # ainvfx-runpod
