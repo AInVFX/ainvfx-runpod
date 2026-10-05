@@ -19,9 +19,10 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py list               every pod of your account, with its hourly price
   python pod.py doctor             check Python, ssh, the API key, the configuration
 
-The pod runs bootstrap.sh from this repository at start: a health check (driver, disk speed,
-download speed), then ComfyUI at a pinned tag, then the models of the profile, then one test
-image. Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you.
+The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
+(driver, disk speed, download speed), then ComfyUI at a pinned tag, then the models of the profile,
+then one test image. Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you.
+On the test pod (RTX 5090, 4 Oct 2026) the log said READY about 15 minutes after creation.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -45,7 +46,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 API = "https://api.runpod.io/v2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
@@ -53,7 +54,7 @@ COMFY_TAG = "v0.38.2"
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
-TEMPLATE_ID = ""             # the public AInVFX template; `setup --template ID` overrides
+TEMPLATE_ID = "4i789znkrd"   # the public AInVFX template "AInVFX bootcamp ComfyUI"; `setup --template ID` overrides
 HF_SECRET = "huggingface_token"                   # the Runpod Secret holding your Hugging Face token
 HF_SECRET_REF = "{{ RUNPOD_SECRET_%s }}" % HF_SECRET   # Runpod substitutes the value when the pod boots
 WINDOWS = platform.system() == "Windows"
@@ -599,8 +600,8 @@ def cmd_up(args):
                     "gpu": {"id": gpu, "count": 1, "minCudaVersion": MIN_CUDA}}
             if dc_list:
                 body["dataCenterIds"] = dc_list
-            if cfg.get("template_id"):
-                body["templateId"] = cfg["template_id"]      # image, command, ports come from the template
+            if cfg.get("template_id") or TEMPLATE_ID:
+                body["templateId"] = cfg.get("template_id") or TEMPLATE_ID   # image, command, ports come from the template
             else:
                 body["image"] = IMAGE
                 body["args"] = START_CMD
@@ -839,7 +840,7 @@ def cmd_doctor(args):
     say("  ssh          {}".format(shutil.which("ssh") or "absent (JupyterLab replaces it)"))
     say("  config       {} ({})".format(CONFIG, "present" if CONFIG.exists() else "absent: run `setup`"))
     say("  region       {}".format(cfg.get("region") or local_region() + " (guessed)"))
-    say("  template     {}".format(cfg.get("template_id") or "none: the script describes the pod itself"))
+    say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID or "none: the script describes the pod itself"))
     say("  ComfyUI tag  {} · image {}".format(COMFY_TAG, IMAGE))
     if cfg.get("api_key") or os.environ.get("RUNPOD_API_KEY"):
         try:

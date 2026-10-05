@@ -3,11 +3,22 @@
 #
 # What it does, in order (every line it prints starts with [AINVFX], so the log is easy to read):
 #   0. start Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
-#   1. health check: GPU and driver, disk speed, download speed from Hugging Face
+#   1. health check: GPU and driver, disk speed, download speed from Hugging Face (one stream: the
+#      models step, which downloads with hf and several streams, measured 3 times faster on the test pod)
 #   2. install: uv, Python 3.13, PyTorch stable for CUDA 13.0, ComfyUI at a pinned tag, the Manager
 #   3. start ComfyUI, listening for Runpod's proxy on port 8188, and check the proxy from here
 #   4. download the models of the profile (AINVFX_PROFILE: image, video or train), resumable
 #   5. one test image with Z-Image Turbo (proves the GPU, the kernels and the models), then READY
+#
+# v3 (4 Oct 2026, after the first real pod, RTX 5090 in EUR-IS-2): the probe file no longer lands in the
+# ComfyUI folder before the clone (git clone refused the non-empty folder); ComfyUI is fetched with
+# git init + fetch, which tolerates a folder that already holds models; the install marker is written
+# only when main.py exists; each model download logs its time and speed; the one-stream probe warns
+# under 25 MB/s instead of 100 (it measured 39 MB/s where hf then downloaded at about 100 MB/s).
+# The disk threshold drops from 1000 to 300 MB/s: the test pod read at 660 MB/s (dd, direct I/O) and
+# loaded Z-Image Turbo for a 2 s image, so 1000 flagged a healthy pod.
+# Measured on that pod: JupyterLab up in 2 minutes, PyTorch cu130 in 90 s, 63 GB of models in about
+# 10 minutes, the self-test in 2 s once the models are in RAM, READY about 15 minutes after creation.
 #
 # Environment variables, all optional:
 #   AINVFX_PROFILE    image (default) · video · train
@@ -82,17 +93,20 @@ T0=$(now); dd if=$ROOT/.probe of=/dev/null bs=1M iflag=direct status=none 2>/dev
 RD=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
 rm -f $ROOT/.probe
 say "disk: write $WR MB/s · read $RD MB/s"
-[ "$RD" -lt 1000 ] 2>/dev/null && warn "DISK READ UNDER 1000 MB/s: models will load slowly. Consider another pod."
+[ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
 
-mkdir -p $COMFY/models/vae
+# The probe file lands outside the ComfyUI folder (git clone refuses a non-empty folder) and is
+# moved into models/vae/ once ComfyUI is installed.
 PROBE_URL="https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
 PROBE_OUT=$COMFY/models/vae/ae.safetensors
-if [ ! -s "$PROBE_OUT" ]; then
-  T0=$(now); curl -fsSL --retry 3 "$PROBE_URL" -o "$PROBE_OUT"; T1=$(now)
-  BYTES=$(stat -c %s "$PROBE_OUT" 2>/dev/null || echo 0)
+PROBE_TMP=$ROOT/.probe/ae.safetensors
+if [ ! -s "$PROBE_OUT" ] && [ ! -s "$PROBE_TMP" ]; then
+  mkdir -p "$(dirname "$PROBE_TMP")"
+  T0=$(now); curl -fsSL --retry 3 "$PROBE_URL" -o "$PROBE_TMP"; T1=$(now)
+  BYTES=$(stat -c %s "$PROBE_TMP" 2>/dev/null || echo 0)
   DL=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
-  say "download from Hugging Face: $DL MB/s (ae.safetensors, $((BYTES/1000000)) MB)"
-  [ "$DL" -lt 100 ] 2>/dev/null && warn "DOWNLOAD UNDER 100 MB/s: 100 GB of models would take over 20 minutes. Consider another pod."
+  say "download from Hugging Face, one stream: $DL MB/s (ae.safetensors, $((BYTES/1000000)) MB); the models step shows the real speed per file"
+  [ "$DL" -lt 25 ] 2>/dev/null && warn "DOWNLOAD UNDER 25 MB/s ON ONE STREAM: 60 GB of models could take over 30 minutes. Consider another pod."
 else
   say "download probe skipped: ae.safetensors already present"
 fi
@@ -110,17 +124,22 @@ fi
 # shellcheck disable=SC1091
 source $VENV/bin/activate
 MARK=$VENV/.ainvfx_install_$TAG
-if [ ! -f "$MARK" ]; then
+if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
   uv pip install --quiet torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu130 \
     || warn "PyTorch install failed: read the lines above"
+  # git init + fetch instead of git clone: works in a folder that already holds models (a restart)
   if [ ! -d $COMFY/.git ]; then
-    git clone --quiet https://github.com/Comfy-Org/ComfyUI $COMFY || warn "git clone of ComfyUI failed"
+    mkdir -p $COMFY
+    (cd $COMFY && git init --quiet && git remote add origin https://github.com/Comfy-Org/ComfyUI) \
+      || warn "git init of ComfyUI failed"
   fi
-  (cd $COMFY && git fetch --tags --quiet && git checkout --quiet "$TAG") || warn "could not check out $TAG"
+  (cd $COMFY && git fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" && git checkout --quiet "$TAG") \
+    || (cd $COMFY && git fetch --quiet --tags origin && git checkout --quiet "$TAG") \
+    || warn "could not check out ComfyUI $TAG"
   uv pip install --quiet -r $COMFY/requirements.txt || warn "ComfyUI requirements failed"
   [ -f $COMFY/manager_requirements.txt ] && (uv pip install --quiet -r $COMFY/manager_requirements.txt || true)
   uv pip install --quiet -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
-  python - <<'PY' && date -u +'%F %T' > "$MARK"
+  [ -f $COMFY/main.py ] && python - <<'PY' && date -u +'%F %T' > "$MARK"
 import torch, sys
 ok = torch.cuda.is_available()
 cu = torch.version.cuda or "0"
@@ -133,6 +152,10 @@ if tuple(int(x) for x in cu.split(".")[:2]) < (13, 0):
 PY
 else
   say "install already done ($(cat "$MARK") UTC)"
+fi
+[ -f $COMFY/main.py ] || warn "COMFYUI IS NOT INSTALLED ($COMFY/main.py missing): read the lines above"
+if [ -s "$PROBE_TMP" ]; then
+  mkdir -p $COMFY/models/vae && mv -f "$PROBE_TMP" "$PROBE_OUT" && rmdir "$(dirname "$PROBE_TMP")" 2>/dev/null
 fi
 say "ComfyUI $(cd $COMFY 2>/dev/null && git describe --tags 2>/dev/null || echo '?') in $COMFY · environment $VENV"
 
@@ -185,9 +208,14 @@ else
       SKIPPED=$((SKIPPED+1)); continue
     fi
     say "models $TOTAL: downloading $name ($gb GB) from $repo"
+    T0=$(now)
     if hf download "$repo" "$path" --local-dir "$STAGE" >/dev/null 2>&1 && [ -s "$STAGE/$path" ]; then
+      T1=$(now)
+      BYTES=$(stat -c %s "$STAGE/$path" 2>/dev/null || echo 0)
+      SECS=$(python3 -c "print(int($T1-$T0))")
       mv -f "$STAGE/$path" "$dest/$name"
       DONE=$((DONE+1))
+      say "models $TOTAL: $name in $SECS s · $(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")") MB/s"
     else
       warn "download failed: $path from $repo (path changed, or access refused)"
     fi
