@@ -1,0 +1,300 @@
+{
+  "_about": "Model files downloaded by bootstrap.sh, by profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4 October 2026.",
+  "profiles": {
+    "image": [
+      "z_image_turbo",
+      "z_image_turbo_text_encoder",
+      "z_image_vae",
+      "z_image_full",
+      "realesrgan_x4",
+      "z_image_controlnet_union",
+      "depth_anything_3_mono_large",
+      "qwen_image_edit_2511",
+      "qwen_image_vae",
+      "qwen_2_5_vl_7b",
+      "qwen_image_edit_lightning",
+      "seedvr2_3b",
+      "seedvr2_vae",
+      "sam3_1"
+    ],
+    "video": [
+      "@image",
+      "ltx25_distilled_int8",
+      "ltx25_text_encoder_int8",
+      "ltx25_video_vae",
+      "ltx25_audio_vae",
+      "ltx25_latent_upscaler",
+      "ltx25_duration_head",
+      "gemma4_e2b_int8",
+      "ltx25_dev_int8",
+      "ltx25_iclora_clean_plate",
+      "ltx25_iclora_deblur",
+      "ltx25_iclora_water",
+      "ltx25_iclora_ingredients",
+      "ltx25_iclora_pixel_upscaler",
+      "ltx25_iclora_alpha_gen",
+      "ltx25_iclora_layout_to_render",
+      "ltx23_iclora_union_control",
+      "ltx23_iclora_motion_track",
+      "ltx23_iclora_in_outpainting",
+      "ainvfx_fluid",
+      "ltx_ripple",
+      "seedvr2_7b_int8",
+      "rife"
+    ],
+    "train": [
+      "@video",
+      "ltx25_dev_bf16",
+      "ltx25_text_encoder_bf16"
+    ]
+  },
+  "files": {
+    "z_image_turbo": {
+      "repo": "Comfy-Org/z_image_turbo",
+      "path": "split_files/diffusion_models/z_image_turbo_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 6.2
+    },
+    "z_image_turbo_text_encoder": {
+      "repo": "Comfy-Org/z_image_turbo",
+      "path": "split_files/text_encoders/qwen_3_4b_fp8_mixed.safetensors",
+      "dir": "text_encoders",
+      "gb": 5.6
+    },
+    "z_image_vae": {
+      "repo": "Comfy-Org/z_image_turbo",
+      "path": "split_files/vae/ae.safetensors",
+      "dir": "vae",
+      "gb": 0.34
+    },
+    "z_image_full": {
+      "repo": "Comfy-Org/z_image",
+      "path": "split_files/diffusion_models/z_image_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 6.2
+    },
+    "realesrgan_x4": {
+      "repo": "Comfy-Org/Real-ESRGAN_repackaged",
+      "path": "RealESRGAN_x4plus.safetensors",
+      "dir": "upscale_models",
+      "gb": 0.07
+    },
+    "z_image_controlnet_union": {
+      "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+      "path": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+      "dir": "model_patches",
+      "gb": 6.7
+    },
+    "depth_anything_3_mono_large": {
+      "repo": "Comfy-Org/Depth-Anything-3",
+      "path": "geometry_estimation/depth_anything_3_mono_large.safetensors",
+      "dir": "geometry_estimation",
+      "gb": 1.3
+    },
+    "qwen_image_edit_2511": {
+      "repo": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+      "path": "split_files/diffusion_models/qwen_image_edit_2511_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 20.5
+    },
+    "qwen_image_vae": {
+      "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+      "path": "split_files/vae/qwen_image_vae.safetensors",
+      "dir": "vae",
+      "gb": 0.25
+    },
+    "qwen_2_5_vl_7b": {
+      "repo": "Comfy-Org/HunyuanVideo_1.5_repackaged",
+      "path": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "dir": "text_encoders",
+      "gb": 9.4
+    },
+    "qwen_image_edit_lightning": {
+      "repo": "lightx2v/Qwen-Image-Edit-2511-Lightning",
+      "path": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+      "dir": "loras",
+      "gb": 0.85
+    },
+    "seedvr2_3b": {
+      "repo": "Comfy-Org/SeedVR2",
+      "path": "diffusion_models/seedvr2_3b_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 3.5
+    },
+    "seedvr2_vae": {
+      "repo": "Comfy-Org/SeedVR2",
+      "path": "vae/seedvr2_ema_vae_fp16.safetensors",
+      "dir": "vae",
+      "gb": 0.5
+    },
+    "sam3_1": {
+      "repo": "Comfy-Org/sam3.1",
+      "path": "checkpoints/sam3.1_multiplex_fp16.safetensors",
+      "dir": "checkpoints",
+      "gb": 1.7
+    },
+    "ltx25_distilled_int8": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 21.5,
+      "gated": true
+    },
+    "ltx25_text_encoder_int8": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "dir": "text_encoders",
+      "gb": 15.4,
+      "gated": true
+    },
+    "ltx25_video_vae": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "vae/ltx-2.5-video-vae-bf16.safetensors",
+      "dir": "vae",
+      "gb": 1.5,
+      "gated": true
+    },
+    "ltx25_audio_vae": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+      "dir": "vae",
+      "gb": 0.36,
+      "gated": true
+    },
+    "ltx25_latent_upscaler": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+      "dir": "latent_upscale_models",
+      "gb": 1.0,
+      "gated": true
+    },
+    "ltx25_duration_head": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+      "dir": "model_patches",
+      "gb": 0.0,
+      "gated": true
+    },
+    "gemma4_e2b_int8": {
+      "repo": "Comfy-Org/gemma-4",
+      "path": "text_encoders/gemma4_e2b_it_int8_convrot.safetensors",
+      "dir": "text_encoders",
+      "gb": 5.2
+    },
+    "ltx25_dev_int8": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 21.5,
+      "gated": true
+    },
+    "ltx25_iclora_clean_plate": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Clean-Plate",
+      "path": "ltx-2.5-22b-ic-lora-clean-plate-1.0.safetensors",
+      "dir": "loras",
+      "gb": 0.33,
+      "gated": true
+    },
+    "ltx25_iclora_deblur": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Deblur",
+      "path": "ltx-2.5-22b-ic-lora-deblur-0.9.safetensors",
+      "dir": "loras",
+      "gb": 0.91,
+      "gated": true
+    },
+    "ltx25_iclora_water": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Water-Simulation",
+      "path": "ltx-2.5-22b-ic-lora-water-simulation-0.9.safetensors",
+      "dir": "loras",
+      "gb": 0.91,
+      "gated": true
+    },
+    "ltx25_iclora_ingredients": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients",
+      "path": "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors",
+      "dir": "loras",
+      "gb": 1.3,
+      "gated": true
+    },
+    "ltx25_iclora_pixel_upscaler": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler",
+      "path": "ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors",
+      "dir": "loras",
+      "gb": 0.33,
+      "gated": true
+    },
+    "ltx25_iclora_alpha_gen": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen",
+      "path": "ltx-2.5-22b-ic-lora-alpha-gen-0.9.safetensors",
+      "dir": "loras",
+      "gb": 1.3,
+      "gated": true
+    },
+    "ltx25_iclora_layout_to_render": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Layout-To-Render",
+      "path": "ltx-2.5-22b-ic-lora-layout-to-render-1.0.safetensors",
+      "dir": "loras",
+      "gb": 1.3,
+      "gated": true
+    },
+    "ltx23_iclora_union_control": {
+      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
+      "path": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+      "dir": "loras",
+      "gb": 0.65,
+      "gated": false
+    },
+    "ltx23_iclora_motion_track": {
+      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control",
+      "path": "ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors",
+      "dir": "loras",
+      "gb": 0.33,
+      "gated": false
+    },
+    "ltx23_iclora_in_outpainting": {
+      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting",
+      "path": "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors",
+      "dir": "loras",
+      "gb": 1.3,
+      "gated": true
+    },
+    "ainvfx_fluid": {
+      "repo": "AInVFX/ainvfx-fluid",
+      "path": "ltx-2.5/ainvfx-fluid.safetensors",
+      "dir": "loras",
+      "gb": 0.65
+    },
+    "ltx_ripple": {
+      "repo": "WepeNerd/LTX-Ripple",
+      "path": "LTX25_Ripple_v11.safetensors",
+      "dir": "loras",
+      "gb": 0.65
+    },
+    "seedvr2_7b_int8": {
+      "repo": "Comfy-Org/SeedVR2",
+      "path": "diffusion_models/seedvr2_7b_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 8.3
+    },
+    "rife": {
+      "repo": "Comfy-Org/frame_interpolation",
+      "path": "frame_interpolation/rife_v4.26.safetensors",
+      "dir": "frame_interpolation",
+      "gb": 0.02
+    },
+    "ltx25_dev_bf16": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 42.0,
+      "gated": true
+    },
+    "ltx25_text_encoder_bf16": {
+      "repo": "Lightricks/LTX-2.5",
+      "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+      "dir": "text_encoders",
+      "gb": 26.3,
+      "gated": true
+    }
+  }
+}
