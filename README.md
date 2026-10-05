@@ -65,7 +65,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 |---|---|---|
 | 0 | SSH and JupyterLab start in the background, before anything else | JupyterLab answers within two minutes |
 | 1 | **Health check**: the GPU and its driver (580 or newer, so the CUDA 13 kernels of the int8 models run), disk write and read speed | a `WARNING` in capitals when a value is bad: terminate and create again, usually in another data center |
-| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.38.2`, the Manager. The same lines as a manual install on your own machine | `ComfyUI v0.38.2` |
+| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.38.2`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine | `ComfyUI v0.38.2` |
 | 3 | **Start**: ComfyUI listens for the proxy | `COMFYUI UP` with the address, then `PROXY OK` |
 | 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one, each with its time and speed; the first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped | `MODELS DONE 14/14` with the total time and the average speed |
 | 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` |
@@ -79,6 +79,12 @@ Profile sizes (Hugging Face, 4 October 2026): `image` 14 files, about 63 GB; `vi
 Measured on two RTX 5090 pods on Secure Cloud (4 and 5 October 2026): PyTorch installed in 90 seconds, ComfyUI answering after about 4 minutes; the 63 GB of the `image` profile took 10 minutes in EUR-IS-2 (about 100 MB/s) and 90 seconds in EU-CZ-1 (300 to 1300 MB/s per file); the self-test 16 to 106 seconds on the first load, 2 seconds once cached; `READY` 5 to 15 minutes after creation.
 
 The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reachable as `/workspace/ainvfx-bootstrap.log`). Because it lives in ComfyUI's input folder, the pod serves it through its own proxy once ComfyUI answers, and `pod.py` reads it there as well as through the API stream: `up` and `logs` catch `READY` either way.
+
+## Your own settings: settings.env
+
+Every choice the pod makes is a line of [`settings.env`](settings.env), next to the script: the ComfyUI release (`AINVFX_COMFY_TAG`, a tag or `master`), the Python version (`AINVFX_PYTHON`), the PyTorch packages and wheel index (`AINVFX_TORCH`, `AINVFX_TORCH_INDEX`: stable for CUDA 13.0 by default, nightlies with `--pre` and the nightly index), the list of models (`AINVFX_MODELS_URL`, a raw URL of a `models.json` with the same shape as this repository's), custom nodes to install (`AINVFX_CUSTOM_NODES`, git URLs separated by spaces), the disk measurement and the test image (`AINVFX_HEALTHCHECK`, `AINVFX_SELFTEST`), and `AINVFX_BOOTSTRAP_URL`, a fork's own `bootstrap.sh` to run instead of this one. Edit the file, then `python pod.py up`: the values travel with the pod as environment variables, and `bootstrap.sh` reads them. `python pod.py doctor` shows what will be sent.
+
+From the browser, the same variables go in the "Environment variables" section of the template's deploy page (Edit Template). The template carries the course's defaults, so a pod created without touching anything is the course's pod.
 
 ## The Hugging Face token
 
@@ -99,7 +105,7 @@ The gated repositories (LTX 2.5) need a Hugging Face read token: a free Hugging 
 
 The script asks Runpod's catalog where the profile's GPU is in stock on hosts with CUDA 13.0 or newer, and orders the data centers by distance to you: your country first (Runpod names its data centers by country: `CA-MTL-1`, `US-TX-3`, `EU-FR-1`, `EUR-IS-2`), then the rest of your region (Europe or North America), then the other region. Country and region are guessed from this computer's clock (`America/Toronto` gives Canada; `Europe/Paris` gives France) and changed with `setup --region EU --country FR`. `up` prints what is in stock in your region and elsewhere, the hourly price, asks you once, then tries Secure Cloud data center by data center, then Secure Cloud anywhere, then Community Cloud. If the profile's first GPU is out everywhere, it moves to the next one in the list (for `image`: RTX 5090, then a 48 GB slice of the RTX PRO 6000, then the full card). `--secure-only` keeps it on Runpod's own machines; `--gpu` names a card yourself.
 
-By default `up` creates the pod from the AInVFX template (`4i789znkrd`); `setup --template <id>` points it at another. Without a template the script describes the pod itself: image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, ports 8188 and 8888 over HTTP and 22 over TCP, the same start command.
+By default `up` creates the pod from the AInVFX template (`4i789znkrd`); `setup --template <id>` points it at another. Without a template the script describes the pod itself: image `runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404` (Ubuntu 24.04 with the CUDA 13.0 toolkit, so custom nodes that compile kernels match the driver and PyTorch; the image's own PyTorch is not used, the pod builds its environment), ports 8188 and 8888 over HTTP and 22 over TCP, the same start command.
 
 ## Costs, as read on 4 October 2026
 
@@ -118,7 +124,7 @@ RTX 5090: 0.99 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96
 git pull
 ```
 
-The ComfyUI tag lives in `pod.py` (`COMFY_TAG`) and in the template; the model list in `models.json`. A pod created after a change uses the new values; a running pod keeps its own.
+The ComfyUI tag and the other choices live in `settings.env` (and, for browser users, in the template's variables); the model list in `models.json`. A pod created after a change uses the new values; a running pod keeps its own.
 
 ## For contributors
 

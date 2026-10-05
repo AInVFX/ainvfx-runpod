@@ -21,22 +21,50 @@
 # Measured: EUR-IS-2 pod, 63 GB in 10 minutes, READY at 15 minutes; EU-CZ-1 pod, 59 GB in 90 seconds,
 # READY at about 5 minutes. The self-test takes 16 to 106 s on the first load, 2 s once cached.
 #
-# Environment variables, all optional:
-#   AINVFX_PROFILE    image (default) · video · train
-#   AINVFX_COMFY_TAG  the ComfyUI git tag (default v0.38.2)
-#   AINVFX_REPO_RAW   where to fetch models.json from (default: this repository on GitHub)
-#   AINVFX_SELFTEST   1 (default) generates the test image at the end; 0 skips it
-#   HF_TOKEN          a Hugging Face read token, for the gated files (LTX). Without it they are skipped.
-#                     Runpod fills it from the secret `huggingface_token` when the value is
-#                     {{ RUNPOD_SECRET_huggingface_token }}; an unresolved placeholder counts as absent.
+# v5 (5 Oct 2026): every choice is an environment variable with a default, listed in settings.env at
+# the root of the repository; pod.py sends that file's values with each pod, and a browser user sets
+# the same variables on the deploy page. New: AINVFX_PYTHON, AINVFX_TORCH, AINVFX_TORCH_INDEX,
+# AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
+# bootstrap, fetched and run instead of this one). The template image is now
+# runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404 (CUDA 13.0 toolkit, Ubuntu 24.04).
+#
+# Environment variables, all optional (the defaults are the bootcamp's; settings.env documents them):
+#   AINVFX_PROFILE        image (default) · video · train: which set of models.json to download
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.38.2; master for the latest)
+#   AINVFX_PYTHON         the Python version of the environment (default 3.13)
+#   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
+#                         "--pre torch torchvision torchaudio" for nightlies)
+#   AINVFX_TORCH_INDEX    the PyTorch wheel index (default https://download.pytorch.org/whl/cu130)
+#   AINVFX_MODELS_URL     where models.json comes from (default: this repository on GitHub)
+#   AINVFX_CUSTOM_NODES   git URLs of custom nodes to install, separated by spaces (default: none)
+#   AINVFX_HEALTHCHECK    1 (default) measures the disk; 0 skips the measurement
+#   AINVFX_SELFTEST       1 (default) generates the test image at the end; 0 skips it
+#   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork): fetched and run in place of this one
+#   HF_TOKEN              a Hugging Face read token, for the gated files (LTX). Without it they are skipped.
+#                         Runpod fills it from the secret `huggingface_token` when the value is
+#                         {{ RUNPOD_SECRET_huggingface_token }}; an unresolved placeholder counts as absent.
 #
 # Idempotent: a second run (pod restart) skips what is already installed and downloaded.
 # Nothing here depends on SSH: everything is visible in the pod's log in the Runpod console.
 
 set -uo pipefail
+# A fork's bootstrap takes over here, once (AINVFX_BOOTSTRAP_RAN guards against a loop).
+if [ -n "${AINVFX_BOOTSTRAP_URL:-}" ] && [ -z "${AINVFX_BOOTSTRAP_RAN:-}" ]; then
+  echo "[AINVFX] fetching the bootstrap named in AINVFX_BOOTSTRAP_URL: $AINVFX_BOOTSTRAP_URL"
+  if curl -fsSL --retry 3 "$AINVFX_BOOTSTRAP_URL" -o /tmp/ainvfx-bootstrap-fork.sh; then
+    AINVFX_BOOTSTRAP_RAN=1 exec bash /tmp/ainvfx-bootstrap-fork.sh
+  fi
+  echo "[AINVFX] WARNING: that bootstrap could not be fetched; continuing with this one"
+fi
+
 PROFILE="${AINVFX_PROFILE:-image}"
 TAG="${AINVFX_COMFY_TAG:-v0.38.2}"
-RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main}"
+PY="${AINVFX_PYTHON:-3.13}"
+TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
+TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
+MODELS_URL="${AINVFX_MODELS_URL:-${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main}/models.json}"
+CUSTOM_NODES="${AINVFX_CUSTOM_NODES:-}"
+HEALTHCHECK="${AINVFX_HEALTHCHECK:-1}"
 SELFTEST="${AINVFX_SELFTEST:-1}"
 ROOT=/workspace
 COMFY=$ROOT/ComfyUI
@@ -56,7 +84,8 @@ warn() { echo "[AINVFX] WARNING: $*"; }
 now()  { date +%s.%N; }
 mbps() { python3 -c "import sys; b=float(sys.argv[1]); t=float(sys.argv[2]); print(int(b/1e6/max(t,0.001)))" "$1" "$2"; }
 
-say "bootstrap start · profile $PROFILE · ComfyUI $TAG · $(date -u +'%F %T') UTC"
+say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
+say "settings: torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
 
 # A placeholder Runpod did not substitute (no secret in the account) must not reach Hugging Face:
 # an invalid token makes it refuse even public files.
@@ -89,31 +118,36 @@ else
 fi
 say "CPU: $(nproc) cores · RAM: $(free -g | awk '/Mem:/ {print $2}') GB · disk free on $ROOT: $(df -BG $ROOT | awk 'NR==2 {print $4}')"
 
-T0=$(now); dd if=/dev/zero of=$ROOT/.probe bs=1M count=2048 oflag=direct status=none 2>/dev/null; T1=$(now)
-WR=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
-T0=$(now); dd if=$ROOT/.probe of=/dev/null bs=1M iflag=direct status=none 2>/dev/null; T1=$(now)
-RD=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
-rm -f $ROOT/.probe
-say "disk: write $WR MB/s · read $RD MB/s"
-[ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
+if [ "$HEALTHCHECK" = "1" ]; then
+  T0=$(now); dd if=/dev/zero of=$ROOT/.probe bs=1M count=2048 oflag=direct status=none 2>/dev/null; T1=$(now)
+  WR=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
+  T0=$(now); dd if=$ROOT/.probe of=/dev/null bs=1M iflag=direct status=none 2>/dev/null; T1=$(now)
+  RD=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
+  rm -f $ROOT/.probe
+  say "disk: write $WR MB/s · read $RD MB/s"
+  [ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
+else
+  say "disk measurement skipped (AINVFX_HEALTHCHECK=0)"
+fi
 
 
 # ---------------------------------------------------------------- 2. install
-say "step 2/5 install (uv, Python 3.13, PyTorch cu130, ComfyUI $TAG)"
+say "step 2/5 install (uv, Python $PY, PyTorch from $TORCH_INDEX, ComfyUI $TAG)"
 command -v git  >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq git)
 if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || pip install -q uv
 fi
 say "uv $(uv --version 2>/dev/null | awk '{print $2}')"
 if [ ! -x $VENV/bin/python ]; then
-  uv venv $VENV --python 3.13 --quiet || uv venv $VENV --python 3.12 --quiet
+  uv venv $VENV --python "$PY" --quiet || warn "no Python $PY available through uv: read the lines above"
 fi
 # shellcheck disable=SC1091
 source $VENV/bin/activate
-MARK=$VENV/.ainvfx_install_$TAG
+MARK=$VENV/.ainvfx_install_${TAG}_py${PY}
 if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
-  uv pip install --quiet torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu130 \
-    || warn "PyTorch install failed: read the lines above"
+  # shellcheck disable=SC2086
+  uv pip install --quiet $TORCH --index-url "$TORCH_INDEX" \
+    || warn "PyTorch install failed ('$TORCH' from $TORCH_INDEX): read the lines above"
   # git init + fetch instead of git clone: works in a folder that already holds models (a restart)
   if [ ! -d $COMFY/.git ]; then
     mkdir -p $COMFY
@@ -121,11 +155,22 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
       || warn "git init of ComfyUI failed"
   fi
   (cd $COMFY && git fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" && git checkout --quiet "$TAG") \
+    || (cd $COMFY && git fetch --quiet --depth 1 origin "$TAG" && git checkout --quiet FETCH_HEAD) \
     || (cd $COMFY && git fetch --quiet --tags origin && git checkout --quiet "$TAG") \
     || warn "could not check out ComfyUI $TAG"
   uv pip install --quiet -r $COMFY/requirements.txt || warn "ComfyUI requirements failed"
   [ -f $COMFY/manager_requirements.txt ] && (uv pip install --quiet -r $COMFY/manager_requirements.txt || true)
   uv pip install --quiet -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
+  # custom nodes named in AINVFX_CUSTOM_NODES: cloned into custom_nodes, their requirements installed
+  for url in $CUSTOM_NODES; do
+    name=$(basename "${url%.git}")
+    if [ ! -d "$COMFY/custom_nodes/$name" ]; then
+      git clone --quiet --depth 1 "$url" "$COMFY/custom_nodes/$name" && say "custom node $name installed" \
+        || warn "custom node $url could not be cloned"
+    fi
+    [ -f "$COMFY/custom_nodes/$name/requirements.txt" ] && (uv pip install --quiet -r "$COMFY/custom_nodes/$name/requirements.txt" \
+        || warn "the requirements of $name failed")
+  done
   [ -f $COMFY/main.py ] && python - <<'PY' && date -u +'%F %T' > "$MARK"
 import torch, sys
 ok = torch.cuda.is_available()
@@ -172,7 +217,7 @@ fi
 # ---------------------------------------------------------------- 4. models
 say "step 4/5 models of profile $PROFILE"
 MODELS_JSON=$ROOT/models.json
-curl -fsSL --retry 3 "$RAW/models.json" -o "$MODELS_JSON.new" && mv -f "$MODELS_JSON.new" "$MODELS_JSON"
+curl -fsSL --retry 3 "$MODELS_URL" -o "$MODELS_JSON.new" && mv -f "$MODELS_JSON.new" "$MODELS_JSON"
 if [ ! -s "$MODELS_JSON" ]; then
   warn "models.json could not be fetched: no model downloaded. Use the Manager's model library."
 else

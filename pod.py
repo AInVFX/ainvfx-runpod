@@ -26,7 +26,9 @@ first command: `python pod.py status <name or id>`.
 
 The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
 (driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each with its
-download speed), then one test image. Its log lines start with [AINVFX]; `up`, `logs` and `status`
+download speed), then one test image. settings.env, next to this script, holds every choice the
+pod makes (the ComfyUI tag, Python, PyTorch, the models list, custom nodes, the checks): edit it,
+then `up`; its values travel with the pod as environment variables. Its log lines start with [AINVFX]; `up`, `logs` and `status`
 read them for you, from the API log stream and from the copy the pod serves through its proxy.
 Measured on two RTX 5090 pods (4 and 5 Oct 2026): READY 5 to 15 minutes after creation.
 
@@ -52,11 +54,34 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
-IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"      # Ubuntu 24.04, official Runpod image
-COMFY_TAG = "v0.38.2"
+IMAGE = "runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404"      # Ubuntu 24.04, CUDA 13.0, official Runpod image
+
+
+def load_settings():
+    """The AINVFX_* variables of settings.env (next to this script): KEY=value lines, # comments,
+    empty values dropped. They are sent with every pod and read by bootstrap.sh on the pod."""
+    values = {}
+    try:
+        for raw in SETTINGS.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key.startswith("AINVFX_") and value:
+                values[key] = value
+    except OSError:
+        pass
+    return values
+
+
+def comfy_tag():
+    return load_settings().get("AINVFX_COMFY_TAG", "v0.38.2")
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
@@ -68,6 +93,7 @@ CONFIG_DIR = Path.home() / ".ainvfx-runpod"
 CONFIG = CONFIG_DIR / "config.json"
 HERE = Path(__file__).resolve().parent
 OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")   # where `pull` puts the files
+SETTINGS = Path(os.environ.get("AINVFX_SETTINGS") or HERE / "settings.env")   # the pod's choices, one per line
 FINAL = ("EXITED", "ERROR", "TERMINATED")
 # The API log stream can stay open and silent while the pod writes lines that the stored log holds:
 # every STREAM_MAX_AGE seconds the stream is reopened a few seconds back, and every PROXY_POLL
@@ -707,7 +733,8 @@ def cmd_up(args):
     disk = args.disk or spec["disk"]
     gpus = [args.gpu] if args.gpu else spec["gpus"]
     name = "ainvfx-{}-{}".format(profile, tag if tag != profile else datetime.now().strftime("%m%d-%H%M"))
-    env = {"AINVFX_PROFILE": profile, "AINVFX_COMFY_TAG": COMFY_TAG}
+    env = dict(load_settings())              # settings.env: ComfyUI tag, Python, PyTorch, models, custom nodes...
+    env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
     if cfg.get("hf_secret") or secret_exists(cfg):
         env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
     if not args.selftest:
@@ -1010,7 +1037,10 @@ def cmd_doctor(args):
     say("  nearest      {}{}{}".format(REGION_NAMES.get(region, region), ", " + country + " first" if country else "",
                                         "" if cfg.get("region") else " (guessed from the clock: {})".format(local_zone() or "offset")))
     say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID or "none: the script describes the pod itself"))
-    say("  ComfyUI tag  {} · image {}".format(COMFY_TAG, IMAGE))
+    say("  settings     {}{}".format(SETTINGS, "" if SETTINGS.exists() else " (absent: the bootstrap's defaults apply)"))
+    for k, v in load_settings().items():
+        say("    {:<22} {}".format(k, v))
+    say("  image        {} (used when no template is set)".format(IMAGE))
     if cfg.get("api_key") or os.environ.get("RUNPOD_API_KEY"):
         try:
             pods = list_pods(cfg, quiet=True)
