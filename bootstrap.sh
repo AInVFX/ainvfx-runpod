@@ -6,7 +6,8 @@
 #   1. health check: GPU and driver, disk speed (the download speed is measured in step 4, on real files)
 #   2. install: uv, Python 3.13, PyTorch stable for CUDA 13.0, ComfyUI at a pinned tag, the Manager
 #   3. start ComfyUI, listening for Runpod's proxy on port 8188, and check the proxy from here
-#   4. download the models of the profile (AINVFX_PROFILE: image, video or train), resumable
+#   4. download the models of the profile (AINVFX_PROFILE: image, video or train), resumable; every
+#      line says file k of n, GB done of GB planned, percent and the time left
 #   5. one test image with Z-Image Turbo (proves the GPU, the kernels and the models), then READY
 #
 # v4 (5 Oct 2026, after two real pods): the one-stream curl probe is gone (it read 21 to 39 MB/s on pods
@@ -27,6 +28,8 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.3 (6 Oct 2026): every download line says where it stands: file k of n, GB done of GB planned,
+# percent, and the time left at the average speed so far (the plan is computed before the loop).
 # v5.2 (6 Oct 2026): default ComfyUI tag v0.39.0 (tagged 5 Oct 22:49 UTC: Save EXR in 16-bit float by default,
 # Save Video quality defaults, --offline). First pod on it: Adrien's gate before session 2.
 # v5.1 (5 Oct 2026, comment only): the template image is runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404,
@@ -231,42 +234,13 @@ if [ ! -s "$MODELS_JSON" ]; then
   warn "models.json could not be fetched: no model downloaded. Use the Manager's model library."
 else
   mkdir -p "$STAGE"
-  TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
-  while IFS='|' read -r repo path dir gated gb; do
-    [ -z "$repo" ] && continue
-    TOTAL=$((TOTAL+1))
-    name=$(basename "$path")
-    dest=$COMFY/models/$dir
-    mkdir -p "$dest"
-    if [ -s "$dest/$name" ]; then
-      DONE=$((DONE+1)); continue
-    fi
-    if [ "$gated" = "1" ] && [ -z "${HF_TOKEN:-}" ]; then
-      say "models $TOTAL: SKIPPED $name (gated repo $repo, no HF_TOKEN)"
-      SKIPPED=$((SKIPPED+1)); continue
-    fi
-    say "models $TOTAL: downloading $name ($gb GB) from $repo"
-    T0=$(now)
-    if hf download "$repo" "$path" --local-dir "$STAGE" >/dev/null 2>&1 && [ -s "$STAGE/$path" ]; then
-      T1=$(now)
-      BYTES=$(stat -c %s "$STAGE/$path" 2>/dev/null || echo 0)
-      SECS=$(python3 -c "print(int($T1-$T0))")
-      mv -f "$STAGE/$path" "$dest/$name"
-      DONE=$((DONE+1)); BYTES_ALL=$((BYTES_ALL+BYTES))
-      SPEED=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
-      say "models $TOTAL: $name in $SECS s · $SPEED MB/s"
-      # the speed judgement, once, on the first file over 1 GB (small files measure latency, not speed)
-      if [ "$SPEED_JUDGED" = "0" ] && [ "$BYTES" -gt 1000000000 ]; then
-        SPEED_JUDGED=1
-        [ "$SPEED" -lt 50 ] 2>/dev/null && warn "DOWNLOAD UNDER 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
-      fi
-    else
-      warn "download failed: $path from $repo (path changed, or access refused)"
-    fi
-  done < <(python - "$MODELS_JSON" "$PROFILE" <<'PY'
-import json, sys
+  # The plan first (v5.3): which files are missing, their number and their size, so every
+  # download line says where it stands (k of n, GB done of GB total, percent, time left).
+  LIST=$ROOT/models.list
+  python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "${HF_TOKEN:-}" > "$LIST" <<'PY'
+import json, os, sys
 spec = json.load(open(sys.argv[1]))
-files, profiles = spec["files"], spec["profiles"]
+files, profiles, root, token = spec["files"], spec["profiles"], sys.argv[3], sys.argv[4]
 def resolve(name, seen=()):
     out = []
     for item in profiles[name]:
@@ -280,16 +254,81 @@ keys = []
 for k in resolve(sys.argv[2]):
     if k not in keys:
         keys.append(k)
+rows = []
 for k in keys:
     f = files[k]
-    print("|".join([f["repo"], f["path"], f["dir"], "1" if f.get("gated") else "0", str(f.get("gb", "?"))]))
+    name = os.path.basename(f["path"])
+    present = os.path.isfile(os.path.join(root, f["dir"], name)) and os.path.getsize(os.path.join(root, f["dir"], name)) > 0
+    gated = bool(f.get("gated"))
+    todo = (not present) and not (gated and not token)
+    rows.append([f["repo"], f["path"], f["dir"], "1" if gated else "0", str(f.get("gb", "?")), todo, f.get("gb") or 0])
+n_todo = sum(1 for r in rows if r[5])
+gb_todo = round(sum(r[6] for r in rows if r[5]), 1)
+k, before = 0, 0.0
+for r in rows:
+    if r[5]:
+        k += 1
+        print("|".join(r[:5] + [str(k), str(n_todo), "%.1f" % before, "%.1f" % gb_todo]))
+        before += r[6]
+    else:
+        print("|".join(r[:5] + ["", str(n_todo), "", "%.1f" % gb_todo]))
+PY
+  N_ALL=$(grep -c . "$LIST" 2>/dev/null || echo 0)
+  N_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f7); N_TODO=${N_TODO:-0}
+  GB_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f9); GB_TODO=${GB_TODO:-0}
+  say "models: $N_ALL files in profile $PROFILE · $N_TODO to download ($GB_TODO GB) · $((N_ALL-N_TODO)) already present or skipped"
+  TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
+  while IFS='|' read -r repo path dir gated gb k n_todo gb_before gb_todo; do
+    [ -z "$repo" ] && continue
+    TOTAL=$((TOTAL+1))
+    name=$(basename "$path")
+    dest=$COMFY/models/$dir
+    mkdir -p "$dest"
+    if [ -s "$dest/$name" ]; then
+      DONE=$((DONE+1)); continue
+    fi
+    if [ "$gated" = "1" ] && [ -z "${HF_TOKEN:-}" ]; then
+      say "models: SKIPPED $name (gated repo $repo, no HF_TOKEN)"
+      SKIPPED=$((SKIPPED+1)); continue
+    fi
+    say "models $k/$n_todo · $gb_before of $gb_todo GB done · downloading $name ($gb GB) from $repo"
+    T0=$(now)
+    if hf download "$repo" "$path" --local-dir "$STAGE" >/dev/null 2>&1 && [ -s "$STAGE/$path" ]; then
+      T1=$(now)
+      BYTES=$(stat -c %s "$STAGE/$path" 2>/dev/null || echo 0)
+      SECS=$(python3 -c "print(int($T1-$T0))")
+      mv -f "$STAGE/$path" "$dest/$name"
+      DONE=$((DONE+1)); BYTES_ALL=$((BYTES_ALL+BYTES))
+      SPEED=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
+      # where we stand: GB done of the plan, percent, and the time left at the average speed so far
+      PROGRESS=$(python3 - "$gb_before" "$gb" "$gb_todo" "$BYTES_ALL" "$T_ALL0" "$T1" <<'PY'
+import sys
+before, gb, total, bytes_all, t0, t1 = [float(x) if x not in ("?", "") else 0.0 for x in sys.argv[1:]]
+done = before + gb
+pct = int(100 * done / total) if total else 100
+avg = bytes_all / 1e6 / max(t1 - t0, 0.001)            # MB/s over every download so far
+left = max(total - done, 0.0)
+eta = int(left * 1000 / avg) if avg > 0 else 0
+when = "done" if left <= 0.05 else ("about %d min %02d s left" % (eta // 60, eta % 60) if eta >= 60 else "about %d s left" % eta)
+print("%.1f of %.1f GB (%d%%) · %s" % (done, total, pct, when))
 PY
 )
+      say "models $k/$n_todo · $name in $SECS s · $SPEED MB/s · $PROGRESS"
+      # the speed judgement, once, on the first file over 1 GB (small files measure latency, not speed)
+      if [ "$SPEED_JUDGED" = "0" ] && [ "$BYTES" -gt 1000000000 ]; then
+        SPEED_JUDGED=1
+        [ "$SPEED" -lt 50 ] 2>/dev/null && warn "DOWNLOAD UNDER 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
+      fi
+    else
+      warn "download failed: $path from $repo (path changed, or access refused)"
+    fi
+  done < "$LIST"
   rm -rf "$STAGE"
   T_ALL1=$(now)
   TOTALS=""
   [ "$BYTES_ALL" -gt 0 ] && TOTALS=" · $((BYTES_ALL/1000000000)) GB downloaded in $(python3 -c "print(int($T_ALL1-$T_ALL0))") s ($(mbps "$BYTES_ALL" "$(python3 -c "print($T_ALL1-$T_ALL0)")") MB/s)"
-  say "MODELS DONE $DONE/$TOTAL present${SKIPPED:+ · $SKIPPED skipped (gated, no token)} · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk$TOTALS"
+  SK=""; [ "$SKIPPED" -gt 0 ] 2>/dev/null && SK=" · $SKIPPED skipped (gated, no token)"
+  say "MODELS DONE $DONE/$TOTAL present$SK · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk$TOTALS"
   say "press r in ComfyUI to refresh the model lists"
 fi
 

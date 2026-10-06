@@ -25,8 +25,7 @@ when one pod is recorded. A pod created from the console or another machine is a
 first command: `python pod.py status <name or id>`.
 
 The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
-(driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each with its
-download speed), then one test image. settings.env, next to this script, holds every choice the
+(driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each line says file k of n, GB done, percent and the time left), then one test image. settings.env, next to this script, holds every choice the
 pod makes (the ComfyUI tag, Python, PyTorch, the models list, custom nodes, the checks): edit it,
 then `up`; its values travel with the pod as environment variables. Its log lines start with
 [AINVFX]; `up`, `logs` and `status` read them for you, from the API log stream and from the copy
