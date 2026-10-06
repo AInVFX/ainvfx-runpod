@@ -93,7 +93,7 @@ def load_settings():
 
 
 def comfy_tag():
-    return load_settings().get("AINVFX_COMFY_TAG", "v0.38.2")
+    return load_settings().get("AINVFX_COMFY_TAG", "v0.39.0")
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888

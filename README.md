@@ -68,7 +68,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 | before | Runpod puts the image on the host. The template uses the image of Runpod's own "Runpod Pytorch 2.8.0" template, which the hosts already hold, so this takes seconds; a host that has to fetch an image from Docker Hub takes several minutes (19 layers, about 9 GB) | `[RUNPOD]` lines in `pod.py`; system log in the console |
 | 0 | SSH and JupyterLab start in the background, before anything else | JupyterLab answers within two minutes |
 | 1 | **Health check**: the GPU and its driver (580 or newer, so the CUDA 13 kernels of the int8 models run), disk write and read speed | a `WARNING` in capitals when a value is bad: terminate and create again, usually in another data center |
-| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.38.2`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine | `ComfyUI v0.38.2` |
+| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.39.0`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine | `ComfyUI v0.39.0` |
 | 3 | **Start**: ComfyUI listens for the proxy | `COMFYUI UP` with the address, then `PROXY OK` |
 | 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one, each with its time and speed; the first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped | `MODELS DONE 14/14` with the total time and the average speed |
 | 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` |
@@ -85,23 +85,42 @@ The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reac
 
 ## Your own settings: settings.env
 
-Every choice the pod makes is one line of [`settings.env`](settings.env), next to the script. Edit the file, then `python pod.py up`: the values travel with the pod as environment variables, and `bootstrap.sh` reads them. An empty value means the default. `python pod.py doctor` shows what will be sent.
+Every choice the pod makes is one line of [`settings.env`](settings.env), next to the script. Edit the file, then `python pod.py up`: the values travel with the pod as environment variables, and `bootstrap.sh` reads them. An empty value means the default; `python pod.py doctor` shows what will be sent. From the browser, the same variables go in the Environment variables section of the template's deploy page. Deploy without touching anything and you get the course's pod.
 
-| Variable | What it sets | Values | Default |
-|---|---|---|---|
-| `AINVFX_PROFILE` | which set of `models.json` to download | `image` (63 GB) · `video` (adds LTX 2.5, 150 GB) · `train` (adds the training models, 215 GB) | `image` (and `up video`, `up train` set it for you) |
-| `AINVFX_COMFY_TAG` | the ComfyUI release | a git tag such as `v0.38.2`, or a branch such as `master` for the latest commit | `v0.38.2` |
-| `AINVFX_PYTHON` | the Python of the pod's environment (uv installs it) | `3.12`, `3.13`, `3.14` | `3.13` |
-| `AINVFX_TORCH` | the PyTorch packages, with pip flags if wanted | `torch torchvision torchaudio` (stable) · `--pre torch torchvision torchaudio` (nightlies) · a pinned `torch==2.9.1 torchvision==0.24.1` | `torch torchvision torchaudio` |
-| `AINVFX_TORCH_INDEX` | the wheel index PyTorch comes from | `https://download.pytorch.org/whl/cu130` (stable, CUDA 13.0) · `https://download.pytorch.org/whl/nightly/cu130` (nightlies) · `.../cu128` with a 12.8 driver | the cu130 stable index |
-| `AINVFX_MODELS_URL` | where the list of models comes from | the raw URL of a `models.json` shaped like this repository's (fork, edit, point here) | this repository's `models.json` on `main` |
-| `AINVFX_CUSTOM_NODES` | custom nodes installed at start | git URLs separated by spaces, for example `https://github.com/kijai/ComfyUI-KJNodes https://github.com/rgthree/rgthree-comfy`; each is cloned into `custom_nodes` and its `requirements.txt` installed | none |
-| `AINVFX_HEALTHCHECK` | the disk measurement at start | `1` measures and warns when slow · `0` skips it | `1` |
-| `AINVFX_SELFTEST` | the test image at the end | `1` renders one Z-Image Turbo image (proves the GPU, the kernels and the models) · `0` skips it (`up --no-selftest` does the same) | `1` |
-| `AINVFX_BOOTSTRAP_URL` | a fork's own `bootstrap.sh`, run in place of this repository's | the raw URL of the script | this repository's `bootstrap.sh` on `main` |
-| `HF_TOKEN` | the Hugging Face token for the gated files (LTX) | never written in this file: `setup --hf-token` stores it as the Runpod secret `huggingface_token`, and `up` sends the reference `{{ RUNPOD_SECRET_huggingface_token }}` | none (gated files skipped) |
+**`AINVFX_PROFILE`** · which set of `models.json` to download. Default `image`.
+`image` (63 GB) · `video` (adds LTX 2.5, 150 GB) · `train` (adds the training models, 215 GB). `up video` and `up train` set it for you.
 
-From the browser, the same variables go in the "Environment variables" section of the template's deploy page (Edit Template). The template carries the course's defaults, so a pod created without touching anything is the course's pod. Values with spaces need no quotes (`AINVFX_TORCH=--pre torch torchvision torchaudio` is read whole); lines starting with `#` are comments.
+**`AINVFX_COMFY_TAG`** · the ComfyUI release. Default `v0.39.0`.
+A git tag (`v0.39.0`) · a branch (`master` for the latest commit).
+
+**`AINVFX_PYTHON`** · the Python of the pod's environment, installed by uv. Default `3.13`.
+`3.12` · `3.13` · `3.14`.
+
+**`AINVFX_TORCH`** · the PyTorch packages, with pip flags if wanted. Default `torch torchvision torchaudio`.
+`torch torchvision torchaudio` (stable) · `--pre torch torchvision torchaudio` (nightlies) · a pinned `torch==2.9.1 torchvision==0.24.1`.
+
+**`AINVFX_TORCH_INDEX`** · the wheel index PyTorch comes from. Default: the cu130 stable index.
+`https://download.pytorch.org/whl/cu130` (stable, CUDA 13.0) · `https://download.pytorch.org/whl/nightly/cu130` (nightlies) · the `cu128` index with a 12.8 driver.
+
+**`AINVFX_MODELS_URL`** · where the list of models comes from. Default: this repository's `models.json` on `main`.
+The raw URL of a `models.json` shaped like this one: fork, edit, point here.
+
+**`AINVFX_CUSTOM_NODES`** · custom nodes installed at start. Default: none.
+Git URLs separated by spaces, for example `https://github.com/kijai/ComfyUI-KJNodes https://github.com/rgthree/rgthree-comfy`. Each is cloned into `custom_nodes` and its `requirements.txt` installed.
+
+**`AINVFX_HEALTHCHECK`** · the disk measurement at start. Default `1`.
+`1` measures and warns when slow · `0` skips it.
+
+**`AINVFX_SELFTEST`** · the test image at the end. Default `1`.
+`1` renders one Z-Image Turbo image, which proves the GPU, the kernels and the models · `0` skips it (`up --no-selftest` does the same).
+
+**`AINVFX_BOOTSTRAP_URL`** · a fork's own `bootstrap.sh`, run in place of this repository's. Default: this repository's on `main`.
+The raw URL of the script.
+
+**`HF_TOKEN`** · the Hugging Face token for the gated files (LTX). Never written in this file.
+`setup --hf-token` stores it as the Runpod secret `huggingface_token`; `up` sends the reference `{{ RUNPOD_SECRET_huggingface_token }}`. Without it the gated files are skipped and the log says so; the image models need none.
+
+Values with spaces need no quotes (`AINVFX_TORCH=--pre torch torchvision torchaudio` is read whole); lines starting with `#` are comments.
 
 ## The Hugging Face token
 

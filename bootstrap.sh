@@ -27,6 +27,8 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.2 (6 Oct 2026): default ComfyUI tag v0.39.0 (tagged 5 Oct 22:49 UTC: Save EXR in 16-bit float by default,
+# Save Video quality defaults, --offline). First pod on it: Adrien's gate before session 2.
 # v5.1 (5 Oct 2026, comment only): the template image is runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404,
 # the image of Runpod's own "Runpod Pytorch 2.8.0" template, which Runpod keeps on its hosts: the
 # container starts within seconds. The 1.0.7-cu1300-torch291 tag tried on 5 Oct had to be fetched from
@@ -37,7 +39,7 @@
 #
 # Environment variables, all optional (the defaults are the bootcamp's; settings.env documents them):
 #   AINVFX_PROFILE        image (default) · video · train: which set of models.json to download
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.38.2; master for the latest)
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.39.0; master for the latest)
 #   AINVFX_PYTHON         the Python version of the environment (default 3.13)
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
 #                         "--pre torch torchvision torchaudio" for nightlies)
@@ -65,7 +67,7 @@ if [ -n "${AINVFX_BOOTSTRAP_URL:-}" ] && [ -z "${AINVFX_BOOTSTRAP_RAN:-}" ]; the
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.38.2}"
+TAG="${AINVFX_COMFY_TAG:-v0.39.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
