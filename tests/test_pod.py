@@ -43,8 +43,9 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (4, "[AINVFX] COMFYUI UP · https://fakepod1-8188.proxy.runpod.net"),
     (4, "[AINVFX] PROXY OK · https://fakepod1-8188.proxy.runpod.net answers from outside"),
     (4, "[AINVFX] step 4/5 models of profile image"),
-    (5, "[AINVFX] models 1: downloading z_image_turbo_int8_convrot.safetensors (6.2 GB) from Comfy-Org/z_image_turbo"),
-    (5, "[AINVFX] models 1: z_image_turbo_int8_convrot.safetensors in 10 s · 600 MB/s"),
+    (5, "[AINVFX] models: 14 files in profile image · 14 to download (62.9 GB) · 0 already present or skipped"),
+    (5, "[AINVFX] models 1/14 · 0.0 of 62.9 GB done · downloading z_image_turbo_int8_convrot.safetensors (6.2 GB) from Comfy-Org/z_image_turbo"),
+    (5, "[AINVFX] models 1/14 · z_image_turbo_int8_convrot.safetensors in 10 s · 600 MB/s · 6.2 of 62.9 GB (9%) · about 1 min 34 s left"),
     (6, "[AINVFX] MODELS DONE 14/14 present · 59G on disk · 59 GB downloaded in 91 s (650 MB/s)"),
     (6, "[AINVFX] step 5/5 self-test"),
     (7, "[AINVFX] SELFTEST OK · Z-Image Turbo 1024 x 1024, 8 steps, in 16.0 s (models loaded from disk) · output/ainvfx_selftest_00001_.png"),
@@ -68,7 +69,7 @@ PULL_END = [
     (0, "start container for runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404: begin"),
 ]
 STEP = 0.4            # one scripted second of pod time = 0.4 real seconds
-LIVE_LIMIT = 16       # BOOT lines from this index on are never sent on a live connection
+LIVE_LIMIT = 17       # BOOT lines from this index on (SELFTEST OK, READY) are never sent on a live connection
 NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
