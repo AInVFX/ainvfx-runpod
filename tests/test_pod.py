@@ -31,14 +31,14 @@ POD_PY = os.path.join(ROOT, "pod.py")
 sys.path.insert(0, ROOT)
 import pod  # noqa: E402  (the module under test; importing it has no side effect)
 BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
-    (0, "[AINVFX] bootstrap start · profile image · ComfyUI v0.38.2"),
+    (0, "[AINVFX] bootstrap start · profile image · ComfyUI v0.39.0"),
     (0, "[AINVFX] no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"),
     (1, "[AINVFX] step 0/5 starting Runpod's /start.sh in the background (SSH, JupyterLab on port 8888)"),
     (1, "[AINVFX] step 1/5 health check"),
     (1, "[AINVFX] GPU: NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02"),
     (2, "[AINVFX] disk: write 4284 MB/s · read 4306 MB/s"),
-    (2, "[AINVFX] step 2/5 install (uv, Python 3.13, PyTorch cu130, ComfyUI v0.38.2)"),
-    (3, "[AINVFX] ComfyUI v0.38.2 in /workspace/ComfyUI · environment /workspace/venv"),
+    (2, "[AINVFX] step 2/5 install (uv, Python 3.13, PyTorch cu130, ComfyUI v0.39.0)"),
+    (3, "[AINVFX] ComfyUI v0.39.0 in /workspace/ComfyUI · environment /workspace/venv"),
     (3, "[AINVFX] step 3/5 start ComfyUI on port 8188"),
     (4, "[AINVFX] COMFYUI UP · https://fakepod1-8188.proxy.runpod.net"),
     (4, "[AINVFX] PROXY OK · https://fakepod1-8188.proxy.runpod.net answers from outside"),
@@ -264,7 +264,7 @@ class Handler(BaseHTTPRequestHandler):
         if not up:
             return self.problem(502, "no comfy yet")
         if p.endswith("/system_stats"):
-            return self.send_json(200, {"system": {"comfyui_version": "0.38.2"}})
+            return self.send_json(200, {"system": {"comfyui_version": "0.39.0"}})
         if p.endswith("/history"):
             done = pod_seconds(pod) >= STATE["pull_seconds"] + 7
             return self.send_json(200, {"p1": {"outputs": {"9": {"images": [{"filename": "ainvfx_selftest_00001_.png",
@@ -347,7 +347,7 @@ class Helpers(unittest.TestCase):
             self.assertEqual(pod.comfy_tag(), "master")
             pod.SETTINGS = pod.Path(d) / "missing.env"
             self.assertEqual(pod.load_settings(), {})
-            self.assertEqual(pod.comfy_tag(), "v0.38.2")
+            self.assertEqual(pod.comfy_tag(), "v0.39.0")
         finally:
             pod.SETTINGS = old
             shutil.rmtree(d, ignore_errors=True)
@@ -401,7 +401,7 @@ class EndToEnd(unittest.TestCase):
                         AINVFX_STREAM_IDLE="2",
                         AINVFX_SETTINGS=os.path.join(self.home, "settings.env"))
         with open(self.env["AINVFX_SETTINGS"], "w", encoding="utf-8") as f:
-            f.write("AINVFX_COMFY_TAG=v0.38.2\nAINVFX_SELFTEST=0\n")
+            f.write("AINVFX_COMFY_TAG=v0.39.0\nAINVFX_SELFTEST=0\n")
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -425,7 +425,7 @@ class EndToEnd(unittest.TestCase):
         sent = STATE["posts"][0].get("env") or {}
         self.assertEqual(sent.get("AINVFX_PROFILE"), "image")
         self.assertEqual(sent.get("AINVFX_SELFTEST"), "0", "settings.env values travel with the pod")
-        self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "v0.38.2")
+        self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "v0.39.0")
         self.assertIn("SELFTEST OK", out, out)
         self.assertIn("READY", out, "READY must be printed although the live stream never delivers it")
         self.assertNotIn("Still working", out, "`up` must return on READY, not on its deadline")
