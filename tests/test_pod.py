@@ -20,9 +20,12 @@ once: `up --name`, commands by name or id, attaching a pod created elsewhere, `d
 what the 5 October pods taught: Runpod's system log (the image pull, layer by layer) shown as one
 summary, a container that does not start (the stall warning), and a log route that does not answer
 (a message, not a traceback). Then a pod whose log stops at a FAILED line (bootstrap.sh 5.4): `up`
-must stop there, say what to do, and exit non-zero.
+must stop there, say what to do, and exit non-zero. Then what 7 October 2026 taught: no RTX 5090 on
+Secure Cloud (the GPUs in stock that fit are listed, the cheapest is created in its own data center,
+never a pod without stock), a host under maintenance (terminated at once, the next GPU tried), and
+--gpu by short name. The fake also answers GET /v2/catalog/gpus and the GraphQL host query.
 """
-import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
+import json, os, re, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -82,8 +85,41 @@ STEP = 0.4            # one scripted second of pod time = 0.4 real seconds
 LIVE_LIMIT = 17       # BOOT lines from this index on (SELFTEST OK, READY) are never sent on a live connection
 NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
+         "no_5090": False, "maint_dcs": set(), "maint_community": False, "graphql_down": False,
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
+
+
+def fake_catalog(cloud):
+    """GET /v2/catalog/gpus for one cloud, in the shape read from Runpod on 7 October 2026: Secure stock
+    lists its data centers, Community stock comes with none. STATE["no_5090"] reproduces that morning:
+    no RTX 5090 on Secure Cloud anywhere, some on Community."""
+    def gpu(gid, name, mem, p_secure, p_comm, secure_dcs=(), community=False):
+        e = {"id": gid, "name": name, "memory": mem, "manufacturer": "NVIDIA",
+             "price": {"secure": p_secure, "community": p_comm}}
+        if cloud == "SECURE":
+            e["availability"] = "LOW" if any(lvl != "NONE" for _, lvl in secure_dcs) else "NONE"
+            if secure_dcs:
+                e["dataCenters"] = [{"id": d, "name": d, "availability": lvl} for d, lvl in secure_dcs]
+        else:
+            e["availability"] = "LOW" if community else "NONE"
+        return e
+    rtx5090_dcs = () if STATE["no_5090"] else (("EU-CZ-1", "LOW"), ("US-TX-3", "HIGH"), ("CA-MTL-1", "LOW"), ("EUR-NO-1", "NONE"))
+    return [
+        gpu("NVIDIA GeForce RTX 5090", "RTX 5090", 32, 0.99, 0.69, rtx5090_dcs, community=True),
+        gpu("NVIDIA GeForce RTX 4090", "RTX 4090", 24, 0.74, 0.34, (("CA-MTL-1", "HIGH"),), community=True),
+        gpu("NVIDIA H100 80GB HBM3", "H100 SXM", 80, 3.49, 2.69, (("CA-MTL-1", "LOW"),)),
+        gpu("NVIDIA RTX PRO 4500 Blackwell Server Edition", "RTX PRO 4500 SE", 32, 0.72, 0.5, (("US-KS-2", "LOW"),)),
+        gpu("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB", 34, 0.5, 0.5, (("US-WA-2", "LOW"),)),
+        gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "PRO 6000 MIG 24GB", 24, 0.59, 0.5, (("US-PA-1", "LOW"),)),
+        gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000", 96, 2.09, 1.69,
+            (("US-NC-2", "LOW"), ("CA-MTL-1", "LOW"), ("EU-CZ-1", "LOW"))),
+        gpu("NVIDIA B300 SXM6 AC", "B300", 288, 7.89, 6.94, (("EU-NL-1", "LOW"),)),
+    ]
+
+
+REMOVED_NOTE = ("This server will be removed from the platform to make room for more hardware. "
+                "Please note that ALL DATA WILL BE LOST.")
 
 
 def pod_seconds(pod):
@@ -165,6 +201,8 @@ class Handler(BaseHTTPRequestHandler):
             if not pod or pod["deleted"]:
                 return self.problem(404, "pod not found")
             return self.send_json(200, self.view_of(pod))
+        if p == "/v2/catalog/gpus":
+            return self.send_json(200, {"gpus": fake_catalog(q.get("cloud", ["SECURE"])[0])})
         if p.startswith("/v2/catalog/gpus/"):
             return self.send_json(200, {
                 "id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "availability": "LOW",
@@ -179,6 +217,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/graphql":
+            return self.graphql()
         if u.path.startswith("/proxy/") and u.path.endswith("/upload/image"):
             STATE["uploads"].append(len(self.body()))
             return self.send_json(200, {"name": "x.png", "subfolder": "", "type": "input"})
@@ -190,8 +230,31 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("dataCenterIds") == ["EU-CZ-1"]:
                 return self.problem(400, "no capacity in EU-CZ-1")   # the first candidate fails: the loop must go on
             pod = self.new_pod(body["name"], body["gpu"]["id"], (body.get("dataCenterIds") or ["?"])[0])
+            pod["cloud"] = body.get("cloud") or "SECURE"
             return self.send_json(201, self.view_of(pod))
         return self.problem(404, "no route")
+
+    def graphql(self):
+        """The one GraphQL query pod.py sends: the pod's host and its maintenance window. A host in a data
+        center of STATE["maint_dcs"] (or any Community host with STATE["maint_community"]) is the host of
+        5 and 7 October 2026: maintenance started days ago, ends in months, the server is being removed."""
+        query = json.loads(self.body() or b"{}").get("query", "")
+        if self.headers.get("Authorization") != "Bearer fake-key":
+            return self.send_json(200, {"errors": [{"message": "Unauthorized"}], "data": {"pod": None}})
+        if STATE["graphql_down"]:
+            return self.problem(503, "unavailable")
+        m = re.search(r'podId:\s*"([^"]+)"', query)
+        pod = STATE["pods"].get(m.group(1)) if m else None
+        if not pod:
+            return self.send_json(200, {"data": {"pod": None}})
+        machine = {"podHostId": pod["id"] + "-host", "dataCenterId": None if pod["dataCenterId"] == "?" else pod["dataCenterId"],
+                   "location": "somewhere", "maintenanceStart": None, "maintenanceEnd": None, "maintenanceNote": None}
+        if pod["dataCenterId"] in STATE["maint_dcs"] or (pod.get("cloud") == "COMMUNITY" and STATE["maint_community"]):
+            now = datetime.now(timezone.utc)
+            machine.update(maintenanceStart=(now - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                           maintenanceEnd=(now + timedelta(days=172)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                           maintenanceNote=REMOVED_NOTE)
+        return self.send_json(200, {"data": {"pod": {"id": pod["id"], "machine": machine}}})
 
     @staticmethod
     def new_pod(name, gpu, dc):
@@ -206,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def view_of(pod):
-        v = {k: val for k, val in pod.items() if k not in ("t0", "deleted")}
+        v = {k: val for k, val in pod.items() if k not in ("t0", "deleted", "cloud")}
         v["status"] = "RUNNING" if pod_seconds(pod) >= 1 else "STARTING"
         if not container_started(pod):
             v["runtime"] = None              # no container reported yet: image pull, create or boot
@@ -381,6 +444,56 @@ class Helpers(unittest.TestCase):
         self.assertIn("did not answer in time", e.hint())
         self.assertFalse(pod.ApiError(0, "[Errno -2] Name or service not known", "u").timed_out)
 
+    def test_newer_gpu_rule(self):
+        """Blackwell or newer: the RTX 50 series, RTX PRO Blackwell, B200, B300 and their MIG slices."""
+        for g in ("NVIDIA GeForce RTX 5090", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 4500 Blackwell",
+                  "NVIDIA B300 SXM6 AC MIG 1g.34gb", "NVIDIA B200", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"):
+            self.assertTrue(pod.newer_gpu({"id": g}), g)
+        for g in ("NVIDIA H100 80GB HBM3", "NVIDIA H200", "NVIDIA RTX 6000 Ada Generation", "NVIDIA RTX 5000 Ada Generation",
+                  "NVIDIA GeForce RTX 4090", "NVIDIA A100-SXM4-80GB", "AMD Instinct MI300X OAM", "Tesla V100-PCIE-16GB",
+                  "NVIDIA L40S", "NVIDIA RTX A6000"):
+            self.assertFalse(pod.newer_gpu({"id": g}), g)
+
+    def test_maintenance_window(self):
+        """The host of 7 Oct 2026: maintenance from 29 Sep 2026 to 28 Mar 2027, server being removed."""
+        now = datetime(2026, 10, 7, 13, 0, tzinfo=timezone.utc)
+        removed = {"maintenanceStart": "2026-09-29T15:17:00.000Z", "maintenanceEnd": "2027-03-28T15:17:00.000Z",
+                   "maintenanceNote": REMOVED_NOTE}
+        text = pod.maintenance_of(removed, now)
+        self.assertIn("since 29 Sep 2026 15:17 UTC, until 28 Mar 2027 15:17 UTC", text)
+        self.assertIn("removed from the platform", text)
+        self.assertIsNone(pod.maintenance_of({"maintenanceStart": None, "maintenanceEnd": None}, now))
+        self.assertIsNone(pod.maintenance_of({}, now))
+        self.assertIsNone(pod.maintenance_of({"maintenanceStart": "2026-09-01T00:00:00Z",
+                                              "maintenanceEnd": "2026-09-02T00:00:00Z"}, now), "a window that is over")
+        self.assertIsNone(pod.maintenance_of({"maintenanceStart": "2026-10-10T00:00:00Z"}, now), "three days ahead")
+        self.assertIn("from 07 Oct 2026 15:00 UTC", pod.maintenance_of({"maintenanceStart": "2026-10-07T15:00:00Z"}, now))
+        ms = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        self.assertIn("since 01 Oct 2026", pod.maintenance_of({"maintenanceStart": ms}, now), "epoch milliseconds")
+        self.assertIsNotNone(pod.maintenance_of({"maintenanceStart": "next week"}, now), "unreadable: refused")
+
+    def test_offers_and_gpu_names(self):
+        cat = {"SECURE": [
+            {"id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "memory": 32, "price": {"secure": 0.99, "community": 0.69},
+             "availability": "NONE"},
+            {"id": "NVIDIA RTX PRO 4500 Blackwell Server Edition", "name": "RTX PRO 4500 SE", "memory": 32,
+             "price": {"secure": 0.72}, "availability": "LOW", "dataCenters": [{"id": "US-KS-2", "availability": "LOW"}]},
+            {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "name": "RTX PRO 6000", "memory": 96,
+             "price": {"secure": 2.09}, "availability": "LOW"}],          # Secure stock with no data center: skipped
+            "COMMUNITY": [{"id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "memory": 32,
+                           "price": {"secure": 0.99, "community": 0.69}, "availability": "LOW"}]}
+        offers = pod.make_offers(cat, "NA", "CA")
+        self.assertEqual([(o["name"], o["cloud"], o["dcs"]) for o in offers],
+                         [("RTX 5090", "COMMUNITY", []), ("RTX PRO 4500 SE", "SECURE", ["US-KS-2"])])
+        both = cat["SECURE"] + cat["COMMUNITY"]
+        self.assertEqual(pod.find_gpu(both, "NVIDIA GeForce RTX 5090")["id"], "NVIDIA GeForce RTX 5090")
+        self.assertEqual(pod.find_gpu(both, "rtx pro 4500 se")["id"], "NVIDIA RTX PRO 4500 Blackwell Server Edition")
+        self.assertIs(pod.find_gpu(both, "5090"), cat["SECURE"][0], "one GPU type in two clouds is one match")
+        with self.assertRaises(SystemExit):
+            pod.find_gpu(both, "RTX PRO")            # two GPU types
+        with self.assertRaises(SystemExit):
+            pod.find_gpu(both, "GTX 1080")           # none
+
     def test_profiles_and_start_command(self):
         self.assertEqual(sorted(pod.PROFILES), ["image", "train", "video"])
         self.assertIn("bootstrap.sh", pod.START_CMD)
@@ -401,7 +514,8 @@ class EndToEnd(unittest.TestCase):
 
     def setUp(self):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
-                      "pull_seconds": 0, "logs_hang_for": 0, "boot": None})
+                      "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
+                      "maint_community": False, "graphql_down": False})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -409,7 +523,8 @@ class EndToEnd(unittest.TestCase):
                         AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port,
                         AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3", AINVFX_STATUS_POLL="3",
                         AINVFX_PULL_SUMMARY="2", AINVFX_HEARTBEAT="4", AINVFX_STALL_MINUTES="0.1",
-                        AINVFX_STREAM_IDLE="2",
+                        AINVFX_STREAM_IDLE="2", AINVFX_HOST_WAIT="3",
+                        AINVFX_GRAPHQL="http://127.0.0.1:{}/graphql".format(self.port),
                         AINVFX_SETTINGS=os.path.join(self.home, "settings.env"))
         with open(self.env["AINVFX_SETTINGS"], "w", encoding="utf-8") as f:
             f.write("AINVFX_COMFY_TAG=v0.39.0\nAINVFX_SELFTEST=0\n")
@@ -538,6 +653,71 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("down", "--all", "-y")
         self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [True, True, True], out)
         self.assertIn("Nothing bills", out, out)
+
+    def test_no_stock_proposes_the_cheapest_fit_and_never_any_host(self):
+        """7 Oct 2026: no RTX 5090 on Secure Cloud. `up` must not create one anywhere: it lists the GPUs in
+        stock that fit the image profile, cheapest first, creates the cheapest in its own data center,
+        and leaves out what does not fit (24 GB, Hopper) and what costs more than 2.50 USD per hour."""
+        STATE["no_5090"] = True
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("in stock in North America: none right now", out, out)
+        self.assertIn("never creates a pod where the catalog shows no stock", out, out)
+        self.assertIn("Replacement: B300 MIG 34GB (34 GB of VRAM, 0.50 USD per hour, Secure Cloud, US-WA-2)", out, out)
+        self.assertIn("RTX PRO 4500 SE", out, out)
+        self.assertIn("a host Runpod picks", out, "the Community RTX 5090 is listed, as Community")
+        self.assertIn("above 2.50 USD: only with --gpu", out, "the B300 is listed, never picked on its own")
+        self.assertNotIn("RTX 4090", out, "24 GB: does not fit the image profile")
+        self.assertNotIn("H100", out, "Hopper: older than Blackwell")
+        self.assertNotIn("PRO 6000 MIG 24GB", out, out)
+        self.assertIn('python pod.py up image --gpu "RTX 5090"', out, out)
+        self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
+                         [("NVIDIA B300 SXM6 AC MIG 1g.34gb", "SECURE", ["US-WA-2"])], out)
+        self.assertIn("host checked: no maintenance planned (US-WA-2)", out, out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_a_host_under_maintenance_is_terminated_and_the_next_gpu_tried(self):
+        """The host of 5 and 7 Oct 2026 (maintenance under way, server being removed), on the first two
+        candidates: each pod is terminated at once and `up` goes on to the next GPU that fits."""
+        STATE["no_5090"] = True
+        STATE["maint_dcs"] = {"US-WA-2"}
+        STATE["maint_community"] = True
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("REFUSED: its host has maintenance since", out, out)
+        self.assertIn("removed from the platform", out, out)
+        self.assertEqual(out.count("terminated at once"), 2, out)
+        self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
+                         [("NVIDIA B300 SXM6 AC MIG 1g.34gb", "SECURE", ["US-WA-2"]),
+                          ("NVIDIA GeForce RTX 5090", "COMMUNITY", None),
+                          ("NVIDIA RTX PRO 4500 Blackwell Server Edition", "SECURE", ["US-KS-2"])], out)
+        self.assertEqual([STATE["pods"][p]["deleted"] for p in ("fakepod1", "fakepod2", "fakepod3")], [True, True, False], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_gpu_named_on_the_command_line(self):
+        """--gpu takes the short name from the list, in any case; with no stock for it, nothing is created and
+        the GPUs in stock are listed with the command; a name that matches several GPU types is refused."""
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "--gpu", "rtx pro 4500 se", "-y", "--wait", "1", timeout=90)
+        self.assertEqual((STATE["posts"][0]["gpu"]["id"], STATE["posts"][0]["dataCenterIds"]),
+                         ("NVIDIA RTX PRO 4500 Blackwell Server Edition", ["US-KS-2"]), out)
+        self.assertIn("READY", out, out)
+        self.run_pod("down", "-y")
+        STATE["no_5090"] = True
+        out, rc = self.run_pod("up", "image", "--gpu", "RTX 5090", "--secure-only", "-y", "--wait", "1", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("No RTX 5090 in stock right now on Secure Cloud", out, out)
+        self.assertIn('python pod.py up image --gpu "B300 MIG 34GB"', out, out)
+        self.assertEqual(len(STATE["posts"]), 1, "nothing created when the GPU named has no stock")
+        out, rc = self.run_pod("up", "image", "--gpu", "RTX PRO", "-y")
+        self.assertIn("matches several GPU types", out, out)
+        self.assertEqual(len(STATE["posts"]), 1, out)
 
     def test_up_stops_on_a_failed_line(self):
         """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):
