@@ -19,7 +19,8 @@ the log endpoint answering 403 (READY must come from the pod's own copy). Then s
 once: `up --name`, commands by name or id, attaching a pod created elsewhere, `down --all`. Then
 what the 5 October pods taught: Runpod's system log (the image pull, layer by layer) shown as one
 summary, a container that does not start (the stall warning), and a log route that does not answer
-(a message, not a traceback).
+(a message, not a traceback). Then a pod whose log stops at a FAILED line (bootstrap.sh 5.4): `up`
+must stop there, say what to do, and exit non-zero.
 """
 import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -49,8 +50,17 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (6, "[AINVFX] MODELS DONE 14/14 present · 59G on disk · 59 GB downloaded in 91 s (650 MB/s)"),
     (6, "[AINVFX] step 5/5 self-test"),
     (7, "[AINVFX] SELFTEST OK · Z-Image Turbo 1024 x 1024, 8 steps, in 16.0 s (models loaded from disk) · output/ainvfx_selftest_00001_.png"),
-    (7, "[AINVFX] READY · ComfyUI https://fakepod1-8188.proxy.runpod.net · JupyterLab port 8888 · log /workspace/ComfyUI/input/ainvfx/bootstrap.log"),
+    (7, "[AINVFX] READY · ComfyUI https://fakepod1-8188.proxy.runpod.net · JupyterLab https://fakepod1-8888.proxy.runpod.net/lab?token=faketoken · log /workspace/ComfyUI/input/ainvfx/bootstrap.log"),
     (7, "[AINVFX] remember: terminate the pod when you are done"),
+]
+# bootstrap.sh 5.4 on a host whose network times out on every PyTorch route (seen on 6 Oct 2026, before 5.4):
+# the log stops at a FAILED line and the pod stays up; READY never comes.
+BOOT_FAILED = BOOT[:7] + [
+    (3, "[AINVFX] WARNING: PyTorch download from https://download.pytorch.org/whl/cu130 failed (the lines above name the file)"),
+    (3, "[AINVFX] PyTorch: trying PyPI (attempt 1 of 2): the same CUDA 13.0 build, with the NVIDIA libraries from PyPI"),
+    (4, "[AINVFX] PyTorch: trying PyPI (attempt 2 of 2): the same CUDA 13.0 build, with the NVIDIA libraries from PyPI"),
+    (4, "[AINVFX] FAILED: PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above)."),
+    (4, "[AINVFX] the pod stays up so this log can be read, and it bills until you terminate it"),
 ]
 # Runpod's own system log, as seen on a real pod on 5 October 2026: the host fetches the image one
 # Docker layer at a time (many "<layer> Extracting" lines), then starts the container. PULL_START
@@ -88,7 +98,7 @@ def all_events(pod):
     """Every scripted (second, source, line) of this pod, in order."""
     pull = STATE["pull_seconds"]
     ev = [(s, "system", l) for s, l in PULL_START if pull] + [(pull + s, "system", l) for s, l in PULL_END if pull]
-    ev += [(pull + s, "container", l) for s, l in BOOT]
+    ev += [(pull + s, "container", l) for s, l in (STATE.get("boot") or BOOT)]
     return sorted(ev, key=lambda e: e[0])
 
 
@@ -391,7 +401,7 @@ class EndToEnd(unittest.TestCase):
 
     def setUp(self):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
-                      "pull_seconds": 0, "logs_hang_for": 0})
+                      "pull_seconds": 0, "logs_hang_for": 0, "boot": None})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -528,6 +538,20 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("down", "--all", "-y")
         self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [True, True, True], out)
         self.assertIn("Nothing bills", out, out)
+
+    def test_up_stops_on_a_failed_line(self):
+        """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):
+        `up` must stop on that line, say what to do, and exit non-zero, instead of waiting for READY."""
+        STATE["boot"] = BOOT_FAILED
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("[AINVFX] FAILED: PYTORCH COULD NOT BE DOWNLOADED", out, out)
+        self.assertIn("Terminate it and create another", out, out)
+        self.assertNotIn("Still working", out, "`up` must stop on FAILED, not on its deadline")
+        self.assertNotIn("[AINVFX] READY", out, out)
+        self.assertNotEqual(rc, 0, out)
+        self.run_pod("down", "-y")
 
 
 if __name__ == "__main__":
