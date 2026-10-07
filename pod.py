@@ -9,6 +9,7 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py up image           create a pod for the image sessions (RTX 5090, 100 GB disk)
   python pod.py up video           create a pod for video (RTX PRO 6000, 200 GB disk)
   python pod.py up train           create a pod for LoRA training (RTX PRO 6000, 250 GB disk)
+  python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
   python pod.py up train --name jar-lora   a second training pod, known here as `jar-lora`
   python pod.py status [pod]       status, GPU, data center, cost so far, ComfyUI address, last log lines
   python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
@@ -39,6 +40,13 @@ the usual answer is `down`, then `up` again, usually in another data center. A l
 FAILED (bootstrap.sh 5.4: PyTorch out of reach, no GPU from PyTorch, no ComfyUI) ends the wait at
 once: that pod cannot work, and the answer is the same, `down` then `up`.
 
+Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, and names the data
+center on Secure Cloud. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
+the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer),
+cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own; --max-price changes
+that), and prints the command to take another one. Right after creation it reads the pod's host: a host
+with maintenance under way or starting within 24 hours is terminated at once and the next GPU is tried.
+
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
 billing it.
@@ -63,7 +71,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -123,16 +131,28 @@ STALL_MINUTES = float(os.environ.get("AINVFX_STALL_MINUTES", "8"))
 STATUS_POLL = int(os.environ.get("AINVFX_STATUS_POLL", "45"))      # seconds between two reads of the pod's status
 STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds without a byte before the stream is reopened
 
+# Each profile names its preferred GPU and the least VRAM it needs. When the preferred GPU has no stock
+# on Secure Cloud, `up` proposes the cheapest GPU in stock with at least that VRAM and a Blackwell chip
+# or newer (see "Choosing the GPU" below).
 PROFILES = {
-    "image": dict(disk=100, gpus=["NVIDIA GeForce RTX 5090",
-                                 "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb",
-                                 "NVIDIA RTX PRO 6000 Blackwell Server Edition"]),
-    "video": dict(disk=200, gpus=["NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                                  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-                                  "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"]),
-    "train": dict(disk=250, gpus=["NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                                  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]),
+    "image": dict(disk=100, vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "video": dict(disk=200, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+    "train": dict(disk=250, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
+# Choosing the GPU. Two rules, learned on 5 and 7 October 2026, when a pod created with no data center
+# named landed on a host scheduled for removal (console notice "This server will be removed from the
+# platform"; the container never started), although the catalog showed no stock for that GPU:
+# 1. `up` never creates a pod where the catalog shows no stock, and never leaves the Secure Cloud data
+#    center to Runpod. Community stock carries no data center in the catalog, so a Community pod is the
+#    one case where Runpod picks the host, and only when the catalog shows Community stock.
+# 2. After each creation, `up` reads the pod's host through the GraphQL API (the REST API v2 does not
+#    report it). A host with maintenance under way, or starting within MAINT_HOURS, is terminated at
+#    once (a few seconds billed) and the next candidate is tried.
+NEWER_GPU = re.compile(r"blackwell|rubin|\brtx [5-9]0[5-9]0\b|\bg?b[1-9]00\b|\bv?r[1-9]00\b", re.I)
+MAX_PRICE = float(os.environ.get("AINVFX_MAX_PRICE", "2.5"))     # USD per hour: the most `up` picks on its own
+MAINT_HOURS = float(os.environ.get("AINVFX_MAINT_HOURS", "24"))  # maintenance starting sooner than this is refused
+HOST_WAIT = int(os.environ.get("AINVFX_HOST_WAIT", "40"))        # seconds to wait for the API to name the host
+GRAPHQL = os.environ.get("AINVFX_GRAPHQL", "https://api.runpod.io/graphql")   # the test harness points this at a fake
 # The same command as the public template. If GitHub cannot be reached, the pod falls back to
 # Runpod's own /start.sh (SSH and JupyterLab), so the error can be read instead of a restart loop.
 START_CMD = ('bash -c "curl -fsSL --retry 5 --retry-delay 3 {raw}/bootstrap.sh -o /tmp/ainvfx-bootstrap.sh '
@@ -440,9 +460,155 @@ def pod_ssh(pod):
     return None, None, None, None
 
 
-def gpu_catalog(cfg, gpu_id):
-    q = urllib.parse.urlencode({"include": "AVAILABILITY", "product": "POD", "minCudaVersion": MIN_CUDA})
-    return rp("GET", "/catalog/gpus/{}?{}".format(urllib.parse.quote(gpu_id, safe=""), q), cfg)
+def read_catalog(cfg, cloud):
+    """Every GPU type with its pod stock on `cloud` (SECURE or COMMUNITY) for hosts on CUDA MIN_CUDA or
+    newer, in one call: id, name, memory (VRAM in GB), price per cloud, availability, and for Secure the
+    data centers with stock (GET /catalog/gpus, REST API v2)."""
+    q = urllib.parse.urlencode({"include": "AVAILABILITY", "product": "POD", "minCudaVersion": MIN_CUDA, "cloud": cloud})
+    data = rp("GET", "/catalog/gpus?" + q, cfg)
+    return [g for g in (data.get("gpus") or []) if isinstance(g, dict) and g.get("id")]
+
+
+def in_stock(level):
+    return str(level or "").upper() not in ("", "NONE")
+
+
+def newer_gpu(gpu):
+    """True for a Blackwell GPU (RTX 50 series, RTX PRO Blackwell, B200, B300 and their MIG slices) or a newer one."""
+    return bool(NEWER_GPU.search("{} {}".format(gpu.get("id", ""), gpu.get("name", ""))))
+
+
+def make_offers(catalogs, region, country):
+    """One offer per GPU type and cloud with stock, cheapest first (Secure first at the same price):
+    dict(id, name, vram, cloud, price, dcs, newer). A Secure offer lists its data centers with stock,
+    the person's country first, and a create names one of them: Secure stock with no data center named
+    is skipped. A Community offer has no data center (the catalog gives none for Community)."""
+    offers = []
+    for cloud, gpus in catalogs.items():
+        for g in gpus:
+            price = (g.get("price") or {}).get(cloud.lower())
+            if not in_stock(g.get("availability")) or not price:
+                continue
+            dcs = [d.get("id") for d in (g.get("dataCenters") or []) if d.get("id") and in_stock(d.get("availability"))]
+            if cloud == "SECURE" and not dcs:
+                continue
+            dcs.sort(key=lambda d: dc_order(d, region, country))
+            offers.append({"id": g["id"], "name": str(g.get("name") or g["id"]), "vram": int(g.get("memory") or 0),
+                           "cloud": cloud, "price": float(price), "dcs": dcs, "newer": newer_gpu(g)})
+    offers.sort(key=lambda o: (o["price"], o["cloud"] != "SECURE", -o["vram"], o["name"]))
+    return offers
+
+
+def find_gpu(catalog, ref):
+    """The catalog entry that `ref` names: its full id or its short name ("RTX PRO 4500 SE"), in any case,
+    or a part of either that matches one GPU type only."""
+    r = ref.strip().lower()
+    for key in ("id", "name"):
+        hits = [g for g in catalog if str(g.get(key, "")).lower() == r]
+        if hits:
+            return hits[0]
+    hits, seen = [], set()                     # the same GPU type comes once per cloud: keep the first
+    for g in catalog:
+        if (r in str(g.get("id", "")).lower() or r in str(g.get("name", "")).lower()) and g["id"] not in seen:
+            seen.add(g["id"])
+            hits.append(g)
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die("no GPU type named \"{}\" in the Runpod catalog. `python pod.py up` lists the GPUs in stock.".format(ref))
+    die("\"{}\" matches several GPU types: {}. Give one of these names to --gpu.".format(
+        ref, ", ".join('"{}"'.format(g.get("name") or g["id"]) for g in hits[:12])))
+
+
+MACHINE_QUERY = ("query {{ pod(input: {{podId: {} }}) {{ id machine {{ podHostId dataCenterId location "
+                 "maintenanceStart maintenanceEnd maintenanceNote }} }} }}")
+
+
+def pod_machine(cfg, pod_id):
+    """The pod's host as the GraphQL API reports it (the REST API v2 has no maintenance field): a dict,
+    empty while no host is assigned; None when GraphQL cannot be read (the check is then skipped)."""
+    try:
+        data = request("POST", GRAPHQL, api_key(cfg), body={"query": MACHINE_QUERY.format(json.dumps(pod_id))}, timeout=20)
+    except ApiError:
+        return None
+    if not isinstance(data, dict) or data.get("errors") or "data" not in data:
+        return None
+    machine = ((data.get("data") or {}).get("pod") or {}).get("machine") or {}
+    return machine if any(machine.values()) else {}
+
+
+def to_time(value):
+    """An API time (RFC 3339 text, or epoch seconds or milliseconds) as an aware datetime, or None."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) or re.fullmatch(r"\d{9,13}(\.\d+)?", str(value)):
+        x = float(value)
+        return datetime.fromtimestamp(x / 1000 if x > 1e11 else x, tz=timezone.utc)
+    return parse_time(str(value))
+
+
+def maintenance_of(machine, now=None):
+    """A sentence when the host has maintenance under way or starting within MAINT_HOURS, else None.
+    A window that is over, or that starts later, does not matter for a pod that lives one session.
+    A time that cannot be read counts as under way: refusing a host costs less than a dead pod."""
+    machine = machine or {}
+    start_raw, end_raw = machine.get("maintenanceStart"), machine.get("maintenanceEnd")
+    if not start_raw and not end_raw:
+        return None
+    now = now or datetime.now(timezone.utc)
+    start, end = to_time(start_raw), to_time(end_raw)
+    if end and end <= now:
+        return None
+    if start and start > now + timedelta(hours=MAINT_HOURS):
+        return None
+
+    def when(t, raw):
+        return t.strftime("%d %b %Y %H:%M UTC") if t else str(raw)
+    if start_raw:
+        text = "maintenance {} {}".format("from" if start and start > now else "since", when(start, start_raw))
+    else:
+        text = "maintenance under way"
+    if end_raw:
+        text += ", until {}".format(when(end, end_raw))
+    note = " ".join(str(machine.get("maintenanceNote") or "").split())
+    if note:
+        text += ' ("{}")'.format(note if len(note) <= 140 else note[:140] + "...")
+    return text
+
+
+def host_check(cfg, pod_id):
+    """(machine, problem) for a pod just created. machine is None when GraphQL cannot be read, {} when
+    no host is reported within HOST_WAIT seconds; problem is the maintenance sentence, or None."""
+    deadline = time.time() + HOST_WAIT
+    while True:
+        machine = pod_machine(cfg, pod_id)
+        if machine is None or machine:
+            return machine, (maintenance_of(machine) if machine else None)
+        if time.time() >= deadline:
+            return {}, None
+        time.sleep(3)
+
+
+def offer_where(o, limit=4):
+    if not o["dcs"]:
+        return "a host Runpod picks"
+    more = len(o["dcs"]) - limit
+    return ", ".join(o["dcs"][:limit]) + (" and {} more".format(more) if more > 0 else "")
+
+
+def offer_line(o):
+    return "{} ({} GB of VRAM, {} per hour, {} Cloud, {})".format(
+        o["name"], o["vram"], fmt_money(o["price"]), o["cloud"].title(), offer_where(o))
+
+
+def show_offers(offers, pick, max_price):
+    """The table of GPUs in stock that fit the profile, cheapest first; `>` marks the one `up` will create."""
+    say("     {:<18} {:>6}  {:>9}  {:<9}  {}".format("GPU", "VRAM", "per hour", "cloud", "in stock in"))
+    for o in offers:
+        note = "   (above {}: only with --gpu)".format(fmt_money(max_price)) if o["price"] > max_price else ""
+        say("   {} {:<18} {:>3} GB  {:>9}  {:<9}  {}{}".format(
+            ">" if o is pick else " ", o["name"][:18], o["vram"], fmt_money(o["price"]), o["cloud"].title(),
+            offer_where(o), note))
 
 
 def list_pods(cfg, quiet=False):
@@ -919,7 +1085,6 @@ def cmd_up(args):
     region = args.region or cfg.get("region") or local_region()
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
     disk = args.disk or spec["disk"]
-    gpus = [args.gpu] if args.gpu else spec["gpus"]
     name = "ainvfx-{}-{}".format(profile, tag if tag != profile else datetime.now().strftime("%m%d-%H%M"))
     env = dict(load_settings())              # settings.env: ComfyUI tag, Python, PyTorch, models, custom nodes...
     env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
@@ -928,41 +1093,95 @@ def cmd_up(args):
     if not args.selftest:
         env["AINVFX_SELFTEST"] = "0"
 
-    created = None
-    for gpu in gpus:
+    # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
+    catalogs = {}
+    for cloud in (("SECURE",) if args.secure_only else ("SECURE", "COMMUNITY")):
         try:
-            cat = gpu_catalog(cfg, gpu)
+            catalogs[cloud] = read_catalog(cfg, cloud)
         except ApiError as e:
-            say("catalog: {} ({}: {})".format(gpu, e.code, e.detail[:100]))
-            continue
-        price = cat.get("price") or {}
-        p_secure, p_comm = price.get("secure"), price.get("community")
-        dcs = [d.get("id") for d in (cat.get("dataCenters") or []) if d.get("id")
-               and str(d.get("availability", "")).upper() not in ("NONE", "")]
-        dcs.sort(key=lambda d: dc_order(d, region, country))
-        avail = str(cat.get("availability", "?")).upper()
-        mine = [d for d in dcs if region_of(d) == region]
-        other = [d for d in dcs if region_of(d) != region]
-        say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(cat.get("name", gpu), avail, MIN_CUDA))
-        say("   in stock in {}: {}".format(REGION_NAMES.get(region, region), ", ".join(mine) or "none right now"))
-        say("   elsewhere: {}".format(", ".join(other) or "none"))
-        say("   price per hour: {} Secure, {} Community".format(
-            fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?"))
-        if dcs:
-            say("   tried first: {}".format(dcs[0]))
-        if not dcs and args.secure_only:
-            continue
-        if not args.yes:
-            ans = input("   Create a {} with a {} GB disk, billed from creation? [Y/n] ".format(cat.get("name", gpu), disk)).strip().lower()
-            if ans not in ("", "y", "yes"):
-                continue
-        attempts = [("SECURE", [dc]) for dc in dcs[:6]] + [("SECURE", [])]
-        if not args.secure_only:
-            attempts.append(("COMMUNITY", []))
-        for cloud, dc_list in attempts:
-            body = {"name": name, "cloud": cloud, "disk": disk, "env": env,
+            if cloud == "SECURE":
+                die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
+            say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
+    secure = catalogs.get("SECURE") or []
+    max_price = MAX_PRICE if args.max_price is None else args.max_price
+    if args.gpu:
+        want = find_gpu(secure + (catalogs.get("COMMUNITY") or []), args.gpu)
+    else:
+        want = next((g for g in secure if g["id"] == spec["gpu"]), {"id": spec["gpu"], "name": spec["gpu"]})
+    offers = make_offers(catalogs, region, country)
+    mine = [o for o in offers if o["id"] == want["id"]]
+    preferred = next((o for o in mine if o["cloud"] == "SECURE"), None)
+    fits = [o for o in offers if o["vram"] >= spec["vram"] and o["newer"]]
+    wname = str(want.get("name") or want["id"])
+
+    price = want.get("price") or {}
+    p_secure, p_comm = price.get("secure"), price.get("community")
+    dcs = preferred["dcs"] if preferred else []
+    say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(
+        wname, str(want.get("availability", "?")).upper(), MIN_CUDA))
+    say("   in stock in {}: {}".format(REGION_NAMES.get(region, region),
+                                       ", ".join(d for d in dcs if region_of(d) == region) or "none right now"))
+    say("   elsewhere: {}".format(", ".join(d for d in dcs if region_of(d) != region) or "none"))
+    say("   price per hour: {} Secure, {} Community".format(
+        fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?"))
+
+    profile_rule = "{} GB of VRAM or more, Blackwell or newer, host on CUDA {} or newer".format(spec["vram"], MIN_CUDA)
+    if args.gpu:
+        candidates = mine                     # the GPU named on the command line, and nothing else
+        if not candidates:
+            say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if args.secure_only else ""))
+            others = [o for o in fits if o["id"] != want["id"]]
+            if others:
+                say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
+                show_offers(others, None, max_price)
+                say('   To take one:  python pod.py up {} --gpu "{}"'.format(profile, others[0]["name"]))
+            die("nothing created.")
+    elif preferred:
+        say("   tried first: {}".format(dcs[0]))
+        candidates = [preferred] + [o for o in fits if o is not preferred and o["price"] <= max_price]
+    else:
+        say("   No {} is free on Secure Cloud. `up` never creates a pod where the catalog shows no stock:".format(wname))
+        say("   Runpod would then pick any host, and twice that was a host being removed from the platform.")
+        candidates = [o for o in fits if o["price"] <= max_price]
+        if candidates:
+            say("   Replacement: {}.".format(offer_line(candidates[0])))
+        say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
+        if fits:
+            show_offers(fits, candidates[0] if candidates else None, max_price)
+        else:
+            say("   none right now.")
+        if not candidates:
+            if fits:
+                say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
+                    fmt_money(max_price), profile, fits[0]["name"]))
+            die("nothing in stock fits the {} profile at {} per hour or less. Try again in a few minutes.".format(
+                profile, fmt_money(max_price)))
+        other = next((o for o in fits if o["id"] != candidates[0]["id"]), None)
+        if other:
+            say('   To choose another one:  python pod.py up {} --gpu "{}"   (any name from the GPU column)'.format(
+                profile, other["name"]))
+        if any(o["cloud"] == "COMMUNITY" for o in fits):
+            say("   Add --secure-only to leave out Community Cloud.")
+
+    first = candidates[0]
+    if not args.yes:
+        if len(candidates) > 1:
+            say("   If it is taken in the meantime, `up` tries the next GPUs that fit, cheapest first, up to {} per hour."
+                .format(fmt_money(max(o["price"] for o in candidates))))
+        ans = input("   Create a {} with a {} GB disk, billed from creation? [Y/n] ".format(first["name"], disk)).strip().lower()
+        if ans not in ("", "y", "yes"):
+            say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
+            return
+
+    created, host = None, None
+    for n, offer in enumerate(candidates):
+        if n:
+            say("   Next: {}.".format(offer_line(offer)))
+        attempts = [[dc] for dc in offer["dcs"][:6]] if offer["cloud"] == "SECURE" else [[]]
+        for dc_list in attempts:
+            body = {"name": name, "cloud": offer["cloud"], "disk": disk, "env": env,
                     "startSsh": True, "startJupyter": True,
-                    "gpu": {"id": gpu, "count": 1, "minCudaVersion": MIN_CUDA}}
+                    "gpu": {"id": offer["id"], "count": 1, "minCudaVersion": MIN_CUDA}}
             if dc_list:
                 body["dataCenterIds"] = dc_list
             if cfg.get("template_id") or TEMPLATE_ID:
@@ -971,16 +1190,35 @@ def cmd_up(args):
                 body["image"] = IMAGE
                 body["args"] = START_CMD
                 body["ports"] = ["{}/http".format(COMFY_PORT), "{}/http".format(JUPYTER_PORT), "22/tcp"]
-            where = "{} {}".format(cloud, dc_list[0] if dc_list else "(any data center)")
-            created = create_pod(cfg, body, where)
-            if created and created.get("id"):
-                say("   created on {}: pod {}".format(where, created["id"]))
-                break
-            created = None
+            where = "{} {}".format(offer["cloud"], dc_list[0] if dc_list else "(host picked by Runpod)")
+            pod = create_pod(cfg, body, where)
+            if not (pod and pod.get("id")):
+                continue
+            say("   created on {}: pod {} ({})".format(where, pod["id"], offer["name"]))
+            machine, problem = host_check(cfg, pod["id"])
+            if problem:
+                say("   REFUSED: its host has {}.".format(problem))
+                try:
+                    rp("DELETE", "/pods/" + pod["id"], cfg)
+                    say("   pod {} terminated at once (a few seconds billed). Trying the next machine.".format(pod["id"]))
+                except ApiError as e:
+                    say("   pod {} COULD NOT BE TERMINATED ({}): run `python pod.py down {}` once this ends."
+                        .format(pod["id"], e.detail[:100], pod["id"]))
+                continue
+            if machine is None:
+                say("   host check skipped: the GraphQL API did not answer. The log below shows whether the host works.")
+            elif not machine:
+                say("   host check: no host reported after {} s. The log below shows whether it works.".format(HOST_WAIT))
+            else:
+                say("   host checked: no maintenance planned{}.".format(
+                    " ({})".format(machine["dataCenterId"]) if machine.get("dataCenterId") else ""))
+            created, host = pod, (machine or {})
+            break
         if created:
             break
     if not created:
-        die("no pod could be created. Try again in a few minutes, another profile, or the Runpod console.")
+        die("no pod could be created: the machines in stock were taken in the meantime, or under maintenance.\n"
+            "Try again in a minute: `python pod.py up {}` reads the stock again.".format(profile))
 
     pod_id = created["id"]
     created_at = datetime.now(timezone.utc)
@@ -1010,6 +1248,8 @@ def cmd_up(args):
         except ApiError:
             pass
     gpu, dc, price = pod_summary(pod)
+    if dc == "?" and host.get("dataCenterId"):
+        dc = host["dataCenterId"]
     say("Pod {} · {} · {} · CUDA {} · {}".format(
         name, gpu, dc if dc != "?" else "data center not reported yet (the console shows it)",
         pod.get("cudaVersion") or "?", (fmt_money(price) + " per hour") if price else "price in the console"))
@@ -1290,10 +1530,13 @@ def main():
     p.add_argument("profile", nargs="?", default="image", choices=sorted(PROFILES))
     p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`); "
                                   "the other commands then take that name")
-    p.add_argument("--gpu", help="exact GPU type id, instead of the profile's list")
+    p.add_argument("--gpu", help='a GPU from the list `up` shows, by its name ("RTX PRO 4500 SE") or its full id; '
+                                 "only that GPU is tried")
+    p.add_argument("--max-price", type=float, help="the most per hour `up` takes on its own when the profile's GPU "
+                                                   "has no stock (default {:.2f} USD)".format(MAX_PRICE))
     p.add_argument("--disk", type=int, help="container disk in GB")
     p.add_argument("--region", choices=["EU", "NA"])
-    p.add_argument("--secure-only", action="store_true", help="never fall back to Community Cloud")
+    p.add_argument("--secure-only", action="store_true", help="leave out Community Cloud")
     p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
