@@ -71,7 +71,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -182,6 +182,21 @@ def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     restrict(CONFIG)
+
+
+def remember_pod(cfg, tag, rec):
+    """Write one pod record, or remove it (rec None). The file is read again just before the write, so
+    two commands running at once (two terminals, two `up`) keep each other's records. Before 0.6.1 each
+    command wrote back the whole file it had read at its start, and the last one to finish erased the
+    other's pod (7 Oct 2026: `down test10` no longer knew test10)."""
+    fresh = load_config()
+    pods = fresh.setdefault("pods", {})
+    if rec is None:
+        pods.pop(tag, None)
+    else:
+        pods[tag] = rec
+    save_config(fresh)
+    cfg["pods"] = pods
 
 
 def restrict(path):
@@ -401,15 +416,30 @@ def which_pod(cfg, ref):
     for tag, rec in pods.items():
         if ref in (rec.get("id"), rec.get("name")):
             return tag, rec
-    for p in list_pods(cfg, quiet=True):
+    account = list_pods(cfg, quiet=True)
+    short = {"ainvfx-{}-{}".format(k, ref) for k in PROFILES}   # `up image --name test10` names its pod ainvfx-image-test10
+
+    def attach(p, tag):
         pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
+        rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
+               "created": p.get("createdAt") or ""}
+        remember_pod(cfg, tag, rec)
+        say("attached to {} ({}) as `{}`".format(rec["name"], pid, tag))
+        return tag, rec
+    for p in account:
+        pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
+        if pname in short:
+            return attach(p, ref)
         if ref in (pid, pname) or (pname and pname.startswith(ref)):
-            rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
-                   "created": p.get("createdAt") or ""}
-            pods[pname or pid] = rec
-            save_config(cfg)
-            say("attached to {} ({})".format(rec["name"], pid))
-            return pname or pid, rec
+            return attach(p, pname or pid)
+    if ref in PROFILES:                     # `up image` names its pod ainvfx-image-<month><day>-<time>
+        hits = [p for p in account if str(p.get("name") or "").startswith("ainvfx-{}-".format(ref))
+                and pod_status(p) not in FINAL]
+        if len(hits) == 1:
+            return attach(hits[0], ref)
+        if hits:
+            die("several {} pods in your account: {}. Name one: `python pod.py {} <name or id>`.".format(
+                ref, "  ".join("{} ({})".format(p.get("name"), p.get("id")) for p in hits), "status"))
     die("no pod '{}' recorded here or in your account. `python pod.py list` shows them.".format(ref))
 
 
@@ -1079,8 +1109,7 @@ def cmd_up(args):
         except ApiError as e:
             if e.code != 404:
                 die("{}\n{}".format(e, e.hint()))
-        cfg["pods"].pop(tag, None)
-        save_config(cfg)
+        remember_pod(cfg, tag, None)
 
     region = args.region or cfg.get("region") or local_region()
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
@@ -1222,8 +1251,7 @@ def cmd_up(args):
 
     pod_id = created["id"]
     created_at = datetime.now(timezone.utc)
-    cfg["pods"][tag] = {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()}
-    save_config(cfg)
+    remember_pod(cfg, tag, {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()})
     say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
     wait_until = time.time() + 15 * 60
     pod = created
@@ -1445,8 +1473,7 @@ def cmd_down(args):
                 say("{}: already gone from Runpod.".format(rec.get("name")))
             else:
                 die("{}\n{}".format(e, e.hint()))
-        cfg["pods"].pop(tag, None)
-        save_config(cfg)
+        remember_pod(cfg, tag, None)
     try:
         remaining = list_pods(cfg, quiet=True)
     except ApiError:
