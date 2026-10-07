@@ -26,7 +26,7 @@ Two ways to create a pod. Both give the same machine.
 1. Open [the AInVFX template](https://console.runpod.io/deploy?template=4i789znkrd&ref=iad0yzht) (template id `4i789znkrd`).
 2. Pick the GPU: **RTX 5090** for image work. If it is out of stock, open the **Filter** button of the Compute section and set **Cloud type** to **Community** (machines owned by third parties, cheaper and often better stocked; the console shows a warning), or pick a slice of the RTX PRO 6000.
 3. Click **Deploy On-Demand**. The pod appears under Pods; its **Logs** button shows the install running.
-4. Wait for the line `READY`: 5 to 15 minutes depending on the data center (the log's first lines are Runpod's own: the image found on the host, the container started; then every line of ours starts with `[AINVFX]`). Open `https://<pod id>-8188.proxy.runpod.net` (also behind the pod's **Connect** button): that is your ComfyUI. If the button opens a blank "403" page, press Enter in the address bar: ComfyUI refuses a page opened by a click from another site (its protection against sites that would drive it), never the address typed or opened by `pod.py open`.
+4. Wait for the line `READY`: 5 to 15 minutes depending on the data center (the log's first lines are Runpod's own: the image found on the host, the container started; then every line of ours starts with `[AINVFX]`). Open `https://<pod id>-8188.proxy.runpod.net` (also behind the pod's **Connect** button): that is your ComfyUI. The `READY` line also gives JupyterLab's link, its token included. If the button opens a blank "403" page, press Enter in the address bar: ComfyUI refuses a page opened by a click from another site (its protection against sites that would drive it), never the address typed or opened by `pod.py open`.
 5. When you are done: download your results (the Assets panel in ComfyUI), then **Terminate** the pod. Stop is not enough: a stopped pod keeps a dead entry and may keep billing storage.
 
 ## Quick start, script
@@ -68,20 +68,24 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 | before | Runpod puts the image on the host. The template uses the image of Runpod's own "Runpod Pytorch 2.8.0" template, which the hosts already hold, so this takes seconds; a host that has to fetch an image from Docker Hub takes several minutes (19 layers, about 9 GB) | `[RUNPOD]` lines in `pod.py`; system log in the console |
 | 0 | SSH and JupyterLab start in the background, before anything else | JupyterLab answers within two minutes |
 | 1 | **Health check**: the GPU and its driver (580 or newer, so the CUDA 13 kernels of the int8 models run), disk write and read speed | a `WARNING` in capitals when a value is bad: terminate and create again, usually in another data center |
-| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.39.0`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine | `ComfyUI v0.39.0` |
+| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.39.0`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine. A download that fails is retried, and PyTorch then comes from PyPI, the same CUDA 13.0 build | `ComfyUI v0.39.0`; `FAILED` when the pod cannot work on that machine (below) |
 | 3 | **Start**: ComfyUI listens for the proxy | `COMFYUI UP` with the address, then `PROXY OK` |
-| 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one. A first line gives the plan (files to download, GB); then every line says file k of n, the GB done of the GB planned, the percent and the time left at the average speed so far. The first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped | `MODELS DONE 14/14` with the total time and the average speed |
-| 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` |
+| 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one. A first line gives the plan (files to download, GB); then every line says file k of n, the GB done of the GB planned, the percent and the time left at the average speed so far. The first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped. Each gated file is checked first: one whose licence your Hugging Face account has not accepted gets a `WAITING` line with its page, and the end of the log lists them all | `MODELS DONE 14/14` with the total time and the average speed |
+| 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` with two links: ComfyUI, and JupyterLab with its token |
 
 `up` and `logs` read the log from two places, because Runpod's live log stream has been seen staying open and silent while the pod wrote its last lines: the stream is reopened every minute a few seconds back, and every 15 seconds the script reads the copy of the log that the pod serves itself. Whichever shows `READY` first ends the wait.
 
 If GitHub cannot be reached, the start command falls back to Runpod's own `/start.sh`: the pod still boots with SSH and JupyterLab, and the error can be read.
 
+**When the log says `FAILED`.** The pod cannot work on that machine: Python, PyTorch or ComfyUI could not be installed, or PyTorch cannot see the GPU. The line says which, and what to do. The pod stays up so the log can be read, and it bills: terminate it and create another (`python pod.py down`, then `up`), which lands on another machine. `up` stops on that line.
+
+**When the log says `ACTION NEEDED`.** Gated files did not come, and the lines below it give the Hugging Face page of each. Logged in with the account the log names, click « Agree and access repository » on each page, then fetch the files on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal (File, New, Terminal) or after `python pod.py ssh`. A pod without a token needs one first (below), then a new pod.
+
 Profile sizes (Hugging Face, 4 October 2026): `image` 14 files, about 63 GB; `video` 36 files, about 150 GB; `train` 38 files, about 215 GB.
 
 Measured on two RTX 5090 pods on Secure Cloud (4 and 5 October 2026), on the image above: the container up within a minute or two of creation, PyTorch installed in 90 seconds, ComfyUI answering after about 4 minutes; the 63 GB of the `image` profile took 10 minutes in EUR-IS-2 (about 100 MB/s) and 90 seconds in EU-CZ-1 (300 to 1300 MB/s per file); the self-test 16 to 106 seconds on the first load, 2 seconds once cached; `READY` 5 to 15 minutes after creation. A third pod on 5 October, created with "any data center" after the first choice had no stock, landed on a host that Runpod had scheduled for removal: it never started its container, the API still said RUNNING, and the log stream did not answer. That pod is why `up` now warns after 8 minutes without a container and why every API error is a message.
 
-The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reachable as `/workspace/ainvfx-bootstrap.log`). Because it lives in ComfyUI's input folder, the pod serves it through its own proxy once ComfyUI answers, and `pod.py` reads it there as well as through the API stream: `up` and `logs` catch `READY` either way.
+The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reachable as `/workspace/ainvfx-bootstrap.log`). Because it lives in ComfyUI's input folder, the pod serves it through its own proxy once ComfyUI answers (so anyone with the pod's address can read it, the JupyterLab token of its last line included: keep the address to yourself), and `pod.py` reads it there as well as through the API stream: `up` and `logs` catch `READY` either way.
 
 ## Your own settings: settings.env
 
@@ -128,14 +132,16 @@ The gated repositories (LTX 2.5) need a Hugging Face read token: a free Hugging 
 
 - `python pod.py setup --hf-token` stores it on Runpod as the secret `huggingface_token` (or do it in the console: Account, Credentials, Secrets, same name).
 - Pods receive it as the variable `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots.
-- Without a secret of that name, the pod receives the placeholder unchanged, notices it, ignores it and skips the gated files. The log says so. Nothing else breaks.
+- Without a secret of that name, the pod receives the placeholder unchanged, notices it, ignores it and skips the gated files. The log says so, with the page of each file. Nothing else breaks.
+- The pod checks the token once and names its Hugging Face account in the log. A token that Hugging Face refuses is dropped, with a `WARNING`.
+- Each gated repository has its own licence: the LTX 2.5 models, then each LTX IC-LoRA. A licence not accepted yet stops nothing else: the end of the log lists the page of each file waiting (`ACTION NEEDED`, above).
 
 ## Files in and out
 
 - **Workflow files** (`.json`): drag and drop them onto the ComfyUI canvas, as at home.
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
 - **Results out**: the Assets panel in ComfyUI's sidebar, or `python pod.py pull`, which downloads every output listed in the pod's history that you do not have yet, into `outputs/<pod name>/` next to the script (or the folder named in `AINVFX_OUTPUTS`).
-- **Many files at once**: JupyterLab at `https://<pod id>-8888.proxy.runpod.net` (the token is under Connect in the console).
+- **Many files at once**: JupyterLab, from the link on the `READY` line (its token is in it) or from the pod's Connect button. Its terminal is under File, New, Terminal.
 
 ## How `up` picks the machine
 

@@ -34,7 +34,9 @@ what the host is doing (fetching the image, starting the container): `up` shows 
 lines, with one summary of the image download (layers done, extracting, downloading) so a long
 pull never looks like a hang. Measured on two RTX 5090 pods (4 and 5 Oct 2026): READY 5 to 15
 minutes after creation. A pod with no container 8 minutes after creation gets a warning: the
-usual answer is `down`, then `up` again, usually in another data center.
+usual answer is `down`, then `up` again, usually in another data center. A line starting with
+FAILED (bootstrap.sh 5.4: PyTorch out of reach, no GPU from PyTorch, no ComfyUI) ends the wait at
+once: that pod cannot work, and the answer is the same, `down` then `up`.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -60,7 +62,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -632,13 +634,25 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
     state["last_output"] = time.time()
 
     def show(line, key):
-        """An [AINVFX] line, once. True on READY."""
+        """An [AINVFX] line, once. True on READY, and on FAILED (state["failed"] then says which)."""
         if key in seen or line in printed:
             return False
         seen.add(key); printed.add(line)
         state["container"] = True
         out(line[line.index("[AINVFX]"):])
+        if "[AINVFX] FAILED" in line:
+            state["failed"] = True
+            return True
         return "READY" in line
+
+    def done():
+        """The end of the wait: True on READY; False on FAILED, with what to do."""
+        if state.get("failed"):
+            say("\nThe pod reported FAILED (the line above): it cannot work on that machine, and it bills until "
+                "it is terminated. Terminate it and create another, which lands on another machine:\n"
+                "    python pod.py down    then    python pod.py up")
+            return False
+        return True
 
     def system(line):
         """A line of Runpod's system log."""
@@ -720,14 +734,14 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
                 if line and "[AINVFX]" in line:
                     if show(line, (eid, line)):
                         pull_summary(True)
-                        return True
+                        return done()
                 elif line and source == "system":
                     system(line)
                 last_id = eid or last_id
                 if time.time() - last_poll > PROXY_POLL:
                     last_poll = time.time()
                     if poll_proxy():
-                        return True
+                        return done()
                 if check_pod() is False:
                     return False
                 pull_summary(False)
@@ -746,7 +760,7 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
             time.sleep(min(PROXY_POLL, 10))
         last_poll = time.time()
         if poll_proxy():
-            return True
+            return done()
         if check_pod() is False:
             return False
         pull_summary(False)
@@ -999,7 +1013,7 @@ def cmd_up(args):
         name, gpu, dc if dc != "?" else "data center not reported yet (the console shows it)",
         pod.get("cudaVersion") or "?", (fmt_money(price) + " per hour") if price else "price in the console"))
     say("ComfyUI address (ready once the log says COMFYUI UP): {}".format(pod_url(pod_id)))
-    say("JupyterLab: {}  (token under Connect in the console)".format(pod_url(pod_id, JUPYTER_PORT)))
+    say("JupyterLab: {}  (the READY line gives the link with its token)".format(pod_url(pod_id, JUPYTER_PORT)))
     say("The pod bills from now on; `python pod.py down {}` terminates it at any time.\n".format(tag))
     try:
         ready = follow_logs(cfg, pod_id, minutes=args.wait, pod=pod, created=created_at)

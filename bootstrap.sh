@@ -28,6 +28,19 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.4 (6 Oct 2026, night, after a console pod that failed): three changes.
+# (1) PyTorch. One host could not reach pypi.nvidia.com, where the PyTorch index sends its NVIDIA
+# libraries, and the install failed. uv now waits longer and retries more (UV_HTTP_TIMEOUT 120,
+# UV_HTTP_RETRIES 5). After a failure, PyPI is tried: it carries the same CUDA 13.0 build of the stable
+# release, with the NVIDIA libraries on its own servers. The other installs retry once. A pod that still
+# cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints a line starting with
+# FAILED, says what to do, and stays up so the log can be read; pod.py 0.5.1 stops on that line.
+# (2) Gated files. The token is checked once, and the log names its Hugging Face account. Each gated
+# file is checked before its download. A file whose licence that account has not accepted is listed,
+# just before the last line, with the link of its page and the command that fetches it once accepted:
+# `bash <this script> models` (step 4 only, then exit; works from JupyterLab's terminal or ssh).
+# (3) The last line gives JupyterLab's link with its token, so one click opens it (Adrien's choice for
+# temporary teaching pods), or says that JupyterLab is off.
 # v5.3 (6 Oct 2026): every download line says where it stands: file k of n, GB done of GB planned,
 # percent, and the time left at the average speed so far (the plan is computed before the loop).
 # v5.2 (6 Oct 2026): default ComfyUI tag v0.39.0 (tagged 5 Oct 22:49 UTC: Save EXR in 16-bit float by default,
@@ -56,6 +69,8 @@
 #                         Runpod fills it from the secret `huggingface_token` when the value is
 #                         {{ RUNPOD_SECRET_huggingface_token }}; an unresolved placeholder counts as absent.
 #
+# One argument is understood: `models` runs step 4 alone (the files still missing), then exits.
+#
 # Idempotent: a second run (pod restart) skips what is already installed and downloaded.
 # Nothing here depends on SSH: everything is visible in the pod's log in the Runpod console.
 
@@ -64,9 +79,24 @@ set -uo pipefail
 if [ -n "${AINVFX_BOOTSTRAP_URL:-}" ] && [ -z "${AINVFX_BOOTSTRAP_RAN:-}" ]; then
   echo "[AINVFX] fetching the bootstrap named in AINVFX_BOOTSTRAP_URL: $AINVFX_BOOTSTRAP_URL"
   if curl -fsSL --retry 3 "$AINVFX_BOOTSTRAP_URL" -o /tmp/ainvfx-bootstrap-fork.sh; then
-    AINVFX_BOOTSTRAP_RAN=1 exec bash /tmp/ainvfx-bootstrap-fork.sh
+    AINVFX_BOOTSTRAP_RAN=1 exec bash /tmp/ainvfx-bootstrap-fork.sh "$@"
   fi
   echo "[AINVFX] WARNING: that bootstrap could not be fetched; continuing with this one"
+fi
+
+MODE="${1:-all}"
+case "$MODE" in
+  all|models) ;;
+  *) echo "usage: bash $0 [models]   (models: fetch the files still missing, then exit)"; exit 2 ;;
+esac
+if [ "$MODE" = "models" ]; then
+  # A terminal opened on the pod may lack the pod's variables: read them from the container's first process.
+  for v in AINVFX_PROFILE AINVFX_MODELS_URL AINVFX_REPO_RAW HF_TOKEN; do
+    if [ -z "${!v:-}" ] && [ -r /proc/1/environ ]; then
+      val=$({ tr '\0' '\n' < /proc/1/environ; } 2>/dev/null | sed -n "s/^$v=//p" | head -1)
+      [ -n "$val" ] && export "$v=$val"
+    fi
+  done
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
@@ -85,6 +115,8 @@ LOG=$COMFY/input/ainvfx/bootstrap.log   # inside ComfyUI's input folder: readabl
 STAGE=$ROOT/.hfdl
 PORT=8188
 PROXY="https://${RUNPOD_POD_ID:-<pod id>}-$PORT.proxy.runpod.net"
+JUPYTER="https://${RUNPOD_POD_ID:-<pod id>}-8888.proxy.runpod.net"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")   # this script on the pod, for the `models` command it prints
 export HF_XET_HIGH_PERFORMANCE=1
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$(dirname "$LOG")"
@@ -95,9 +127,84 @@ say()  { echo "[AINVFX] $*"; }
 warn() { echo "[AINVFX] WARNING: $*"; }
 now()  { date +%s.%N; }
 mbps() { python3 -c "import sys; b=float(sys.argv[1]); t=float(sys.argv[2]); print(int(b/1e6/max(t,0.001)))" "$1" "$2"; }
+fail() { echo "[AINVFX] FAILED: $*"; }
+hold() {   # after FAILED: the pod stays up (SSH, JupyterLab, this log) until it is terminated
+  say "the pod stays up so this log can be read, and it bills until you terminate it"
+  if [ -n "${START_PID:-}" ]; then wait "$START_PID"; fi
+  sleep infinity
+}
+# uv waits longer and retries more than its defaults (30 s, 3 retries): slow mirrors happen.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-120}"
+export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-5}"
+uvi() {    # uv pip install, once more after a pause if the first attempt fails
+  uv pip install --quiet "$@" && return 0
+  warn "install failed, one more try in 10 s: uv pip install $*"
+  sleep 10
+  uv pip install --quiet "$@"
+}
+# PyTorch: its own index first. That index sends its NVIDIA libraries to pypi.nvidia.com, which a host
+# could not reach on 6 Oct 2026. PyPI carries the same CUDA 13.0 build of the stable release, with the
+# NVIDIA libraries on its own servers, so it is the second route (stable cu130 only: PyPI has no other
+# CUDA build and no nightlies). uv keeps finished downloads in its cache: a new attempt fetches only what failed.
+install_torch() {
+  # shellcheck disable=SC2086
+  uv pip install --quiet $TORCH --index-url "$TORCH_INDEX" && return 0
+  warn "PyTorch download from $TORCH_INDEX failed (the lines above name the file)"
+  local pypi=0 attempt
+  case "$TORCH_INDEX" in */whl/cu130|*/whl/cu130/) pypi=1 ;; esac
+  case " $TORCH " in *" --pre "*) pypi=0 ;; esac
+  for attempt in 1 2; do
+    sleep 10
+    if [ "$pypi" = "1" ]; then
+      say "PyTorch: trying PyPI (attempt $attempt of 2): the same CUDA 13.0 build, with the NVIDIA libraries from PyPI"
+      # shellcheck disable=SC2086
+      uv pip install --quiet $TORCH && return 0
+    else
+      say "PyTorch: trying $TORCH_INDEX again (attempt $attempt of 2)"
+      # shellcheck disable=SC2086
+      uv pip install --quiet $TORCH --index-url "$TORCH_INDEX" && return 0
+    fi
+  done
+  return 1
+}
+hf_state() {   # ok, gated, missing or error for one file of Hugging Face: one HEAD request, nothing downloaded
+  local auth=() hdr code err
+  [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+  hdr=$(curl -sI --max-time 20 "${auth[@]}" "https://huggingface.co/$1/resolve/main/$2" 2>/dev/null | tr -d '\r')
+  code=$(printf '%s\n' "$hdr" | awk '/^HTTP/ {c=$2} END {print c}')
+  err=$(printf '%s\n' "$hdr" | awk -F': ' 'tolower($1) == "x-error-code" {e=$2} END {print e}')
+  case "$code" in
+    2*|3*) echo ok ;;
+    401|403) if [ "$err" = "GatedRepo" ]; then echo gated; else echo error; fi ;;
+    404) echo missing ;;
+    *) echo error ;;
+  esac
+}
+NEED_REPOS=""; NOTOKEN_REPOS=""; WAITING=0; SKIPPED=0; HF_USER=""
+print_links() {   # one page link per repo, each repo once, in the order met
+  local r
+  # shellcheck disable=SC2086
+  for r in $(printf '%s\n' $1 | awk 'NF && !seen[$0]++'); do say "   https://huggingface.co/$r"; done
+}
+access_summary() {   # the gated files that did not come, with the page of each and what to do
+  if [ -n "$NEED_REPOS" ]; then
+    say "ACTION NEEDED · $WAITING gated file(s) wait for a licence that the Hugging Face account${HF_USER:+ $HF_USER} has not accepted. Logged in to huggingface.co with that account, open each page and click « Agree and access repository » (the LTX pages approve at once):"
+    print_links "$NEED_REPOS"
+    say "   then fetch them on this pod, without a new one: bash $SELF models   (in JupyterLab's terminal, or after python pod.py ssh)"
+    say "   a Read token works; a fine-grained token also needs its permission to read public gated repos"
+  fi
+  if [ -n "$NOTOKEN_REPOS" ]; then
+    say "ACTION NEEDED · $SKIPPED gated file(s) skipped: this pod has no Hugging Face token. Store a Read token as the Runpod secret huggingface_token (python pod.py setup --hf-token), accept the licence on each page below, then create a new pod:"
+    print_links "$NOTOKEN_REPOS"
+  fi
+}
 
-say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
-say "settings: torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
+if [ "$MODE" = "models" ]; then
+  say "models only (bash $SELF models) · profile $PROFILE · $(date -u +'%F %T') UTC"
+else
+  say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
+  say "settings: torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
+fi
 
 # A placeholder Runpod did not substitute (no secret in the account) must not reach Hugging Face:
 # an invalid token makes it refuse even public files.
@@ -105,8 +212,23 @@ if [ -n "${HF_TOKEN:-}" ] && case "$HF_TOKEN" in *"{{"*) true;; *) false;; esac;
   say "no Runpod secret named huggingface_token in this account: HF_TOKEN ignored"
   unset HF_TOKEN
 fi
-if [ -n "${HF_TOKEN:-}" ]; then say "HF_TOKEN present: gated files (LTX) allowed"; else say "no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"; fi
+# The token, checked once: a refused token is dropped (the public files then come without it), a valid one
+# names its Hugging Face account, the one that must accept the gated licences.
+if [ -n "${HF_TOKEN:-}" ]; then
+  WHO=$(curl -s --max-time 15 -w '\n%{http_code}' -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/api/whoami-v2 2>/dev/null)
+  case "$(printf '%s\n' "$WHO" | tail -n 1)" in
+    200) HF_USER=$(printf '%s\n' "$WHO" | sed '$d' | python3 -c "import json, sys; print(json.load(sys.stdin).get('name', ''))" 2>/dev/null) ;;
+    401) warn "HUGGING FACE REFUSES THIS TOKEN (401): it is ignored, so the gated files will be skipped. Create a new Read token (huggingface.co, Settings, Access Tokens) and store it again as the Runpod secret huggingface_token"
+         unset HF_TOKEN ;;
+  esac
+fi
+if [ -n "${HF_TOKEN:-}" ]; then
+  say "HF_TOKEN present${HF_USER:+, Hugging Face account $HF_USER}: gated files (LTX) allowed once their licence is accepted"
+else
+  say "no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"
+fi
 
+if [ "$MODE" != "models" ]; then   # steps 0 to 3; the models mode goes straight to step 4
 # ---------------------------------------------------------------- 0. SSH and JupyterLab now
 if [ -x /start.sh ] && ! pgrep -f "jupyter lab" >/dev/null 2>&1; then
   say "step 0/5 starting Runpod's /start.sh in the background (SSH, JupyterLab on port 8888)"
@@ -151,15 +273,19 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 say "uv $(uv --version 2>/dev/null | awk '{print $2}')"
 if [ ! -x $VENV/bin/python ]; then
-  uv venv $VENV --python "$PY" --quiet || warn "no Python $PY available through uv: read the lines above"
+  uv venv $VENV --python "$PY" --quiet || { sleep 10; uv venv $VENV --python "$PY" --quiet; } || {
+    fail "PYTHON $PY COULD NOT BE INSTALLED on this machine (the lines above). Terminate this pod and create a new one: it lands on another machine."
+    hold
+  }
 fi
 # shellcheck disable=SC1091
 source $VENV/bin/activate
 MARK=$VENV/.ainvfx_install_${TAG}_py${PY}
 if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
-  # shellcheck disable=SC2086
-  uv pip install --quiet $TORCH --index-url "$TORCH_INDEX" \
-    || warn "PyTorch install failed ('$TORCH' from $TORCH_INDEX): read the lines above"
+  install_torch || {
+    fail "PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above). Your settings are not the cause. Terminate this pod and create a new one, which lands on another machine: python pod.py down, then python pod.py up $PROFILE; or Terminate in the console, then deploy again from the template."
+    hold
+  }
   # git init + fetch instead of git clone: works in a folder that already holds models (a restart)
   if [ ! -d $COMFY/.git ]; then
     mkdir -p $COMFY
@@ -170,9 +296,9 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
     || (cd $COMFY && git fetch --quiet --depth 1 origin "$TAG" && git checkout --quiet FETCH_HEAD) \
     || (cd $COMFY && git fetch --quiet --tags origin && git checkout --quiet "$TAG") \
     || warn "could not check out ComfyUI $TAG"
-  uv pip install --quiet -r $COMFY/requirements.txt || warn "ComfyUI requirements failed"
-  [ -f $COMFY/manager_requirements.txt ] && (uv pip install --quiet -r $COMFY/manager_requirements.txt || true)
-  uv pip install --quiet -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
+  uvi -r $COMFY/requirements.txt || warn "ComfyUI requirements failed"
+  [ -f $COMFY/manager_requirements.txt ] && (uvi -r $COMFY/manager_requirements.txt || true)
+  uvi -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
   # custom nodes named in AINVFX_CUSTOM_NODES: cloned into custom_nodes, their requirements installed
   for url in $CUSTOM_NODES; do
     name=$(basename "${url%.git}")
@@ -180,10 +306,11 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
       git clone --quiet --depth 1 "$url" "$COMFY/custom_nodes/$name" && say "custom node $name installed" \
         || warn "custom node $url could not be cloned"
     fi
-    [ -f "$COMFY/custom_nodes/$name/requirements.txt" ] && (uv pip install --quiet -r "$COMFY/custom_nodes/$name/requirements.txt" \
+    [ -f "$COMFY/custom_nodes/$name/requirements.txt" ] && (uvi -r "$COMFY/custom_nodes/$name/requirements.txt" \
         || warn "the requirements of $name failed")
   done
-  [ -f $COMFY/main.py ] && python - <<'PY' && date -u +'%F %T' > "$MARK"
+  if [ -f $COMFY/main.py ]; then
+    if python - <<'PY'
 import torch, sys
 ok = torch.cuda.is_available()
 cu = torch.version.cuda or "0"
@@ -194,10 +321,20 @@ if not ok:
 if tuple(int(x) for x in cu.split(".")[:2]) < (13, 0):
     print("[AINVFX] WARNING: CUDA", cu, "under 13.0: int8 kernels off, everything slow.")
 PY
+    then
+      date -u +'%F %T' > "$MARK"
+    else
+      fail "PYTORCH DOES NOT START, OR DOES NOT SEE THE GPU, on this machine (the lines above). Terminate this pod and create a new one: it lands on another machine."
+      hold
+    fi
+  fi
 else
   say "install already done ($(cat "$MARK") UTC)"
 fi
-[ -f $COMFY/main.py ] || warn "COMFYUI IS NOT INSTALLED ($COMFY/main.py missing): read the lines above"
+if [ ! -f $COMFY/main.py ]; then
+  fail "COMFYUI IS NOT INSTALLED ($COMFY/main.py missing: the lines above say why). Terminate this pod and create a new one."
+  hold
+fi
 say "ComfyUI $(cd $COMFY 2>/dev/null && git describe --tags 2>/dev/null || echo '?') in $COMFY · environment $VENV"
 
 # ---------------------------------------------------------------- 3. start ComfyUI
@@ -209,7 +346,7 @@ mkdir -p $COMFY/models/diffusion_models $COMFY/models/text_encoders $COMFY/model
 if ! curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
   (cd $COMFY && nohup python main.py --listen 0.0.0.0 --port $PORT --enable-manager --preview-method auto \
      >> $ROOT/comfy.log 2>&1 &)
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     sleep 3
     curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1 && break
   done
@@ -225,6 +362,15 @@ if curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
 else
   warn "COMFYUI DID NOT START within 3 minutes: read $ROOT/comfy.log (JupyterLab or ssh)"
 fi
+else   # models mode: the environment the first run built
+  if [ -f $VENV/bin/activate ]; then
+    # shellcheck disable=SC1091
+    source $VENV/bin/activate
+  else
+    warn "no environment in $VENV: this pod never finished its install, so the models cannot be fetched from here"
+    exit 1
+  fi
+fi   # end of steps 0 to 3
 
 # ---------------------------------------------------------------- 4. models
 say "step 4/5 models of profile $PROFILE"
@@ -236,11 +382,35 @@ else
   mkdir -p "$STAGE"
   # The plan first (v5.3): which files are missing, their number and their size, so every
   # download line says where it stands (k of n, GB done of GB total, percent, time left).
+  # v5.4: each missing gated file is checked first (one HEAD request with the token), so a licence not
+  # yet accepted is told with its page instead of failing a download. Every row ends with its state:
+  # todo, present, notoken (gated, no token), gated (licence not accepted) or missing (path gone).
   LIST=$ROOT/models.list
   python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "${HF_TOKEN:-}" > "$LIST" <<'PY'
-import json, os, sys
+import json, os, sys, urllib.error, urllib.parse, urllib.request
 spec = json.load(open(sys.argv[1]))
 files, profiles, root, token = spec["files"], spec["profiles"], sys.argv[3], sys.argv[4]
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None                 # a redirect to the file's storage already means "allowed"
+opener = urllib.request.build_opener(NoRedirect)
+def access(repo, path):
+    """todo, gated, missing, or todo again when the check itself fails (the download then decides)."""
+    req = urllib.request.Request("https://huggingface.co/%s/resolve/main/%s" % (repo, urllib.parse.quote(path)),
+                                 method="HEAD", headers={"Authorization": "Bearer " + token} if token else {})
+    try:
+        opener.open(req, timeout=20).close()
+        return "todo"
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            return "todo"
+        if e.code in (401, 403) and e.headers.get("X-Error-Code") == "GatedRepo":
+            return "gated"
+        if e.code == 404:
+            return "missing"
+        return "todo"
+    except Exception:
+        return "todo"
 def resolve(name, seen=()):
     out = []
     for item in profiles[name]:
@@ -260,25 +430,40 @@ for k in keys:
     name = os.path.basename(f["path"])
     present = os.path.isfile(os.path.join(root, f["dir"], name)) and os.path.getsize(os.path.join(root, f["dir"], name)) > 0
     gated = bool(f.get("gated"))
-    todo = (not present) and not (gated and not token)
-    rows.append([f["repo"], f["path"], f["dir"], "1" if gated else "0", str(f.get("gb", "?")), todo, f.get("gb") or 0])
-n_todo = sum(1 for r in rows if r[5])
-gb_todo = round(sum(r[6] for r in rows if r[5]), 1)
+    if present:
+        state = "present"
+    elif gated and not token:
+        state = "notoken"
+    elif gated:
+        state = access(f["repo"], f["path"])
+    else:
+        state = "todo"
+    rows.append([f["repo"], f["path"], f["dir"], "1" if gated else "0", str(f.get("gb", "?")), state, f.get("gb") or 0])
+todo = [r for r in rows if r[5] == "todo"]
+n_todo = len(todo)
+gb_todo = round(sum(r[6] for r in todo), 1)
 k, before = 0, 0.0
 for r in rows:
-    if r[5]:
+    if r[5] == "todo":
         k += 1
-        print("|".join(r[:5] + [str(k), str(n_todo), "%.1f" % before, "%.1f" % gb_todo]))
+        print("|".join(r[:5] + [str(k), str(n_todo), "%.1f" % before, "%.1f" % gb_todo, r[5]]))
         before += r[6]
     else:
-        print("|".join(r[:5] + ["", str(n_todo), "", "%.1f" % gb_todo]))
+        print("|".join(r[:5] + ["", str(n_todo), "", "%.1f" % gb_todo, r[5]]))
 PY
   N_ALL=$(grep -c . "$LIST" 2>/dev/null || echo 0)
   N_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f7); N_TODO=${N_TODO:-0}
   GB_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f9); GB_TODO=${GB_TODO:-0}
-  say "models: $N_ALL files in profile $PROFILE · $N_TODO to download ($GB_TODO GB) · $((N_ALL-N_TODO)) already present or skipped"
+  # the rest of the plan, by state: present, gated without a token, waiting for a licence, moved
+  PLAN_REST=$(awk -F'|' '{n[$10]++} END {s = ""
+    if (n["present"]) s = s " · " n["present"] " already present"
+    if (n["notoken"]) s = s " · " n["notoken"] " gated, no token"
+    if (n["gated"])   s = s " · " n["gated"] " waiting for a licence"
+    if (n["missing"]) s = s " · " n["missing"] " moved"
+    print s}' "$LIST")
+  say "models: $N_ALL files in profile $PROFILE · $N_TODO to download ($GB_TODO GB)$PLAN_REST"
   TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
-  while IFS='|' read -r repo path dir gated gb k n_todo gb_before gb_todo; do
+  while IFS='|' read -r repo path dir _ gb k n_todo gb_before gb_todo state; do
     [ -z "$repo" ] && continue
     TOTAL=$((TOTAL+1))
     name=$(basename "$path")
@@ -287,10 +472,17 @@ PY
     if [ -s "$dest/$name" ]; then
       DONE=$((DONE+1)); continue
     fi
-    if [ "$gated" = "1" ] && [ -z "${HF_TOKEN:-}" ]; then
-      say "models: SKIPPED $name (gated repo $repo, no HF_TOKEN)"
-      SKIPPED=$((SKIPPED+1)); continue
-    fi
+    case "$state" in
+      notoken)
+        say "models: SKIPPED $name (gated repo $repo, no HF_TOKEN): https://huggingface.co/$repo"
+        SKIPPED=$((SKIPPED+1)); NOTOKEN_REPOS="$NOTOKEN_REPOS $repo"; continue ;;
+      gated)
+        say "models: WAITING $name · its licence is not accepted yet: https://huggingface.co/$repo"
+        WAITING=$((WAITING+1)); NEED_REPOS="$NEED_REPOS $repo"; continue ;;
+      missing)
+        warn "models: $path is no longer in $repo (moved or renamed): models.json needs an update"
+        continue ;;
+    esac
     say "models $k/$n_todo · $gb_before of $gb_todo GB done · downloading $name ($gb GB) from $repo"
     T0=$(now)
     if hf download "$repo" "$path" --local-dir "$STAGE" >/dev/null 2>&1 && [ -s "$STAGE/$path" ]; then
@@ -320,7 +512,15 @@ PY
         [ "$SPEED" -lt 50 ] 2>/dev/null && warn "DOWNLOAD UNDER 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
       fi
     else
-      warn "download failed: $path from $repo (path changed, or access refused)"
+      case "$(hf_state "$repo" "$path")" in
+        gated)
+          say "models: WAITING $name · its licence is not accepted yet: https://huggingface.co/$repo"
+          WAITING=$((WAITING+1)); NEED_REPOS="$NEED_REPOS $repo" ;;
+        missing)
+          warn "download failed: $path is no longer in $repo (moved or renamed): models.json needs an update" ;;
+        *)
+          warn "download failed: $name from $repo (network): bash $SELF models tries again" ;;
+      esac
     fi
   done < "$LIST"
   rm -rf "$STAGE"
@@ -328,8 +528,14 @@ PY
   TOTALS=""
   [ "$BYTES_ALL" -gt 0 ] && TOTALS=" · $((BYTES_ALL/1000000000)) GB downloaded in $(python3 -c "print(int($T_ALL1-$T_ALL0))") s ($(mbps "$BYTES_ALL" "$(python3 -c "print($T_ALL1-$T_ALL0)")") MB/s)"
   SK=""; [ "$SKIPPED" -gt 0 ] 2>/dev/null && SK=" · $SKIPPED skipped (gated, no token)"
+  [ "$WAITING" -gt 0 ] 2>/dev/null && SK="$SK · $WAITING waiting for a licence (the pages are listed at the end)"
   say "MODELS DONE $DONE/$TOTAL present$SK · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk$TOTALS"
   say "press r in ComfyUI to refresh the model lists"
+fi
+if [ "$MODE" = "models" ]; then
+  access_summary
+  sleep 1   # lets the log copy catch up before the prompt returns
+  exit 0
 fi
 
 # ---------------------------------------------------------------- 5. self-test, then READY
@@ -387,7 +593,17 @@ else
   say "self-test skipped (AINVFX_SELFTEST=$SELFTEST, or the Z-Image Turbo files are missing)"
 fi
 
-say "READY · ComfyUI $PROXY · JupyterLab port 8888 · log $LOG"
+access_summary
+# JupyterLab runs only when the pod was created with "Start Jupyter notebook" on (pod.py always asks for it):
+# Runpod then sets JUPYTER_PASSWORD, the token the page asks for, and the link carries it, so one click
+# opens JupyterLab (Adrien's choice, 6 Oct 2026: temporary teaching pods). Like the ComfyUI address, the
+# line opens the pod to whoever reads it, and this log is served through the proxy: keep the address private.
+if pgrep -f "jupyter-lab|jupyter lab" >/dev/null 2>&1; then
+  if [ -n "${JUPYTER_PASSWORD:-}" ]; then JL="JupyterLab $JUPYTER/lab?token=$JUPYTER_PASSWORD"; else JL="JupyterLab $JUPYTER"; fi
+else
+  JL="JupyterLab off (the pod was created without « Start Jupyter notebook »)"
+fi
+say "READY · ComfyUI $PROXY · $JL · log $LOG"
 say "remember: terminate the pod when you are done"
 if [ -n "$START_PID" ]; then
   wait "$START_PID"
