@@ -494,6 +494,22 @@ class Helpers(unittest.TestCase):
         with self.assertRaises(SystemExit):
             pod.find_gpu(both, "GTX 1080")           # none
 
+    def test_two_commands_keep_each_others_pods(self):
+        """Two `up` started at once from one machine (7 Oct 2026): both records must survive."""
+        d = tempfile.mkdtemp(prefix="ainvfx-cfg-")
+        old = (pod.CONFIG_DIR, pod.CONFIG)
+        pod.CONFIG_DIR, pod.CONFIG = pod.Path(d), pod.Path(d) / "config.json"
+        try:
+            a, b = pod.load_config(), pod.load_config()        # both read the file before either writes
+            pod.remember_pod(a, "test10", {"id": "p10"})
+            pod.remember_pod(b, "test11", {"id": "p11"})
+            self.assertEqual(sorted(pod.load_config()["pods"]), ["test10", "test11"])
+            pod.remember_pod(a, "test10", None)
+            self.assertEqual(sorted(pod.load_config()["pods"]), ["test11"])
+        finally:
+            pod.CONFIG_DIR, pod.CONFIG = old
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_profiles_and_start_command(self):
         self.assertEqual(sorted(pod.PROFILES), ["image", "train", "video"])
         self.assertIn("bootstrap.sh", pod.START_CMD)
@@ -718,6 +734,21 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("up", "image", "--gpu", "RTX PRO", "-y")
         self.assertIn("matches several GPU types", out, out)
         self.assertEqual(len(STATE["posts"]), 1, out)
+
+    def test_a_pod_missing_here_is_found_by_its_short_name(self):
+        """`down test10` when this machine lost the record of `up image --name test10` (7 Oct 2026), and
+        `down image` for a pod of the default tag: both find the pod in the account and terminate it."""
+        self.run_pod("setup", "-y")
+        Handler.new_pod("ainvfx-image-test10", "NVIDIA GeForce RTX 5090", "EU-CZ-1")
+        Handler.new_pod("ainvfx-image-1007-1250", "NVIDIA GeForce RTX 5090", "EU-CZ-1")
+        out, rc = self.run_pod("down", "test10", "-y", "--no-pull")
+        self.assertIn("attached to ainvfx-image-test10", out, out)
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("down", "image", "-y", "--no-pull")
+        self.assertIn("attached to ainvfx-image-1007-1250", out, out)
+        self.assertTrue(STATE["pods"]["fakepod2"]["deleted"], out)
+        self.assertEqual(rc, 0, out)
 
     def test_up_stops_on_a_failed_line(self):
         """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):
