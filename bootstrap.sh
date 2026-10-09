@@ -28,6 +28,11 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.5 (7 Oct 2026, after the first pod on a B300 MIG slice): step 1 printed "[Insufficient Permissions]"
+# as the GPU's memory. A MIG slice (Multi-Instance GPU: one part of a bigger GPU, with its own memory,
+# here 1g.34gb of a B300) cannot read the whole card's memory from inside its container. Step 1 now reads
+# the slice's size from its profile name (`nvidia-smi -L`), and the PyTorch line of step 2 adds the VRAM
+# that PyTorch sees, on every GPU.
 # v5.4 (6 Oct 2026, night, after a console pod that failed): three changes.
 # (1) PyTorch. One host could not reach pypi.nvidia.com, where the PyTorch index sends its NVIDIA
 # libraries, and the install failed. uv now waits longer and retries more (UV_HTTP_TIMEOUT 120,
@@ -242,8 +247,26 @@ fi
 say "step 1/5 health check"
 if command -v nvidia-smi >/dev/null 2>&1; then
   GPU_LINE=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -1)
-  say "GPU: $GPU_LINE"
-  DRV=$(echo "$GPU_LINE" | awk -F', ' '{print $3}' | cut -d. -f1)
+  GPU_NAME=$(echo "$GPU_LINE" | awk -F', ' '{print $1}')
+  GPU_MEM=$(echo "$GPU_LINE" | awk -F', ' '{print $2}')
+  DRV_FULL=$(echo "$GPU_LINE" | awk -F', ' '{print $3}')
+  case "$GPU_MEM" in
+    [0-9]*) ;;
+    *)  # v5.5: a MIG slice cannot read the whole card's memory from its container ("[Insufficient
+        # Permissions]"). Its own size is in its profile name, as `nvidia-smi -L` lists it:
+        # "  MIG 1g.34gb     Device  0: (UUID: MIG-...)". PyTorch reports the exact VRAM in step 2.
+        MIG=$(nvidia-smi -L 2>/dev/null | sed -n 's/^[[:space:]]*MIG \([^[:space:]]*\).*/\1/p' | head -1)
+        MIG_GB=$(echo "$MIG" | grep -o '[0-9][0-9]*gb' | head -1 | sed 's/gb$//')
+        if [ -n "$MIG_GB" ]; then
+          GPU_MEM="MIG slice $MIG, $MIG_GB GB"
+        elif [ -n "$MIG" ]; then
+          GPU_MEM="MIG slice $MIG (its VRAM: see step 2)"
+        else
+          GPU_MEM="VRAM not readable here (see step 2)"
+        fi ;;
+  esac
+  say "GPU: $GPU_NAME, $GPU_MEM, $DRV_FULL"
+  DRV=$(echo "$DRV_FULL" | cut -d. -f1)
   if [ -n "$DRV" ] && [ "$DRV" -lt 580 ] 2>/dev/null; then
     warn "DRIVER $DRV IS OLDER THAN 580: CUDA 13 kernels will not run, int8 models will be slow. Terminate this pod and create another."
   fi
@@ -314,7 +337,11 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
 import torch, sys
 ok = torch.cuda.is_available()
 cu = torch.version.cuda or "0"
-print("[AINVFX] torch", torch.__version__, "cuda", cu, "GPU", torch.cuda.get_device_name(0) if ok else "NOT VISIBLE")
+try:      # v5.5: the VRAM as PyTorch sees it, exact on every GPU, a MIG slice included; never fatal
+    vram = " · {:.0f} MiB of VRAM".format(torch.cuda.get_device_properties(0).total_memory / 2**20) if ok else ""
+except Exception:
+    vram = ""
+print("[AINVFX] torch", torch.__version__, "cuda", cu, "GPU", (torch.cuda.get_device_name(0) if ok else "NOT VISIBLE") + vram)
 if not ok:
     print("[AINVFX] WARNING: THE GPU IS NOT VISIBLE FROM PYTORCH. Terminate this pod and create another.")
     sys.exit(1)

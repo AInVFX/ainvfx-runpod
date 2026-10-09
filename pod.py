@@ -42,7 +42,8 @@ once: that pod cannot work, and the answer is the same, `down` then `up`.
 
 Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, and names the data
 center on Secure Cloud. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
-the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer),
+the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer,
+not a 1g MIG slice),
 cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own; --max-price changes
 that), and prints the command to take another one. Right after creation it reads the pod's host: a host
 with maintenance under way or starting within 24 hours is terminated at once and the next GPU is tried.
@@ -71,7 +72,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -149,6 +150,11 @@ PROFILES = {
 #    report it). A host with maintenance under way, or starting within MAINT_HOURS, is terminated at
 #    once (a few seconds billed) and the next candidate is tried.
 NEWER_GPU = re.compile(r"blackwell|rubin|\brtx [5-9]0[5-9]0\b|\bg?b[1-9]00\b|\bv?r[1-9]00\b", re.I)
+# A 1g MIG slice (Multi-Instance GPU: a fixed share of a bigger GPU, with its own memory) is the smallest
+# share: one seventh of a B300 (the catalog offers 56 on an 8-GPU machine). On 7 Oct 2026 the B300 MIG
+# 1g.34gb ran the image self-test in 111 s, against 16.1 s on an RTX 5090. `up` leaves 1g slices out of
+# its list and never picks one on its own; `--gpu "B300 MIG 34GB"` still takes one.
+SMALL_SLICE = re.compile(r"\bMIG 1g\.", re.I)
 MAX_PRICE = float(os.environ.get("AINVFX_MAX_PRICE", "2.5"))     # USD per hour: the most `up` picks on its own
 MAINT_HOURS = float(os.environ.get("AINVFX_MAINT_HOURS", "24"))  # maintenance starting sooner than this is refused
 HOST_WAIT = int(os.environ.get("AINVFX_HOST_WAIT", "40"))        # seconds to wait for the API to name the host
@@ -510,7 +516,7 @@ def newer_gpu(gpu):
 
 def make_offers(catalogs, region, country):
     """One offer per GPU type and cloud with stock, cheapest first (Secure first at the same price):
-    dict(id, name, vram, cloud, price, dcs, newer). A Secure offer lists its data centers with stock,
+    dict(id, name, vram, cloud, price, dcs, newer, slice). A Secure offer lists its data centers with stock,
     the person's country first, and a create names one of them: Secure stock with no data center named
     is skipped. A Community offer has no data center (the catalog gives none for Community)."""
     offers = []
@@ -524,9 +530,16 @@ def make_offers(catalogs, region, country):
                 continue
             dcs.sort(key=lambda d: dc_order(d, region, country))
             offers.append({"id": g["id"], "name": str(g.get("name") or g["id"]), "vram": int(g.get("memory") or 0),
-                           "cloud": cloud, "price": float(price), "dcs": dcs, "newer": newer_gpu(g)})
+                           "cloud": cloud, "price": float(price), "dcs": dcs, "newer": newer_gpu(g),
+                           "slice": bool(SMALL_SLICE.search(g["id"]))})
     offers.sort(key=lambda o: (o["price"], o["cloud"] != "SECURE", -o["vram"], o["name"]))
     return offers
+
+
+def fits_profile(offer, vram):
+    """True when `up` may pick the offer on its own for a profile needing `vram` GB: enough VRAM,
+    a Blackwell chip or newer, and not a 1g MIG slice."""
+    return offer["vram"] >= vram and offer["newer"] and not offer["slice"]
 
 
 def find_gpu(catalog, ref):
@@ -1140,7 +1153,7 @@ def cmd_up(args):
     offers = make_offers(catalogs, region, country)
     mine = [o for o in offers if o["id"] == want["id"]]
     preferred = next((o for o in mine if o["cloud"] == "SECURE"), None)
-    fits = [o for o in offers if o["vram"] >= spec["vram"] and o["newer"]]
+    fits = [o for o in offers if fits_profile(o, spec["vram"])]
     wname = str(want.get("name") or want["id"])
 
     price = want.get("price") or {}
@@ -1154,7 +1167,8 @@ def cmd_up(args):
     say("   price per hour: {} Secure, {} Community".format(
         fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?"))
 
-    profile_rule = "{} GB of VRAM or more, Blackwell or newer, host on CUDA {} or newer".format(spec["vram"], MIN_CUDA)
+    profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
+        spec["vram"], MIN_CUDA)
     if args.gpu:
         candidates = mine                     # the GPU named on the command line, and nothing else
         if not candidates:
@@ -1206,7 +1220,9 @@ def cmd_up(args):
     for n, offer in enumerate(candidates):
         if n:
             say("   Next: {}.".format(offer_line(offer)))
-        attempts = [[dc] for dc in offer["dcs"][:6]] if offer["cloud"] == "SECURE" else [[]]
+        # every data center the catalog lists with stock for this GPU (0.6.0 stopped at 6: with ten pods
+        # created in the same minutes, the seventh data center can be the one with a free GPU)
+        attempts = [[dc] for dc in offer["dcs"]] if offer["cloud"] == "SECURE" else [[]]
         for dc_list in attempts:
             body = {"name": name, "cloud": offer["cloud"], "disk": disk, "env": env,
                     "startSsh": True, "startJupyter": True,

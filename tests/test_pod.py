@@ -86,6 +86,7 @@ LIVE_LIMIT = 17       # BOOT lines from this index on (SELFTEST OK, READY) are n
 NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
          "no_5090": False, "maint_dcs": set(), "maint_community": False, "graphql_down": False,
+         "full_dcs": set(), "pro6000_dcs": None,
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
@@ -113,7 +114,7 @@ def fake_catalog(cloud):
         gpu("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB", 34, 0.5, 0.5, (("US-WA-2", "LOW"),)),
         gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "PRO 6000 MIG 24GB", 24, 0.59, 0.5, (("US-PA-1", "LOW"),)),
         gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000", 96, 2.09, 1.69,
-            (("US-NC-2", "LOW"), ("CA-MTL-1", "LOW"), ("EU-CZ-1", "LOW"))),
+            STATE.get("pro6000_dcs") or (("US-NC-2", "LOW"), ("CA-MTL-1", "LOW"), ("EU-CZ-1", "LOW"))),
         gpu("NVIDIA B300 SXM6 AC", "B300", 288, 7.89, 6.94, (("EU-NL-1", "LOW"),)),
     ]
 
@@ -229,6 +230,8 @@ class Handler(BaseHTTPRequestHandler):
             STATE["posts"].append(body)
             if body.get("dataCenterIds") == ["EU-CZ-1"]:
                 return self.problem(400, "no capacity in EU-CZ-1")   # the first candidate fails: the loop must go on
+            if (body.get("dataCenterIds") or [None])[0] in STATE.get("full_dcs", ()):
+                return self.problem(400, "There are no instances currently available")
             pod = self.new_pod(body["name"], body["gpu"]["id"], (body.get("dataCenterIds") or ["?"])[0])
             pod["cloud"] = body.get("cloud") or "SECURE"
             return self.send_json(201, self.view_of(pod))
@@ -482,9 +485,16 @@ class Helpers(unittest.TestCase):
              "price": {"secure": 2.09}, "availability": "LOW"}],          # Secure stock with no data center: skipped
             "COMMUNITY": [{"id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "memory": 32,
                            "price": {"secure": 0.99, "community": 0.69}, "availability": "LOW"}]}
+        cat["SECURE"].append({"id": "NVIDIA B300 SXM6 AC MIG 1g.34gb", "name": "B300 MIG 34GB", "memory": 34,
+                              "price": {"secure": 0.5}, "availability": "LOW",
+                              "dataCenters": [{"id": "US-WA-2", "availability": "LOW"}]})
         offers = pod.make_offers(cat, "NA", "CA")
-        self.assertEqual([(o["name"], o["cloud"], o["dcs"]) for o in offers],
-                         [("RTX 5090", "COMMUNITY", []), ("RTX PRO 4500 SE", "SECURE", ["US-KS-2"])])
+        self.assertEqual([(o["name"], o["cloud"], o["dcs"], o["slice"]) for o in offers],
+                         [("B300 MIG 34GB", "SECURE", ["US-WA-2"], True), ("RTX 5090", "COMMUNITY", [], False),
+                          ("RTX PRO 4500 SE", "SECURE", ["US-KS-2"], False)])
+        self.assertEqual([o["name"] for o in offers if pod.fits_profile(o, 32)], ["RTX 5090", "RTX PRO 4500 SE"])
+        self.assertEqual([o["name"] for o in offers if pod.fits_profile(o, 96)], [])
+        cat["SECURE"].pop()
         both = cat["SECURE"] + cat["COMMUNITY"]
         self.assertEqual(pod.find_gpu(both, "NVIDIA GeForce RTX 5090")["id"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.find_gpu(both, "rtx pro 4500 se")["id"], "NVIDIA RTX PRO 4500 Blackwell Server Edition")
@@ -531,7 +541,7 @@ class EndToEnd(unittest.TestCase):
     def setUp(self):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
-                      "maint_community": False, "graphql_down": False})
+                      "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -671,26 +681,27 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Nothing bills", out, out)
 
     def test_no_stock_proposes_the_cheapest_fit_and_never_any_host(self):
-        """7 Oct 2026: no RTX 5090 on Secure Cloud. `up` must not create one anywhere: it lists the GPUs in
-        stock that fit the image profile, cheapest first, creates the cheapest in its own data center,
-        and leaves out what does not fit (24 GB, Hopper) and what costs more than 2.50 USD per hour."""
+        """7 Oct 2026: no RTX 5090 on Secure Cloud. `up` must not create one there: it lists the GPUs in
+        stock that fit the image profile, cheapest first, and creates the cheapest (here the Community
+        RTX 5090). It leaves out what does not fit (24 GB, Hopper, a 1g MIG slice) and never picks on its
+        own what costs more than 2.50 USD per hour."""
         STATE["no_5090"] = True
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
         self.assertIn("in stock in North America: none right now", out, out)
         self.assertIn("never creates a pod where the catalog shows no stock", out, out)
-        self.assertIn("Replacement: B300 MIG 34GB (34 GB of VRAM, 0.50 USD per hour, Secure Cloud, US-WA-2)", out, out)
+        self.assertIn("Replacement: RTX 5090 (32 GB of VRAM, 0.69 USD per hour, Community Cloud, a host Runpod picks)", out, out)
         self.assertIn("RTX PRO 4500 SE", out, out)
-        self.assertIn("a host Runpod picks", out, "the Community RTX 5090 is listed, as Community")
+        self.assertNotIn("B300 MIG", out, "a 1g slice is never listed: 111 s self-test against 16 s (7 Oct 2026)")
         self.assertIn("above 2.50 USD: only with --gpu", out, "the B300 is listed, never picked on its own")
         self.assertNotIn("RTX 4090", out, "24 GB: does not fit the image profile")
         self.assertNotIn("H100", out, "Hopper: older than Blackwell")
         self.assertNotIn("PRO 6000 MIG 24GB", out, out)
-        self.assertIn('python pod.py up image --gpu "RTX 5090"', out, out)
+        self.assertIn('python pod.py up image --gpu "RTX PRO 4500 SE"', out, out)
         self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
-                         [("NVIDIA B300 SXM6 AC MIG 1g.34gb", "SECURE", ["US-WA-2"])], out)
-        self.assertIn("host checked: no maintenance planned (US-WA-2)", out, out)
+                         [("NVIDIA GeForce RTX 5090", "COMMUNITY", None)], out)
+        self.assertIn("host checked: no maintenance planned.", out, out)
         self.assertIn("READY", out, out)
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
@@ -699,7 +710,7 @@ class EndToEnd(unittest.TestCase):
         """The host of 5 and 7 Oct 2026 (maintenance under way, server being removed), on the first two
         candidates: each pod is terminated at once and `up` goes on to the next GPU that fits."""
         STATE["no_5090"] = True
-        STATE["maint_dcs"] = {"US-WA-2"}
+        STATE["maint_dcs"] = {"US-KS-2"}
         STATE["maint_community"] = True
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
@@ -708,10 +719,25 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("removed from the platform", out, out)
         self.assertEqual(out.count("terminated at once"), 2, out)
         self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
-                         [("NVIDIA B300 SXM6 AC MIG 1g.34gb", "SECURE", ["US-WA-2"]),
-                          ("NVIDIA GeForce RTX 5090", "COMMUNITY", None),
-                          ("NVIDIA RTX PRO 4500 Blackwell Server Edition", "SECURE", ["US-KS-2"])], out)
+                         [("NVIDIA GeForce RTX 5090", "COMMUNITY", None),
+                          ("NVIDIA RTX PRO 4500 Blackwell Server Edition", "SECURE", ["US-KS-2"]),
+                          ("NVIDIA RTX PRO 6000 Blackwell Server Edition", "SECURE", ["CA-MTL-1"])], out)
         self.assertEqual([STATE["pods"][p]["deleted"] for p in ("fakepod1", "fakepod2", "fakepod3")], [True, True, False], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_every_data_center_with_stock_is_tried(self):
+        """Ten pods created in the same minutes: the first seven data centers listed for the RTX PRO 6000
+        are full by the time this one asks, the eighth has a GPU. 0.6.0 stopped after six."""
+        dcs = ["CA-MTL-1", "CA-MTL-3", "US-CA-2", "US-GA-1", "US-IL-1", "US-NC-2", "US-TX-3", "EUR-IS-1"]
+        STATE["pro6000_dcs"] = tuple((d, "LOW") for d in dcs)
+        STATE["full_dcs"] = set(dcs[:7])
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "-y", "--secure-only", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertEqual([p.get("dataCenterIds") for p in STATE["posts"]], [[d] for d in dcs], out)
+        self.assertIn("created on SECURE EUR-IS-1", out, out)
         self.assertIn("READY", out, out)
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
@@ -729,11 +755,17 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("up", "image", "--gpu", "RTX 5090", "--secure-only", "-y", "--wait", "1", timeout=60)
         self.assertNotEqual(rc, 0, out)
         self.assertIn("No RTX 5090 in stock right now on Secure Cloud", out, out)
-        self.assertIn('python pod.py up image --gpu "B300 MIG 34GB"', out, out)
+        self.assertIn('python pod.py up image --gpu "RTX PRO 4500 SE"', out, out)
+        self.assertNotIn("B300 MIG", out, out)
         self.assertEqual(len(STATE["posts"]), 1, "nothing created when the GPU named has no stock")
         out, rc = self.run_pod("up", "image", "--gpu", "RTX PRO", "-y")
         self.assertIn("matches several GPU types", out, out)
         self.assertEqual(len(STATE["posts"]), 1, out)
+        out, rc = self.run_pod("up", "image", "--gpu", "B300 MIG 34GB", "-y", "--wait", "1", timeout=90)
+        self.assertEqual((STATE["posts"][1]["gpu"]["id"], STATE["posts"][1]["dataCenterIds"]),
+                         ("NVIDIA B300 SXM6 AC MIG 1g.34gb", ["US-WA-2"]), "a 1g slice named with --gpu is still created")
+        self.assertIn("READY", out, out)
+        self.run_pod("down", "-y")
 
     def test_a_pod_missing_here_is_found_by_its_short_name(self):
         """`down test10` when this machine lost the record of `up image --name test10` (7 Oct 2026), and
