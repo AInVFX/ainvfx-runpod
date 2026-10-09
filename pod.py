@@ -16,7 +16,7 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py open [pod]         open ComfyUI in your browser
   python pod.py push [pod] FILES...   copy images or videos into the pod's input folder
   python pod.py pull [pod]         download the pod's outputs into outputs/<pod name>/
-  python pod.py down [pod]         pull, then terminate the pod (billing stops); `down --all` for every pod
+  python pod.py down [pod]         pull, terminate (billing stops), then what it cost and the credit left; `--all`
   python pod.py ssh [pod]          a terminal on the pod
   python pod.py list               every pod of your account, with its hourly price
   python pod.py doctor             check Python, ssh, the API key, the configuration
@@ -47,6 +47,9 @@ not a 1g MIG slice),
 cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own; --max-price changes
 that), and prints the command to take another one. Right after creation it reads the pod's host: a host
 with maintenance under way or starting within 24 hours is terminated at once and the next GPU is tried.
+Money: before its question, `up` shows your Runpod credit and the hours it buys on the card it proposes,
+and the question names the price. `down` says what each pod cost (its hours at its price, an estimate),
+lists any pod still running with its price per hour, and gives the credit left.
 
 Rule of the course: create at the start of the session, pull your results, terminate at the end.
 A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
@@ -72,7 +75,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -480,6 +483,25 @@ def pod_price(pod):
         return None
 
 
+def pod_spent(pod, rec=None):
+    """(hours, USD, price per hour) since the pod was created, at its hourly price: an estimate, since Runpod
+    bills from creation. None when the price or the creation time is unknown."""
+    price = pod_price(pod)
+    created = parse_time(pod.get("createdAt") or "") or parse_time((rec or {}).get("created", ""))
+    if not price or not created:
+        return None
+    hours = max(0.0, (datetime.now(timezone.utc) - created).total_seconds() / 3600)
+    return hours, hours * price, price
+
+
+def fmt_duration(hours):
+    minutes = int(round(hours * 60))
+    if minutes < 1:
+        return "under a minute"
+    h, m = divmod(minutes, 60)
+    return "{} h {:02d} min".format(h, m) if h else "{} min".format(m)
+
+
 def pod_summary(pod):
     gpu = (pod.get("gpu") or {}).get("id") or "?"
     dc = pod.get("dataCenterId") or "?"
@@ -578,6 +600,30 @@ def pod_machine(cfg, pod_id):
         return None
     machine = ((data.get("data") or {}).get("pod") or {}).get("machine") or {}
     return machine if any(machine.values()) else {}
+
+
+MONEY_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
+
+
+def account_money(cfg):
+    """(credit left in USD, what the account spends now in USD per hour), read through the GraphQL API (the
+    REST API v2 has no balance); (None, None) when it cannot be read, and the money lines are left out."""
+    try:
+        data = request("POST", GRAPHQL, api_key(cfg), body={"query": MONEY_QUERY}, timeout=20)
+    except ApiError:
+        return None, None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None, None
+    me = (data.get("data") or {}).get("myself")
+    if not isinstance(me, dict):
+        return None, None
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    return num(me.get("clientBalance")), num(me.get("currentSpendPerHr"))
 
 
 def to_time(value):
@@ -1207,11 +1253,21 @@ def cmd_up(args):
             say("   Add --secure-only to leave out Community Cloud.")
 
     first = candidates[0]
+    balance, spend = account_money(cfg)
+    if balance is not None:
+        line = "   Your Runpod credit: {}, about {} hours of {} at {} per hour".format(
+            fmt_money(balance), int(balance // first["price"]), first["name"], fmt_money(first["price"]))
+        if spend:
+            line += "; your account already spends {} per hour".format(fmt_money(spend))
+        say(line + ".")
+        if balance < 3 * first["price"]:
+            say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
     if not args.yes:
         if len(candidates) > 1:
             say("   If it is taken in the meantime, `up` tries the next GPUs that fit, cheapest first, up to {} per hour."
                 .format(fmt_money(max(o["price"] for o in candidates))))
-        ans = input("   Create a {} with a {} GB disk, billed from creation? [Y/n] ".format(first["name"], disk)).strip().lower()
+        ans = input("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
+            first["name"], fmt_money(first["price"]), disk)).strip().lower()
         if ans not in ("", "y", "yes"):
             say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
             return
@@ -1341,10 +1397,12 @@ def cmd_status(args):
     gpu, dc, price = pod_summary(pod)
     st = pod_status(pod)
     say("`{}` · {} · {} · {} · CUDA {} · {}".format(tag, rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
-    created = parse_time(pod.get("createdAt") or "") or parse_time(rec.get("created", ""))
-    if created and price:
-        hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
-        say("running for {:.1f} h · about {} spent so far at {} per hour".format(hours, fmt_money(hours * price), fmt_money(price)))
+    spent = pod_spent(pod, rec)
+    if spent:
+        say("running for {} · about {} spent so far at {} per hour".format(fmt_duration(spent[0]), fmt_money(spent[1]), fmt_money(spent[2])))
+        balance, _ = account_money(cfg)
+        if balance is not None:
+            say("credit left on Runpod: {}, about {} more hours of this pod".format(fmt_money(balance), int(balance // spent[2])))
     rt = pod.get("runtime") or {}
     if rt.get("gpus"):
         g = rt["gpus"][0]
@@ -1482,8 +1540,16 @@ def cmd_down(args):
             n = pull(cfg, rec)
             say("{} file(s) pulled into {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
         try:
+            spent = pod_spent(get_pod(cfg, rec["id"]), rec)
+        except ApiError:
+            spent = None
+        try:
             rp("DELETE", "/pods/" + rec["id"], cfg)          # DELETE /pods/{id}: terminate, 204 no body
-            say("Terminated: {}".format(rec.get("name")))
+            if spent:
+                say("Terminated: {}. It ran {} at {} per hour: about {} spent.".format(
+                    rec.get("name"), fmt_duration(spent[0]), fmt_money(spent[2]), fmt_money(spent[1])))
+            else:
+                say("Terminated: {}".format(rec.get("name")))
         except ApiError as e:
             if e.code == 404:
                 say("{}: already gone from Runpod.".format(rec.get("name")))
@@ -1493,14 +1559,22 @@ def cmd_down(args):
     try:
         remaining = list_pods(cfg, quiet=True)
     except ApiError:
-        return
-    running = [p for p in remaining if pod_status(p) not in FINAL]
-    if running:
-        say("Attention: {} other pod(s) still in your account:".format(len(running)))
-        for p in running:
-            say("  - {} ({})".format(p.get("name") or p.get("id"), pod_status(p)))
-    else:
-        say("No pod running in your account. Nothing bills.")
+        remaining = None
+    if remaining is not None:
+        running = [p for p in remaining if pod_status(p) not in FINAL]
+        if running:
+            total = sum(pod_price(p) or 0 for p in running)
+            say("Attention: {} other pod(s) still running, {} per hour in total:".format(len(running), fmt_money(total)))
+            for p in running:
+                price = pod_price(p)
+                say("  - {} ({}{})".format(p.get("name") or p.get("id"), pod_status(p),
+                                           ", {} per hour".format(fmt_money(price)) if price else ""))
+            say("`python pod.py down <name>` terminates one of them.")
+        else:
+            say("No pod running in your account. Nothing bills.")
+    balance, _ = account_money(cfg)
+    if balance is not None:
+        say("Credit left on Runpod: {} (the last minutes may still be deducted).".format(fmt_money(balance)))
 
 
 def cmd_list(args):

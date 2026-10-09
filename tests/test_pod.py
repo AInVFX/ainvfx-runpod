@@ -86,7 +86,7 @@ LIVE_LIMIT = 17       # BOOT lines from this index on (SELFTEST OK, READY) are n
 NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
          "no_5090": False, "maint_dcs": set(), "maint_community": False, "graphql_down": False,
-         "full_dcs": set(), "pro6000_dcs": None,
+         "full_dcs": set(), "pro6000_dcs": None, "balance": 212.40,
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
@@ -107,13 +107,13 @@ def fake_catalog(cloud):
         return e
     rtx5090_dcs = () if STATE["no_5090"] else (("EU-CZ-1", "LOW"), ("US-TX-3", "HIGH"), ("CA-MTL-1", "LOW"), ("EUR-NO-1", "NONE"))
     return [
-        gpu("NVIDIA GeForce RTX 5090", "RTX 5090", 32, 0.99, 0.69, rtx5090_dcs, community=True),
+        gpu("NVIDIA GeForce RTX 5090", "RTX 5090", 32, 1.19, 0.69, rtx5090_dcs, community=True),
         gpu("NVIDIA GeForce RTX 4090", "RTX 4090", 24, 0.74, 0.34, (("CA-MTL-1", "HIGH"),), community=True),
         gpu("NVIDIA H100 80GB HBM3", "H100 SXM", 80, 3.49, 2.69, (("CA-MTL-1", "LOW"),)),
         gpu("NVIDIA RTX PRO 4500 Blackwell Server Edition", "RTX PRO 4500 SE", 32, 0.72, 0.5, (("US-KS-2", "LOW"),)),
         gpu("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB", 34, 0.5, 0.5, (("US-WA-2", "LOW"),)),
         gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "PRO 6000 MIG 24GB", 24, 0.59, 0.5, (("US-PA-1", "LOW"),)),
-        gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000", 96, 2.09, 1.69,
+        gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000", 96, 2.49, 1.69,
             STATE.get("pro6000_dcs") or (("US-NC-2", "LOW"), ("CA-MTL-1", "LOW"), ("EU-CZ-1", "LOW"))),
         gpu("NVIDIA B300 SXM6 AC", "B300", 288, 7.89, 6.94, (("EU-NL-1", "LOW"),)),
     ]
@@ -246,6 +246,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"errors": [{"message": "Unauthorized"}], "data": {"pod": None}})
         if STATE["graphql_down"]:
             return self.problem(503, "unavailable")
+        if "myself" in query:            # the credit and the spend rate (pod.py 0.7.0)
+            running = [p for p in STATE["pods"].values() if not p.get("deleted")]
+            return self.send_json(200, {"data": {"myself": {"clientBalance": STATE["balance"],
+                                                            "currentSpendPerHr": round(sum(p["cost"] for p in running), 2)}}})
         m = re.search(r'podId:\s*"([^"]+)"', query)
         pod = STATE["pods"].get(m.group(1)) if m else None
         if not pod:
@@ -263,7 +267,8 @@ class Handler(BaseHTTPRequestHandler):
     def new_pod(name, gpu, dc):
         STATE["count"] += 1
         pid = "fakepod{}".format(STATE["count"])
-        pod = {"id": pid, "name": name, "cost": 0.99, "gpu": {"id": gpu, "count": 1}, "dataCenterId": dc,
+        cost = {"NVIDIA GeForce RTX 5090": 1.19, "NVIDIA RTX PRO 6000 Blackwell Server Edition": 2.49}.get(gpu, 0.72)
+        pod = {"id": pid, "name": name, "cost": cost, "gpu": {"id": gpu, "count": 1}, "dataCenterId": dc,
                "cudaVersion": "13.3", "createdAt": ts_of(0), "template": None,
                "ssh": {"direct": {"host": "81.27.69.177", "port": 32554, "username": "root"}},
                "runtime": {"gpus": [{"util": 0, "memoryUtil": 0}]}, "t0": time.time(), "deleted": False}
@@ -457,6 +462,17 @@ class Helpers(unittest.TestCase):
                   "NVIDIA L40S", "NVIDIA RTX A6000"):
             self.assertFalse(pod.newer_gpu({"id": g}), g)
 
+    def test_duration_and_spent(self):
+        self.assertEqual(pod.fmt_duration(0.004), "under a minute")
+        self.assertEqual(pod.fmt_duration(0.75), "45 min")
+        self.assertEqual(pod.fmt_duration(2.5), "2 h 30 min")
+        from datetime import timedelta as td
+        p = {"cost": 1.19, "createdAt": (datetime.now(timezone.utc) - td(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        hours, usd, price = pod.pod_spent(p)
+        self.assertAlmostEqual(hours, 2.0, places=2)
+        self.assertAlmostEqual(usd, 2.38, places=2)
+        self.assertIsNone(pod.pod_spent({"cost": None, "createdAt": p["createdAt"]}))
+
     def test_maintenance_window(self):
         """The host of 7 Oct 2026: maintenance from 29 Sep 2026 to 28 Mar 2027, server being removed."""
         now = datetime(2026, 10, 7, 13, 0, tzinfo=timezone.utc)
@@ -541,7 +557,8 @@ class EndToEnd(unittest.TestCase):
     def setUp(self):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
-                      "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None})
+                      "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
+                      "balance": 212.40})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -558,8 +575,9 @@ class EndToEnd(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
 
-    def run_pod(self, *cmd, timeout=120):
-        r = subprocess.run([sys.executable, POD_PY] + list(cmd), capture_output=True, text=True, env=self.env, timeout=timeout)
+    def run_pod(self, *cmd, timeout=120, input=None):
+        r = subprocess.run([sys.executable, POD_PY] + list(cmd), capture_output=True, text=True, env=self.env, timeout=timeout,
+                           input=input)
         return r.stdout + r.stderr, r.returncode
 
     def whole_session(self):
@@ -726,6 +744,28 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("READY", out, out)
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
+
+    def test_money_lines(self):
+        """Adrien, 8 Oct 2026: the price in the question, the credit and the hours it buys before it, then
+        what the pod cost, the other pods still running with their price, and the credit left after down."""
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
+        self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 100 GB disk, billed from creation? [Y/n]", out, out)
+        self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertIn("READY", out, out)
+        Handler.new_pod("ainvfx-video-other", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "US-NC-2")
+        out, rc = self.run_pod("up", "image", "--name", "second", "--wait", "1", input="n\n", timeout=60)
+        self.assertIn("your account already spends 3.68 USD per hour.", out, out)
+        out, rc = self.run_pod("down", "image", "-y", "--no-pull")
+        self.assertRegex(out, r"Terminated: ainvfx-image-\S+\. It ran [^.]+ at 1\.19 USD per hour: about \d+\.\d\d USD spent\.")
+        self.assertIn("Attention: 1 other pod(s) still running, 2.49 USD per hour in total:", out, out)
+        self.assertIn("- ainvfx-video-other (", out, out)
+        self.assertIn("Credit left on Runpod: 212.40 USD (the last minutes may still be deducted).", out, out)
+        STATE["balance"] = 2.0
+        out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
+        self.assertIn("That is under 3 hours", out, out)
 
     def test_every_data_center_with_stock_is_tried(self):
         """Ten pods created in the same minutes: the first seven data centers listed for the RTX PRO 6000
