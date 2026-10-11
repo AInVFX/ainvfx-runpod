@@ -1,5 +1,5 @@
 {
-  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4 and 10 October 2026.",
+  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10 and 11 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -19,7 +19,8 @@
       "qwen_edit_multiple_angles_lora",
       "qwen_image_2512_fp8",
       "qwen_image_2512_lightning",
-      "qwen_360_lora"
+      "qwen_360_lora",
+      "qwen_edit_360_lora"
     ],
     "3d": [
       "trellis_2_int8",
@@ -422,6 +423,12 @@
       "path": "qwen-360-diffusion-2512-int8-bf16-v2.safetensors",
       "dir": "loras",
       "gb": 0.76
+    },
+    "qwen_edit_360_lora": {
+      "repo": "mickmumpitz/QWEN-EDIT_360",
+      "path": "251018_MICKMUMPITZ_QWEN-EDIT_360_03.safetensors",
+      "dir": "loras",
+      "gb": 0.3
     }
   }
 }

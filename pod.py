@@ -162,7 +162,7 @@ STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds wit
 # disk is computed from the sum (115% of the models plus 30 GB for the environment, rounded up to
 # 10, never under 100). The GPU is the one of the profile that needs the most VRAM.
 PROFILES = {
-    "image": dict(gb=86, vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "image": dict(gb=86, vram=32, gpu="NVIDIA GeForce RTX 5090"),   # 87 GB in models.json since 11 Oct; the 15% margin covers it
     "3d":    dict(gb=30, vram=32, gpu="NVIDIA GeForce RTX 5090"),
     "video": dict(gb=85, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
     "train": dict(gb=68, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
