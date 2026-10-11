@@ -1,5 +1,5 @@
 {
-  "_about": "Model files downloaded by bootstrap.sh, by profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4 October 2026.",
+  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4 and 10 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -15,10 +15,30 @@
       "qwen_image_edit_lightning",
       "seedvr2_3b",
       "seedvr2_vae",
+      "sam3_1",
+      "qwen_edit_multiple_angles_lora",
+      "qwen_image_2512_fp8",
+      "qwen_image_2512_lightning",
+      "qwen_360_lora"
+    ],
+    "3d": [
+      "trellis_2_int8",
+      "pixal3d_int8",
+      "pixal3d_multiview_int8",
+      "trellis_2_shape_vae",
+      "trellis_2_texture_vae",
+      "dino_v3_vit_l",
+      "dino_v3_l_naf",
+      "moge_2_vitl_normal",
+      "birefnet",
+      "triposplat",
+      "triposplat_dino_v3_vit_h",
+      "triposplat_vae_decoder",
+      "sam_3d_body",
+      "rt_detr_v4",
       "sam3_1"
     ],
     "video": [
-      "@image",
       "ltx25_distilled_int8",
       "ltx25_text_encoder_int8",
       "ltx25_video_vae",
@@ -43,7 +63,6 @@
       "rife"
     ],
     "train": [
-      "@video",
       "ltx25_dev_bf16",
       "ltx25_text_encoder_bf16"
     ]
@@ -295,6 +314,114 @@
       "dir": "text_encoders",
       "gb": 26.3,
       "gated": true
+    },
+    "trellis_2_int8": {
+      "repo": "Comfy-Org/TRELLIS.2",
+      "path": "diffusion_models/trellis_2_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 5.25
+    },
+    "pixal3d_int8": {
+      "repo": "Comfy-Org/Pixal3D",
+      "path": "diffusion_models/pixal3d_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 5.58
+    },
+    "pixal3d_multiview_int8": {
+      "repo": "Comfy-Org/Pixal3D",
+      "path": "diffusion_models/pixal3d_multiview_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 5.58
+    },
+    "trellis_2_shape_vae": {
+      "repo": "Comfy-Org/TRELLIS.2",
+      "path": "vae/trellis_2_shape_vae_bf16.safetensors",
+      "dir": "vae",
+      "gb": 1.1
+    },
+    "trellis_2_texture_vae": {
+      "repo": "Comfy-Org/TRELLIS.2",
+      "path": "vae/trellis_2_texture_vae_bf16.safetensors",
+      "dir": "vae",
+      "gb": 0.95
+    },
+    "dino_v3_vit_l": {
+      "repo": "Comfy-Org/TRELLIS.2",
+      "path": "clip_vision/dino_v3_vit_l.safetensors",
+      "dir": "clip_vision",
+      "gb": 1.21
+    },
+    "dino_v3_l_naf": {
+      "repo": "Comfy-Org/Pixal3D",
+      "path": "clip_vision/dino_v3_L_naf_fp32.safetensors",
+      "dir": "clip_vision",
+      "gb": 1.22
+    },
+    "moge_2_vitl_normal": {
+      "repo": "Comfy-Org/MoGe",
+      "path": "geometry_estimation/moge_2_vitl_normal_fp16.safetensors",
+      "dir": "geometry_estimation",
+      "gb": 0.66
+    },
+    "birefnet": {
+      "repo": "Comfy-Org/BiRefNet",
+      "path": "background_removal/birefnet.safetensors",
+      "dir": "background_removal",
+      "gb": 0.44
+    },
+    "triposplat": {
+      "repo": "VAST-AI/TripoSplat",
+      "path": "diffusion_models/triposplat_fp16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 0.74
+    },
+    "triposplat_dino_v3_vit_h": {
+      "repo": "VAST-AI/TripoSplat",
+      "path": "clip_vision/dino_v3_vit_h.safetensors",
+      "dir": "clip_vision",
+      "gb": 1.68
+    },
+    "triposplat_vae_decoder": {
+      "repo": "VAST-AI/TripoSplat",
+      "path": "vae/triposplat_vae_decoder_fp16.safetensors",
+      "dir": "vae",
+      "gb": 0.58
+    },
+    "sam_3d_body": {
+      "repo": "Comfy-Org/sam-3d-body",
+      "path": "detection/sam_3d_body_dinov3_bf16.safetensors",
+      "dir": "detection",
+      "gb": 2.83
+    },
+    "rt_detr_v4": {
+      "repo": "Comfy-Org/SDPose",
+      "path": "diffusion_models/rt_detr_v4-x-hgnet_fp32.safetensors",
+      "dir": "diffusion_models",
+      "gb": 0.25
+    },
+    "qwen_edit_multiple_angles_lora": {
+      "repo": "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
+      "path": "qwen-image-edit-2511-multiple-angles-lora.safetensors",
+      "dir": "loras",
+      "gb": 0.3
+    },
+    "qwen_image_2512_fp8": {
+      "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+      "path": "split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors",
+      "dir": "diffusion_models",
+      "gb": 20.43
+    },
+    "qwen_image_2512_lightning": {
+      "repo": "lightx2v/Qwen-Image-2512-Lightning",
+      "path": "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors",
+      "dir": "loras",
+      "gb": 1.7
+    },
+    "qwen_360_lora": {
+      "repo": "ProGamerGov/qwen-360-diffusion",
+      "path": "qwen-360-diffusion-2512-int8-bf16-v2.safetensors",
+      "dir": "loras",
+      "gb": 0.76
     }
   }
 }

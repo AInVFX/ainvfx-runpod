@@ -6,7 +6,7 @@
 #   1. health check: GPU and driver, disk speed (the download speed is measured in step 4, on real files)
 #   2. install: uv, Python 3.13, PyTorch stable for CUDA 13.0, ComfyUI at a pinned tag, the Manager
 #   3. start ComfyUI, listening for Runpod's proxy on port 8188, and check the proxy from here
-#   4. download the models of the profile (AINVFX_PROFILE: image, video or train), resumable; every
+#   4. download the models of the profile (AINVFX_PROFILE: image, 3d, video, train, several joined by +, or all), resumable; every
 #      line says file k of n, GB done of GB planned, percent and the time left
 #   5. one test image with Z-Image Turbo (proves the GPU, the kernels and the models), then READY
 #
@@ -28,6 +28,9 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.6 (10 Oct 2026): AINVFX_PROFILE takes one profile or several joined by + (image+3d, image+video+train)
+# or all; models.json profiles are atomic (a new 3d profile; video is LTX only; train the bf16 files only),
+# so the video sessions ask for image+video and the training sessions for video+train.
 # v5.5 (7 Oct 2026, after the first pod on a B300 MIG slice): step 1 printed "[Insufficient Permissions]"
 # as the GPU's memory. A MIG slice (Multi-Instance GPU: one part of a bigger GPU, with its own memory,
 # here 1g.34gb of a B300) cannot read the whole card's memory from inside its container. Step 1 now reads
@@ -59,7 +62,9 @@
 # `uv pip install nvidia-cuda-nvcc==13.0.88` in the venv first; no course step does.
 #
 # Environment variables, all optional (the defaults are the bootcamp's; settings.env documents them):
-#   AINVFX_PROFILE        image (default) · video · train: which set of models.json to download
+#   AINVFX_PROFILE        image (default) · 3d · video · train, one or several joined by + (image+3d), or all:
+#                         which sets of models.json to download (v5.6, 10 Oct 2026: profiles are atomic, so
+#                         video no longer includes image: ask for image+video)
 #   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.39.0; master for the latest)
 #   AINVFX_PYTHON         the Python version of the environment (default 3.13)
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
@@ -447,10 +452,20 @@ def resolve(name, seen=()):
         else:
             out.append(item)
     return out
+import re
+wanted = [p for p in re.split(r"[+,\s]+", sys.argv[2].strip()) if p]
+if "all" in wanted:
+    wanted = list(profiles)
+unknown = [p for p in wanted if p not in profiles]
+if unknown:
+    sys.stderr.write("unknown profile(s) ignored: %s (known: %s)\n" % (", ".join(unknown), ", ".join(profiles)))
 keys = []
-for k in resolve(sys.argv[2]):
-    if k not in keys:
-        keys.append(k)
+for p in wanted:
+    if p not in profiles:
+        continue
+    for k in resolve(p):
+        if k not in keys:
+            keys.append(k)
 rows = []
 for k in keys:
     f = files[k]

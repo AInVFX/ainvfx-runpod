@@ -6,10 +6,14 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
 
   python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
   python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
-  python pod.py up image           create a pod for the image sessions (RTX 5090, 100 GB disk)
-  python pod.py up video           create a pod for video (RTX PRO 6000, 200 GB disk)
-  python pod.py up train           create a pod for LoRA training (RTX PRO 6000, 250 GB disk)
+  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 86 GB)
+  python pod.py up image+3d        the image models plus the 3D block (RTX 5090)
+  python pod.py up image+video     image plus LTX 2.5 for the video sessions (RTX PRO 6000)
+  python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
+  python pod.py up all             every profile (image, 3d, video, train), about 270 GB of models
   python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
+  python pod.py up image --community       also consider Community Cloud (off by default since 0.8.0)
+  python pod.py up image --models-url URL  your own models.json for this pod (a raw URL)
   python pod.py up train --name jar-lora   a second training pod, known here as `jar-lora`
   python pod.py status [pod]       status, GPU, data center, cost so far, ComfyUI address, last log lines
   python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
@@ -30,6 +34,9 @@ The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab firs
 file k of n, GB done, percent and the time left), then one test image. settings.env, next to this
 script, holds every choice the pod makes (the ComfyUI tag, Python, PyTorch, the models list,
 custom nodes, the checks): edit it, then `up`; its values travel with the pod as environment variables.
+Your own values go in settings.local.env, next to it (ignored by git, so `git pull` never touches it):
+each line there replaces the same line of settings.env. For one pod only, `up --set KEY=VALUE`
+(repeatable) and `up --models-url URL` replace a value on the command line.
 Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you, from the API
 log stream and from the copy the pod serves through its proxy. Before the first [AINVFX] line,
 Runpod's own system log tells what the host is doing (fetching the image, starting the container):
@@ -40,13 +47,15 @@ the usual answer is `down`, then `up` again, usually in another data center. A l
 FAILED (bootstrap.sh 5.4: PyTorch out of reach, no GPU from PyTorch, no ComfyUI) ends the wait at
 once: that pod cannot work, and the answer is the same, `down` then `up`.
 
-Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, and names the data
-center on Secure Cloud. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
+Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, on Secure Cloud, and
+names the data center. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
 the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer,
-not a 1g MIG slice),
-cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own; --max-price changes
-that), and prints the command to take another one. Right after creation it reads the pod's host: a host
-with maintenance under way or starting within 24 hours is terminated at once and the next GPU is tried.
+not a 1g MIG slice), cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own;
+--max-price changes that), and prints the command to take another one. Community Cloud (machines owned
+by third parties, cheaper, the host picked by Runpod) is left out unless `--community` is given: on
+9 October 2026 the first pod of the session, a Community RTX 5090, never started. Right after creation
+`up` reads the pod's host: a host with maintenance under way or starting within 24 hours is terminated
+at once and the next GPU is tried.
 Money: before its question, `up` shows your Runpod credit and the hours it buys on the card it proposes,
 and the question names the price. `down` says what each pod cost (its hours at its price, an estimate),
 lists any pod still running with its price per hour, and gives the credit left.
@@ -75,7 +84,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -86,12 +95,11 @@ REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 
 
-def load_settings():
-    """The AINVFX_* variables of settings.env (next to this script): KEY=value lines, # comments,
-    empty values dropped. They are sent with every pod and read by bootstrap.sh on the pod."""
+def read_env_file(path):
+    """The AINVFX_* variables of one KEY=value file: # comments, empty values dropped."""
     values = {}
     try:
-        for raw in SETTINGS.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -103,6 +111,15 @@ def load_settings():
                 values[key] = value
     except OSError:
         pass
+    return values
+
+
+def load_settings():
+    """settings.env (next to this script, versioned), then settings.local.env (yours, ignored by git):
+    a key in the local file replaces the same key of settings.env. The result is sent with every pod
+    and read by bootstrap.sh on the pod."""
+    values = read_env_file(SETTINGS)
+    values.update(read_env_file(SETTINGS_LOCAL))
     return values
 
 
@@ -120,6 +137,8 @@ CONFIG = CONFIG_DIR / "config.json"
 HERE = Path(__file__).resolve().parent
 OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")   # where `pull` puts the files
 SETTINGS = Path(os.environ.get("AINVFX_SETTINGS") or HERE / "settings.env")   # the pod's choices, one per line
+SETTINGS_LOCAL = Path(os.environ.get("AINVFX_SETTINGS_LOCAL") or SETTINGS.with_name("settings.local.env"))  # yours, not versioned
+DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 FINAL = ("EXITED", "ERROR", "TERMINATED")
 # The API log stream can stay open and silent while the pod writes lines that the stored log holds:
 # every STREAM_MAX_AGE seconds the stream is reopened a few seconds back, and every PROXY_POLL
@@ -138,11 +157,38 @@ STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds wit
 # Each profile names its preferred GPU and the least VRAM it needs. When the preferred GPU has no stock
 # on Secure Cloud, `up` proposes the cheapest GPU in stock with at least that VRAM and a Blackwell chip
 # or newer (see "Choosing the GPU" below).
+# Since 0.8.0 (10 Oct 2026) the profiles are atomic and combine: `up image+3d`, `up image+video`,
+# `up video+train`, `up all`. gb is the size of the profile's models in models.json; the container
+# disk is computed from the sum (115% of the models plus 30 GB for the environment, rounded up to
+# 10, never under 100). The GPU is the one of the profile that needs the most VRAM.
 PROFILES = {
-    "image": dict(disk=100, vram=32, gpu="NVIDIA GeForce RTX 5090"),
-    "video": dict(disk=200, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
-    "train": dict(disk=250, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+    "image": dict(gb=86, vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "3d":    dict(gb=30, vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "video": dict(gb=85, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+    "train": dict(gb=68, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
+PROFILE_ORDER = ["image", "3d", "video", "train"]
+
+
+def parse_profiles(text):
+    """`image`, `image+3d`, `image,video,train` or `all` -> the profiles in PROFILE_ORDER, no duplicate."""
+    parts = [p.strip().lower() for p in re.split(r"[+,\s]+", (text or "image").strip()) if p.strip()]
+    if "all" in parts:
+        return list(PROFILE_ORDER)
+    unknown = [p for p in parts if p not in PROFILES]
+    if unknown:
+        die("unknown profile(s): {}. Known: {}, joined by + (image+3d), or all.".format(
+            ", ".join(unknown), ", ".join(PROFILE_ORDER)))
+    return [p for p in PROFILE_ORDER if p in parts]
+
+
+def profile_spec(profiles):
+    """disk, vram, gpu and the label (`image+3d`) for one or several profiles."""
+    gb = sum(PROFILES[p]["gb"] for p in profiles)
+    vram = max(PROFILES[p]["vram"] for p in profiles)
+    gpu = next(PROFILES[p]["gpu"] for p in profiles if PROFILES[p]["vram"] == vram)
+    disk = max(100, int(-(-(gb * 1.15 + 30) // 10) * 10))
+    return dict(disk=disk, vram=vram, gpu=gpu, gb=gb, label="+".join(profiles))
 # Choosing the GPU. Two rules, learned on 5 and 7 October 2026, when a pod created with no data center
 # named landed on a host scheduled for removal (console notice "This server will be removed from the
 # platform"; the container never started), although the catalog showed no stock for that GPU:
@@ -411,6 +457,8 @@ def which_pod(cfg, ref):
     the account but not here (created from the console, or from another machine) is attached: its
     record is written to the configuration under its name, so the next commands can use it."""
     pods = cfg.setdefault("pods", {})
+    if ref:
+        ref = ref.strip().replace("+", "-")   # `down image+3d` and `down image-3d` name the same pod
     if ref is None:
         if len(pods) == 1:
             tag = next(iter(pods))
@@ -1150,10 +1198,11 @@ def create_pod(cfg, body, where):
 
 def cmd_up(args):
     cfg = load_config()
-    profile = args.profile
-    spec = PROFILES[profile]
+    profiles = parse_profiles(args.profile)
+    spec = profile_spec(profiles)
+    profile = spec["label"]                   # `image+3d`: the value AINVFX_PROFILE carries
     api_key(cfg)
-    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile
+    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile.replace("+", "-")
     cfg.setdefault("pods", {})
     old = cfg["pods"].get(tag)
     if old:
@@ -1173,8 +1222,17 @@ def cmd_up(args):
     region = args.region or cfg.get("region") or local_region()
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
     disk = args.disk or spec["disk"]
-    name = "ainvfx-{}-{}".format(profile, tag if tag != profile else datetime.now().strftime("%m%d-%H%M"))
-    env = dict(load_settings())              # settings.env: ComfyUI tag, Python, PyTorch, models, custom nodes...
+    name = "ainvfx-{}-{}".format(profile.replace("+", "-"), tag if tag != profile.replace("+", "-")
+                                 else datetime.now().strftime("%m%d-%H%M"))
+    env = dict(load_settings())              # settings.env, then settings.local.env: tag, Python, PyTorch, models...
+    for item in (args.set or []):            # `--set KEY=VALUE`, for this pod only
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key.startswith("AINVFX_") or not value:
+            die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
+        env[key] = value
+    if args.models_url:                       # `--models-url URL`, the same as --set AINVFX_MODELS_URL=URL
+        env["AINVFX_MODELS_URL"] = args.models_url.strip()
     env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
     if cfg.get("hf_secret") or secret_exists(cfg):
         env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
@@ -1183,7 +1241,7 @@ def cmd_up(args):
 
     # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
     catalogs = {}
-    for cloud in (("SECURE",) if args.secure_only else ("SECURE", "COMMUNITY")):
+    for cloud in (("SECURE", "COMMUNITY") if args.community else ("SECURE",)):
         try:
             catalogs[cloud] = read_catalog(cfg, cloud)
         except ApiError as e:
@@ -1210,15 +1268,23 @@ def cmd_up(args):
     say("   in stock in {}: {}".format(REGION_NAMES.get(region, region),
                                        ", ".join(d for d in dcs if region_of(d) == region) or "none right now"))
     say("   elsewhere: {}".format(", ".join(d for d in dcs if region_of(d) != region) or "none"))
-    say("   price per hour: {} Secure, {} Community".format(
-        fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?"))
+    say("   price per hour: {} Secure, {} Community{}".format(
+        fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?",
+        "" if args.community else " (not considered: add --community)"))
+    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
+    if models_url != DEFAULT_MODELS_URL:
+        say("   models list: {} (your own, not the course's)".format(models_url))
+    for key in sorted(k for k in env if k.startswith("AINVFX_") and k not in ("AINVFX_PROFILE", "AINVFX_MODELS_URL", "AINVFX_SELFTEST")
+                      and read_env_file(SETTINGS).get(k) != env[k]):
+        say("   {}: {} (yours)".format(key, env[key]))
 
     profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
         spec["vram"], MIN_CUDA)
+    say("   profile {}: about {} GB of models, a {} GB container disk".format(profile, spec["gb"], disk))
     if args.gpu:
         candidates = mine                     # the GPU named on the command line, and nothing else
         if not candidates:
-            say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if args.secure_only else ""))
+            say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if not args.community else ""))
             others = [o for o in fits if o["id"] != want["id"]]
             if others:
                 say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
@@ -1249,8 +1315,9 @@ def cmd_up(args):
         if other:
             say('   To choose another one:  python pod.py up {} --gpu "{}"   (any name from the GPU column)'.format(
                 profile, other["name"]))
-        if any(o["cloud"] == "COMMUNITY" for o in fits):
-            say("   Add --secure-only to leave out Community Cloud.")
+        if not args.community:
+            say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
+                " picked by Runpod and can fail to start, as on 9 October 2026).")
 
     first = candidates[0]
     balance, spend = account_money(cfg)
@@ -1612,8 +1679,10 @@ def cmd_doctor(args):
                                         "" if cfg.get("region") else " (guessed from the clock: {})".format(local_zone() or "offset")))
     say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID or "none: the script describes the pod itself"))
     say("  settings     {}{}".format(SETTINGS, "" if SETTINGS.exists() else " (absent: the bootstrap's defaults apply)"))
+    say("  yours        {}{}".format(SETTINGS_LOCAL, "" if SETTINGS_LOCAL.exists() else " (absent: nothing replaced)"))
+    local = read_env_file(SETTINGS_LOCAL)
     for k, v in load_settings().items():
-        say("    {:<22} {}".format(k, v))
+        say("    {:<22} {}{}".format(k, v, "   (settings.local.env)" if k in local else ""))
     say("  image        {} (used when no template is set)".format(IMAGE))
     if cfg.get("api_key") or os.environ.get("RUNPOD_API_KEY"):
         try:
@@ -1644,7 +1713,9 @@ def main():
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("up", help="create a pod")
-    p.add_argument("profile", nargs="?", default="image", choices=sorted(PROFILES))
+    p.add_argument("profile", nargs="?", default="image",
+                   help="which models the pod downloads: image, 3d, video, train, several joined by + (image+3d, "
+                        "image+video, video+train), or all (default image)")
     p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`); "
                                   "the other commands then take that name")
     p.add_argument("--gpu", help='a GPU from the list `up` shows, by its name ("RTX PRO 4500 SE") or its full id; '
@@ -1653,7 +1724,14 @@ def main():
                                                    "has no stock (default {:.2f} USD)".format(MAX_PRICE))
     p.add_argument("--disk", type=int, help="container disk in GB")
     p.add_argument("--region", choices=["EU", "NA"])
-    p.add_argument("--secure-only", action="store_true", help="leave out Community Cloud")
+    p.add_argument("--community", action="store_true",
+                   help="also consider Community Cloud (machines owned by third parties, cheaper, the host picked by "
+                        "Runpod); off by default since 0.8.0")
+    p.add_argument("--set", action="append", metavar="AINVFX_KEY=VALUE",
+                   help="replace one settings.env value for this pod (repeatable), for example "
+                        "--set AINVFX_COMFY_TAG=master; lasting changes go in settings.local.env")
+    p.add_argument("--models-url", metavar="URL",
+                   help="the raw URL of your own models.json for this pod (the same as --set AINVFX_MODELS_URL=URL)")
     p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")

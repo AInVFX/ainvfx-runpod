@@ -421,17 +421,26 @@ class Helpers(unittest.TestCase):
         with open(f, "w", encoding="utf-8") as fh:
             fh.write("# comment\nAINVFX_COMFY_TAG=master\nAINVFX_TORCH=\"--pre torch torchvision\"\n"
                      "AINVFX_SELFTEST=\nOTHER=1\n  AINVFX_PYTHON = 3.14 \n")
-        old = pod.SETTINGS
-        pod.SETTINGS = pod.Path(f)
+        old, old_local = pod.SETTINGS, pod.SETTINGS_LOCAL
+        pod.SETTINGS, pod.SETTINGS_LOCAL = pod.Path(f), pod.Path(d) / "settings.local.env"
         try:
             self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "master", "AINVFX_TORCH": "--pre torch torchvision",
                                                    "AINVFX_PYTHON": "3.14"})
             self.assertEqual(pod.comfy_tag(), "master")
+            with open(pod.SETTINGS_LOCAL, "w", encoding="utf-8") as fh:   # 0.8.0: the local file wins, key by key
+                fh.write("AINVFX_COMFY_TAG=v0.38.2\nAINVFX_MODELS_URL=https://example.org/mine/models.json\n")
+            self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "v0.38.2", "AINVFX_TORCH": "--pre torch torchvision",
+                                                   "AINVFX_PYTHON": "3.14",
+                                                   "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
+            self.assertEqual(pod.comfy_tag(), "v0.38.2")
             pod.SETTINGS = pod.Path(d) / "missing.env"
+            self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "v0.38.2",
+                                                   "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
+            pod.SETTINGS_LOCAL = pod.Path(d) / "missing.local.env"
             self.assertEqual(pod.load_settings(), {})
             self.assertEqual(pod.comfy_tag(), "v0.39.0")
         finally:
-            pod.SETTINGS = old
+            pod.SETTINGS, pod.SETTINGS_LOCAL = old, old_local
             shutil.rmtree(d, ignore_errors=True)
 
     def test_image_pull_counts_layer_lines(self):
@@ -536,8 +545,27 @@ class Helpers(unittest.TestCase):
             pod.CONFIG_DIR, pod.CONFIG = old
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_combined_profiles(self):
+        """0.8.0 (10 Oct 2026): atomic profiles that combine. The disk follows the models, the GPU the
+        profile that needs the most VRAM; `all` is every profile; an unknown profile is refused."""
+        self.assertEqual(pod.parse_profiles("image"), ["image"])
+        self.assertEqual(pod.parse_profiles("3d+image"), ["image", "3d"])
+        self.assertEqual(pod.parse_profiles("image, video,train"), ["image", "video", "train"])
+        self.assertEqual(pod.parse_profiles("all"), ["image", "3d", "video", "train"])
+        self.assertEqual(pod.profile_spec(["image"])["disk"], 130)
+        self.assertEqual(pod.profile_spec(["image"])["gpu"], "NVIDIA GeForce RTX 5090")
+        self.assertEqual(pod.profile_spec(["3d"])["disk"], 100, "never under 100 GB")
+        self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
+        self.assertEqual(pod.profile_spec(["image", "video"])["gpu"], "NVIDIA RTX PRO 6000 Blackwell Server Edition")
+        self.assertEqual(pod.profile_spec(["image", "video"])["vram"], 96)
+        self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 210)
+        spec = pod.profile_spec(["image", "3d", "video", "train"])
+        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 340))
+        with self.assertRaises(SystemExit):
+            pod.parse_profiles("nope+3d")
+
     def test_profiles_and_start_command(self):
-        self.assertEqual(sorted(pod.PROFILES), ["image", "train", "video"])
+        self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
         self.assertIn("bootstrap.sh", pod.START_CMD)
         self.assertTrue(pod.START_CMD.endswith('|| /start.sh"'))
 
@@ -698,31 +726,86 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [True, True, True], out)
         self.assertIn("Nothing bills", out, out)
 
-    def test_no_stock_proposes_the_cheapest_fit_and_never_any_host(self):
+    def test_no_stock_proposes_the_cheapest_secure_fit_and_never_any_host(self):
         """7 Oct 2026: no RTX 5090 on Secure Cloud. `up` must not create one there: it lists the GPUs in
-        stock that fit the image profile, cheapest first, and creates the cheapest (here the Community
-        RTX 5090). It leaves out what does not fit (24 GB, Hopper, a 1g MIG slice) and never picks on its
-        own what costs more than 2.50 USD per hour."""
+        stock that fit the image profile, cheapest first, and creates the cheapest. Since 0.8.0 (9 Oct
+        2026, a Community pod that never started) Community Cloud is left out unless --community is
+        given, so the replacement is the Secure RTX PRO 4500 SE, not the cheaper Community RTX 5090. It
+        leaves out what does not fit (24 GB, Hopper, a 1g MIG slice) and never picks on its own what
+        costs more than 2.50 USD per hour."""
         STATE["no_5090"] = True
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
         self.assertIn("in stock in North America: none right now", out, out)
+        self.assertIn("(not considered: add --community)", out, out)
         self.assertIn("never creates a pod where the catalog shows no stock", out, out)
-        self.assertIn("Replacement: RTX 5090 (32 GB of VRAM, 0.69 USD per hour, Community Cloud, a host Runpod picks)", out, out)
-        self.assertIn("RTX PRO 4500 SE", out, out)
+        self.assertIn("Replacement: RTX PRO 4500 SE (32 GB of VRAM, 0.72 USD per hour, Secure Cloud, US-KS-2)", out, out)
+        self.assertNotIn("Community Cloud, a host Runpod picks", out, "Community offers are not listed without --community")
+        self.assertIn("add --community to include it", out, out)
         self.assertNotIn("B300 MIG", out, "a 1g slice is never listed: 111 s self-test against 16 s (7 Oct 2026)")
         self.assertIn("above 2.50 USD: only with --gpu", out, "the B300 is listed, never picked on its own")
         self.assertNotIn("RTX 4090", out, "24 GB: does not fit the image profile")
         self.assertNotIn("H100", out, "Hopper: older than Blackwell")
         self.assertNotIn("PRO 6000 MIG 24GB", out, out)
-        self.assertIn('python pod.py up image --gpu "RTX PRO 4500 SE"', out, out)
+        self.assertIn('python pod.py up image --gpu "RTX PRO 6000"', out, out)
         self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
-                         [("NVIDIA GeForce RTX 5090", "COMMUNITY", None)], out)
-        self.assertIn("host checked: no maintenance planned.", out, out)
+                         [("NVIDIA RTX PRO 4500 Blackwell Server Edition", "SECURE", ["US-KS-2"])], out)
+        self.assertIn("host checked: no maintenance planned", out, out)
         self.assertIn("READY", out, out)
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
+
+    def test_community_cloud_only_with_the_flag(self):
+        """With --community, the 0.7.0 behaviour: the Community RTX 5090 at 0.69 is the cheapest fit and
+        is created with no data center named (Runpod picks the host)."""
+        STATE["no_5090"] = True
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "--community", "-y", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertNotIn("not considered", out, out)
+        self.assertIn("Replacement: RTX 5090 (32 GB of VRAM, 0.69 USD per hour, Community Cloud, a host Runpod picks)", out, out)
+        self.assertIn("RTX PRO 4500 SE", out, out)
+        self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
+                         [("NVIDIA GeForce RTX 5090", "COMMUNITY", None)], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_local_settings_and_command_line_overrides(self):
+        """0.8.0, Félix's question of 9 Oct 2026: a models.json of one's own. settings.local.env replaces
+        settings.env key by key and survives `git pull`; `--models-url` and `--set` replace a value for
+        one pod; a `--set` without an AINVFX_ key creates nothing."""
+        self.run_pod("setup", "-y")
+        mine = "https://raw.githubusercontent.com/someone/ainvfx-runpod/main/models.json"
+        with open(os.path.join(self.home, "settings.local.env"), "w", encoding="utf-8") as f:
+            f.write("# mine\nAINVFX_MODELS_URL={}\nAINVFX_CUSTOM_NODES=https://github.com/kijai/ComfyUI-KJNodes\n".format(mine))
+        out, rc = self.run_pod("doctor")
+        self.assertIn("settings.local.env", out, out)
+        self.assertIn("AINVFX_MODELS_URL", out, out)
+        self.assertIn("(settings.local.env)", out, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertIn("models list: {} (your own, not the course's)".format(mine), out, out)
+        self.assertIn("AINVFX_CUSTOM_NODES: https://github.com/kijai/ComfyUI-KJNodes (yours)", out, out)
+        sent = STATE["posts"][0].get("env") or {}
+        self.assertEqual(sent.get("AINVFX_MODELS_URL"), mine)
+        self.assertEqual(sent.get("AINVFX_CUSTOM_NODES"), "https://github.com/kijai/ComfyUI-KJNodes")
+        self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "v0.39.0", "settings.env still provides the rest")
+        self.assertIn("READY", out, out)
+        self.run_pod("down", "-y")
+        gist = "https://gist.githubusercontent.com/someone/abc/raw/models.json"
+        out, rc = self.run_pod("up", "image", "--name", "second", "--models-url", gist, "--set", "AINVFX_COMFY_TAG=master",
+                               "-y", "--wait", "1", timeout=90)
+        sent = STATE["posts"][1].get("env") or {}
+        self.assertEqual(sent.get("AINVFX_MODELS_URL"), gist, "--models-url wins over settings.local.env")
+        self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "master")
+        self.assertIn("AINVFX_COMFY_TAG: master (yours)", out, out)
+        self.assertIn("READY", out, out)
+        self.run_pod("down", "second", "-y", "--no-pull")
+        out, rc = self.run_pod("up", "image", "--set", "HF_TOKEN=abc", "-y", "--wait", "1", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("--set takes AINVFX_KEY=value", out, out)
+        self.assertEqual(len(STATE["posts"]), 2, "nothing created")
 
     def test_a_host_under_maintenance_is_terminated_and_the_next_gpu_tried(self):
         """The host of 5 and 7 Oct 2026 (maintenance under way, server being removed), on the first two
@@ -731,7 +814,7 @@ class EndToEnd(unittest.TestCase):
         STATE["maint_dcs"] = {"US-KS-2"}
         STATE["maint_community"] = True
         self.run_pod("setup", "-y")
-        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
+        out, rc = self.run_pod("up", "image", "--community", "-y", "--wait", "1", timeout=120)
         self.assertNotIn("Traceback", out, out)
         self.assertIn("REFUSED: its host has maintenance since", out, out)
         self.assertIn("removed from the platform", out, out)
@@ -745,13 +828,28 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
 
+    def test_up_with_a_combined_profile(self):
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image+3d", "-y", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("profile image+3d: about 116 GB of models, a 170 GB container disk", out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), 170, out)
+        self.assertEqual((STATE["posts"][0].get("env") or {}).get("AINVFX_PROFILE"), "image+3d", out)
+        self.assertEqual(STATE["posts"][0]["gpu"]["id"], "NVIDIA GeForce RTX 5090", out)
+        self.assertIn("READY", out, out)
+        out, rc = self.run_pod("down", "image+3d", "-y", "--no-pull")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "nope+3d", "-y", "--wait", "1", timeout=30)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("unknown profile(s): nope", out, out)
+
     def test_money_lines(self):
         """Adrien, 8 Oct 2026: the price in the question, the credit and the hours it buys before it, then
         what the pod cost, the other pods still running with their price, and the credit left after down."""
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
-        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 100 GB disk, billed from creation? [Y/n]", out, out)
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 130 GB disk, billed from creation? [Y/n]", out, out)
         self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertIn("READY", out, out)
@@ -774,7 +872,7 @@ class EndToEnd(unittest.TestCase):
         STATE["pro6000_dcs"] = tuple((d, "LOW") for d in dcs)
         STATE["full_dcs"] = set(dcs[:7])
         self.run_pod("setup", "-y")
-        out, rc = self.run_pod("up", "video", "-y", "--secure-only", "--wait", "1", timeout=90)
+        out, rc = self.run_pod("up", "video", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
         self.assertEqual([p.get("dataCenterIds") for p in STATE["posts"]], [[d] for d in dcs], out)
         self.assertIn("created on SECURE EUR-IS-1", out, out)
@@ -792,7 +890,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("READY", out, out)
         self.run_pod("down", "-y")
         STATE["no_5090"] = True
-        out, rc = self.run_pod("up", "image", "--gpu", "RTX 5090", "--secure-only", "-y", "--wait", "1", timeout=60)
+        out, rc = self.run_pod("up", "image", "--gpu", "RTX 5090", "-y", "--wait", "1", timeout=60)
         self.assertNotEqual(rc, 0, out)
         self.assertIn("No RTX 5090 in stock right now on Secure Cloud", out, out)
         self.assertIn('python pod.py up image --gpu "RTX PRO 4500 SE"', out, out)

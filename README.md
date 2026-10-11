@@ -36,19 +36,19 @@ git clone https://github.com/AInVFX/ainvfx-runpod
 cd ainvfx-runpod
 python pod.py setup        # once: your Runpod API key, your nearest data centers, your SSH key (optional)
 python pod.py setup --hf-token   # optional: your Hugging Face token, stored on Runpod as a secret (gated files)
-python pod.py up image     # creates the pod, follows its log until READY
+python pod.py up image     # creates the pod on Secure Cloud, follows its log until READY
 python pod.py open         # opens ComfyUI in your browser
 python pod.py pull         # downloads the pod's outputs into outputs/<pod name>/
 python pod.py down         # pulls, then terminates (billing stops)
 ```
 
-The other commands: `logs` (follow the log again), `status` (GPU, cost so far, address, last log lines), `push file.png` (copy a file into the pod's input folder), `ssh` (a terminal on the pod), `list` (every pod of your account), `doctor` (check your setup). `python pod.py --help` lists them all. Ctrl+C while a log is followed stops the following only; the pod keeps running until `down`.
+The other commands: `logs` (follow the log again), `status` (GPU, cost so far, address, last log lines), `push file.png` (copy a file into the pod's input folder), `ssh` (a terminal on the pod), `list` (every pod of your account), `doctor` (check your setup). `python pod.py --help` lists them all. Ctrl+C while a log is followed stops the following only; the pod keeps running until `down`. `up image --community` also considers Community Cloud (off by default since 0.8.0: see "How `up` picks the machine"); `up image --models-url <URL>` downloads your own list of models (see "Your own settings").
 
 While `up` waits, two kinds of lines appear. `[RUNPOD]` lines are Runpod's own system log: what the host does before our script runs (the image found on the host or fetched from Docker Hub, the container started). `[AINVFX]` lines are our script on the pod. If the host has to fetch the image, `up` prints one summary line every 15 seconds (`image download: 19 layers · 7 done · 9 extracting · 3 downloading (2 min 30 s)`), so a long pull never looks like a hang; after 8 minutes without a container, it prints a warning in capitals. The pod bills from its creation, whatever the host is doing: the answer to a stalled pod is `python pod.py down`, then `up` again, usually in another data center. An error after the pod exists is always a message that names the pod, never a traceback.
 
-**Several pods at once** (LoRA training, for example): `up train --name jar-lora` creates a second pod of the same profile, known to the script as `jar-lora`. Every command then takes that name, the pod's full name or its id: `status jar-lora`, `pull ainvfx-train-jar-lora`, `down jar-lora`. `list` shows every pod of your account and which ones this machine knows; a pod created from the console or from another machine is attached by its first command (`python pod.py status <name or id>`). `down --all` terminates every pod recorded here.
+**Several pods at once** (LoRA training, for example): `up video+train --name jar-lora` creates a second pod of the same profile, known to the script as `jar-lora`. Every command then takes that name, the pod's full name or its id: `status jar-lora`, `pull ainvfx-train-jar-lora`, `down jar-lora`. `list` shows every pod of your account and which ones this machine knows; a pod created from the console or from another machine is attached by its first command (`python pod.py status <name or id>`). `down --all` terminates every pod recorded here.
 
-Profiles: `up image` rents an RTX 5090 with a 100 GB disk; `up video` an RTX PRO 6000 (96 GB) with a 200 GB disk, for LTX 2.5; `up train` the same card with 250 GB, for LoRA training.
+Profiles, since 0.8.0 (10 October 2026): four atomic sets of models in `models.json`, combined on the command line. `up image` (the image block: Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, SeedVR2, the Qwen-Image-2512 panorama set; about 86 GB) and `up 3d` (TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet; about 30 GB) rent an RTX 5090; `up video` (LTX 2.5 and its IC-LoRAs, about 85 GB) and `up train` (the bf16 LTX files of the training kit, about 68 GB) rent an RTX PRO 6000 (96 GB). Join them with `+`: `up image+3d` for the 3D session, `up image+video` for the video sessions, `up video+train` for training, `up all` for everything (about 270 GB). The container disk follows the models (115% of their size plus 30 GB, rounded up to 10, never under 100 GB): 130 GB for `image`, 170 for `image+3d`, 230 for `image+video`, 340 for `all`; `--disk` overrides it. A profile alone downloads only its own files: `video` no longer includes `image`.
 
 **What you need on your machine**
 
@@ -81,18 +81,28 @@ If GitHub cannot be reached, the start command falls back to Runpod's own `/star
 
 **When the log says `ACTION NEEDED`.** Gated files did not come, and the lines below it give the Hugging Face page of each. Logged in with the account the log names, click « Agree and access repository » on each page, then fetch the files on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal (File, New, Terminal) or after `python pod.py ssh`. A pod without a token needs one first (below), then a new pod.
 
-Profile sizes (Hugging Face, 4 October 2026): `image` 14 files, about 63 GB; `video` 36 files, about 150 GB; `train` 38 files, about 215 GB.
+Profile sizes (Hugging Face, 4 and 10 October 2026): `image` 18 files, about 86 GB; `3d` 15 files, about 30 GB; `video` 22 files, about 85 GB; `train` 2 files, about 68 GB; `all` 56 files, about 270 GB.
 
 Measured on two RTX 5090 pods on Secure Cloud (4 and 5 October 2026), on the image above: the container up within a minute or two of creation, PyTorch installed in 90 seconds, ComfyUI answering after about 4 minutes; the 63 GB of the `image` profile took 10 minutes in EUR-IS-2 (about 100 MB/s) and 90 seconds in EU-CZ-1 (300 to 1300 MB/s per file); the self-test 16 to 106 seconds on the first load, 2 seconds once cached; `READY` 5 to 15 minutes after creation. A third pod on 5 October, created with "any data center" after the first choice had no stock, landed on a host that Runpod had scheduled for removal: it never started its container, the API still said RUNNING, and the log stream did not answer. That pod is why `up` now warns after 8 minutes without a container and why every API error is a message. On 7 October a pod created the same way landed on such a host again, although the catalog showed no stock for that GPU: since 0.6.0, `up` never creates a pod without stock and checks the host after creation (see How `up` picks the machine, below).
 
 The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reachable as `/workspace/ainvfx-bootstrap.log`). Because it lives in ComfyUI's input folder, the pod serves it through its own proxy once ComfyUI answers (so anyone with the pod's address can read it, the JupyterLab token of its last line included: keep the address to yourself), and `pod.py` reads it there as well as through the API stream: `up` and `logs` catch `READY` either way.
 
-## Your own settings: settings.env
+## Your own settings: settings.env, settings.local.env, --set
 
-Every choice the pod makes is one line of [`settings.env`](settings.env), next to the script. Edit the file, then `python pod.py up`: the values travel with the pod as environment variables, and `bootstrap.sh` reads them. An empty value means the default; `python pod.py doctor` shows what will be sent. From the browser, the same variables go in the Environment variables section of the template's deploy page. Deploy without touching anything and you get the course's pod.
+Every choice the pod makes is one line of [`settings.env`](settings.env), next to the script. The values travel with the pod as environment variables, and `bootstrap.sh` reads them. An empty value means the default; `python pod.py doctor` shows what will be sent, and marks the values that are yours. From the browser, the same variables go in the Environment variables section of the template's deploy page. Deploy without touching anything and you get the course's pod.
 
-**`AINVFX_PROFILE`** · which set of `models.json` to download. Default `image`.
-`image` (63 GB) · `video` (adds LTX 2.5, 150 GB) · `train` (adds the training models, 215 GB). `up video` and `up train` set it for you.
+Three ways to change a value, from the most lasting to the most temporary:
+
+1. **`settings.local.env`**, a file you create next to `settings.env`, with the same `KEY=value` lines. Each key there replaces the same key of `settings.env`; the keys you leave out keep the course's value. Git ignores this file, so `git pull` never touches it, and every pod you create uses it. The place for a list of models of your own, or custom nodes you always want.
+2. **`--set AINVFX_KEY=VALUE`** on `up`, repeatable, for one pod only: `python pod.py up image --set AINVFX_COMFY_TAG=master --set AINVFX_SELFTEST=0`.
+3. **`--models-url URL`** on `up`, a shortcut for `--set AINVFX_MODELS_URL=URL`.
+
+Never edit `settings.env` itself: `git pull` would stop on your change. Before creating the pod, `up` prints every value that differs from `settings.env`, so you see what the pod will do.
+
+**Your own list of models.** Copy [`models.json`](models.json), keep its shape, and put the result somewhere the pod can download it as a plain file: a fork of this repository (`https://raw.githubusercontent.com/<you>/ainvfx-runpod/main/models.json`) or a GitHub Gist (its Raw button gives the URL). In the file, `profiles` names which entries each profile downloads (`@image` inside `video` means "everything of image, plus"), and `files` describes each entry: the Hugging Face `repo`, the `path` of the file inside it, the `dir` under `ComfyUI/models` where it goes, its size in `gb` (for the progress lines) and `gated: true` when the repository needs a token. Point `AINVFX_MODELS_URL` at your file in `settings.local.env`, or give `--models-url` for one pod: the pod downloads your list instead of the course's. For a file needed once, the pod's own terminal works too (JupyterLab, or `python pod.py ssh`): `cd /workspace/ComfyUI/models/diffusion_models && hf download <repo> <path> --local-dir .`; it is gone with the pod.
+
+**`AINVFX_PROFILE`** · which sets of `models.json` to download. Default `image`.
+`image` (86 GB) · `3d` (30 GB) · `video` (LTX 2.5, 85 GB) · `train` (the bf16 training files, 68 GB) · several joined by `+`, for example `image+3d` or `image+video+train` · `all`. `up <profiles>` sets it for you.
 
 **`AINVFX_COMFY_TAG`** · the ComfyUI release. Default `v0.39.0`.
 A git tag (`v0.39.0`) · a branch (`master` for the latest commit).
@@ -107,7 +117,7 @@ A git tag (`v0.39.0`) · a branch (`master` for the latest commit).
 `https://download.pytorch.org/whl/cu130` (stable, CUDA 13.0) · `https://download.pytorch.org/whl/nightly/cu130` (nightlies) · the `cu128` index with a 12.8 driver.
 
 **`AINVFX_MODELS_URL`** · where the list of models comes from. Default: this repository's `models.json` on `main`.
-The raw URL of a `models.json` shaped like this one: fork, edit, point here.
+The raw URL of a `models.json` shaped like this one (a fork or a Gist, above), in `settings.local.env` or with `up --models-url`.
 
 **`AINVFX_CUSTOM_NODES`** · custom nodes installed at start. Default: none.
 Git URLs separated by spaces, for example `https://github.com/kijai/ComfyUI-KJNodes https://github.com/rgthree/rgthree-comfy`. Each is cloned into `custom_nodes` and its `requirements.txt` installed.
@@ -147,9 +157,9 @@ The gated repositories (LTX 2.5) need a Hugging Face read token: a free Hugging 
 
 The script reads Runpod's catalog once per cloud: every GPU type with its stock on hosts with CUDA 13.0 or newer. It orders the data centers by distance to you: your country first (Runpod names its data centers by country: `CA-MTL-1`, `US-TX-3`, `EU-FR-1`, `EUR-IS-2`), then the rest of your region (Europe or North America), then the other region. Country and region are guessed from this computer's clock (`America/Toronto` gives Canada; `Europe/Paris` gives France) and changed with `setup --region EU --country FR`. `up` prints where the profile's GPU is in stock, in your region and elsewhere, and its hourly price.
 
-`up` creates a pod only where the catalog shows stock, and always names the Secure Cloud data center. With no data center named, Runpod picks any host, and on 5 and 7 October 2026 that host was one being removed from the platform. When the profile's GPU has no stock on Secure Cloud, `up` lists every GPU in stock that fits the profile (32 GB of VRAM or more for `image`, 96 GB for `video` and `train`, a Blackwell chip or newer), cheapest first. It leaves out the 1g MIG slices. A MIG slice (Multi-Instance GPU) is a fixed share of a bigger GPU, with its own memory, and a 1g slice is the smallest share: one seventh of a B300. On 7 October 2026 a B300 MIG 1g.34gb ran the image self-test in 111 s, against 16.1 s on an RTX 5090. `--gpu "B300 MIG 34GB"` still takes one. It marks the one it will create and prints the command to take another one, for example `python pod.py up image --gpu "RTX PRO 4500 SE"` (the name from the GPU column, or the full id). It never takes a GPU above 2.50 USD per hour on its own (`--max-price` changes that). If a GPU is taken between the catalog read and the creation, `up` tries its other data centers with stock, then the next GPU that fits, cheapest first. Community Cloud stock comes with no data center in the catalog, so a Community pod is the one case where Runpod picks the host.
+`up` creates a pod only where the catalog shows stock, on Secure Cloud, and always names the data center. With no data center named, Runpod picks any host, and on 5 and 7 October 2026 that host was one being removed from the platform. **Community Cloud is left out unless you add `--community`** (since 0.8.0): its machines belong to third parties, cost less and carry no data center in the catalog, so Runpod picks the host; on 9 October 2026 the first pod of a session, a Community RTX 5090, never started. With `--community`, `up` reads that catalog too and may propose a Community GPU when it is the cheapest that fits. When the profile's GPU has no stock on Secure Cloud, `up` lists every GPU in stock that fits the profile (32 GB of VRAM or more for `image`, 96 GB for `video` and `train`, a Blackwell chip or newer), cheapest first. It leaves out the 1g MIG slices. A MIG slice (Multi-Instance GPU) is a fixed share of a bigger GPU, with its own memory, and a 1g slice is the smallest share: one seventh of a B300. On 7 October 2026 a B300 MIG 1g.34gb ran the image self-test in 111 s, against 16.1 s on an RTX 5090. `--gpu "B300 MIG 34GB"` still takes one. It marks the one it will create and prints the command to take another one, for example `python pod.py up image --gpu "RTX PRO 4500 SE"` (the name from the GPU column, or the full id). It never takes a GPU above 2.50 USD per hour on its own (`--max-price` changes that). If a GPU is taken between the catalog read and the creation, `up` tries its other data centers with stock, then the next GPU that fits, cheapest first. Community Cloud stock comes with no data center in the catalog, so a Community pod is the one case where Runpod picks the host.
 
-Right after each creation, `up` reads the pod's host through Runpod's GraphQL API (the REST API does not report it). A host with maintenance under way, or starting within 24 hours, is terminated at once (a few seconds billed), and the next GPU is tried. `--secure-only` leaves out Community Cloud; `--gpu` tries only the GPU you name.
+Right after each creation, `up` reads the pod's host through Runpod's GraphQL API (the REST API does not report it). A host with maintenance under way, or starting within 24 hours, is terminated at once (a few seconds billed), and the next GPU is tried. `--gpu` tries only the GPU you name, on Secure Cloud unless `--community` is added.
 
 **What it costs.** Before its question, `up` shows your Runpod credit and how many hours it buys on the card it proposes, and the question names the price per hour. `down` says what each pod cost (its hours at its price: an estimate, since Runpod bills from creation), lists any pod still running with its price per hour and the total, and gives the credit left. `status` shows the cost so far and the hours left at that pod's price. The credit comes from Runpod's GraphQL API; when it cannot be read, these lines are left out.
 
@@ -157,9 +167,9 @@ By default `up` creates the pod from the AInVFX template (`4i789znkrd`); `setup 
 
 **The image** is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the image of Runpod's own "Runpod Pytorch 2.8.0" template. Runpod keeps the images of its own templates on its hosts, so the container starts within seconds; any other tag has to be fetched from Docker Hub by the host first (the `1.0.7-cu1300-torch291` tag tried on 5 October 2026: 19 layers, about 9 GB, over 5 minutes before we gave up). The image's own PyTorch and CUDA toolkit are not used: `bootstrap.sh` builds the pod's environment with the cu130 PyTorch wheels, which carry their own CUDA 13 libraries, and the GPU driver is the host's. The toolkit of the image only matters to a custom node that compiles a CUDA kernel from source; none of the course's does, and if one did, `uv pip install nvidia-cuda-nvcc==13.0.88` in the venv provides the CUDA 13 compiler.
 
-## Costs, as read on 4 October 2026
+## Costs, as read on 8 October 2026
 
-RTX 5090: 0.99 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96 GB): 2.09 and 1.69. The container disk costs 0.10 USD per GB per month while the pod runs, nothing after termination. Billing is by the second, from creation to termination. Current prices: [Runpod pricing](https://docs.runpod.io/pods/pricing).
+RTX 5090: 1.19 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96 GB): 2.49 and 1.69. The container disk costs 0.10 USD per GB per month while the pod runs, nothing after termination. Billing is by the second, from creation to termination. Current prices: [Runpod pricing](https://docs.runpod.io/pods/pricing).
 
 ## Security notes
 
@@ -174,7 +184,7 @@ RTX 5090: 0.99 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96
 git pull
 ```
 
-The ComfyUI tag and the other choices live in `settings.env` (and, for browser users, in the template's variables); the model list in `models.json`. A pod created after a change uses the new values; a running pod keeps its own.
+The ComfyUI tag and the other choices live in `settings.env` (and, for browser users, in the template's variables); the model list in `models.json`; your own values in `settings.local.env`, which `git pull` leaves alone. A pod created after a change uses the new values; a running pod keeps its own.
 
 ## For contributors
 
