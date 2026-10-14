@@ -186,6 +186,16 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path
         if p.startswith("/proxy/"):
             return self.proxy_get(p, q)
+        if p.startswith("/files/"):          # a models list served as a raw file (0.8.1)
+            body = STATE["files"].get(p)
+            if body is None:
+                return self.problem(404, "no such file")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if p == "/v2/slow":                 # answers after 3 s: a host that does not respond
             time.sleep(3)
             return self.send_json(200, {"slow": True})
@@ -438,7 +448,7 @@ class Helpers(unittest.TestCase):
                                                    "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
             pod.SETTINGS_LOCAL = pod.Path(d) / "missing.local.env"
             self.assertEqual(pod.load_settings(), {})
-            self.assertEqual(pod.comfy_tag(), "v0.39.0")
+            self.assertEqual(pod.comfy_tag(), "v0.40.0")
         finally:
             pod.SETTINGS, pod.SETTINGS_LOCAL = old, old_local
             shutil.rmtree(d, ignore_errors=True)
@@ -586,7 +596,7 @@ class EndToEnd(unittest.TestCase):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
-                      "balance": 212.40})
+                      "balance": 212.40, "files": {}})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -777,7 +787,9 @@ class EndToEnd(unittest.TestCase):
         settings.env key by key and survives `git pull`; `--models-url` and `--set` replace a value for
         one pod; a `--set` without an AINVFX_ key creates nothing."""
         self.run_pod("setup", "-y")
-        mine = "https://raw.githubusercontent.com/someone/ainvfx-runpod/main/models.json"
+        course = open(os.path.join(os.path.dirname(POD_PY), "models.json"), "rb").read()
+        STATE["files"].update({"/files/mine/models.json": course, "/files/gist/models.json": course})
+        mine = "http://127.0.0.1:{}/files/mine/models.json".format(self.port)
         with open(os.path.join(self.home, "settings.local.env"), "w", encoding="utf-8") as f:
             f.write("# mine\nAINVFX_MODELS_URL={}\nAINVFX_CUSTOM_NODES=https://github.com/kijai/ComfyUI-KJNodes\n".format(mine))
         out, rc = self.run_pod("doctor")
@@ -793,7 +805,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sent.get("AINVFX_COMFY_TAG"), "v0.39.0", "settings.env still provides the rest")
         self.assertIn("READY", out, out)
         self.run_pod("down", "-y")
-        gist = "https://gist.githubusercontent.com/someone/abc/raw/models.json"
+        gist = "http://127.0.0.1:{}/files/gist/models.json".format(self.port)
         out, rc = self.run_pod("up", "image", "--name", "second", "--models-url", gist, "--set", "AINVFX_COMFY_TAG=master",
                                "-y", "--wait", "1", timeout=90)
         sent = STATE["posts"][1].get("env") or {}
@@ -806,6 +818,39 @@ class EndToEnd(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("--set takes AINVFX_KEY=value", out, out)
         self.assertEqual(len(STATE["posts"]), 2, "nothing created")
+
+    def test_own_models_list(self):
+        """0.8.1, Adrien's pod of 13 Oct 2026 with a Google Drive link: a share link becomes the file's own
+        link, the disk follows your list, and a web page stops `up` before anything is created."""
+        self.assertEqual(pod.direct_url("https://drive.google.com/file/d/1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh/view?usp=sharing"),
+                         "https://drive.google.com/uc?export=download&id=1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh")
+        self.assertEqual(pod.direct_url("https://github.com/me/ainvfx-runpod/blob/main/models.json"),
+                         "https://raw.githubusercontent.com/me/ainvfx-runpod/main/models.json")
+        self.assertEqual(pod.direct_url("https://www.dropbox.com/scl/fi/abc/models.json?rlkey=x&dl=0"),
+                         "https://www.dropbox.com/scl/fi/abc/models.json?rlkey=x&dl=1")
+        self.assertEqual(pod.direct_url(pod.DEFAULT_MODELS_URL), pod.DEFAULT_MODELS_URL)
+        lst = json.load(open(os.path.join(os.path.dirname(POD_PY), "models.json"), encoding="utf-8"))
+        lst["profiles"]["image"] = ["z_image_turbo", "z_image_turbo_text_encoder", "z_image_vae", "z_image_full"]
+        STATE["files"].update({"/files/zimage.json": json.dumps(lst).encode(),
+                               "/files/page.html": b"<!DOCTYPE html><html><body>Google Drive</body></html>"})
+        base = "http://127.0.0.1:{}/files/".format(self.port)
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "--models-url", base + "page.html", "-y", "--wait", "1", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("not the JSON itself", out, out)
+        self.assertEqual(len(STATE["posts"]), 0, "nothing created")
+        typo = dict(lst, profiles=dict(lst["profiles"], image=["z_image_turbo", "z_image_vea"]))
+        STATE["files"]["/files/typo.json"] = json.dumps(typo).encode()
+        out, rc = self.run_pod("up", "image", "--models-url", base + "typo.json", "-y", "--wait", "1", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("names files that are not in its files list: z_image_vea", out, out)
+        self.assertEqual(len(STATE["posts"]), 0, "nothing created")
+        out, rc = self.run_pod("up", "image", "--models-url", base + "zimage.json", "-y", "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("profile image: about 18 GB of models, a 100 GB container disk", out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), 100, out)
+        self.assertIn("READY", out, out)
+        self.run_pod("down", "-y", "--no-pull")
 
     def test_a_host_under_maintenance_is_terminated_and_the_next_gpu_tried(self):
         """The host of 5 and 7 Oct 2026 (maintenance under way, server being removed), on the first two
@@ -832,7 +877,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image+3d", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn("profile image+3d: about 116 GB of models, a 170 GB container disk", out, out)
+        self.assertIn("profile image+3d: about 115 GB of models, a 170 GB container disk", out, out)
         self.assertEqual(STATE["posts"][0].get("disk"), 170, out)
         self.assertEqual((STATE["posts"][0].get("env") or {}).get("AINVFX_PROFILE"), "image+3d", out)
         self.assertEqual(STATE["posts"][0]["gpu"]["id"], "NVIDIA GeForce RTX 5090", out)

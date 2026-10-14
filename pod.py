@@ -6,14 +6,15 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
 
   python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
   python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
-  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 86 GB)
+  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 87 GB)
   python pod.py up image+3d        the image models plus the 3D block (RTX 5090)
   python pod.py up image+video     image plus LTX 2.5 for the video sessions (RTX PRO 6000)
   python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
   python pod.py up all             every profile (image, 3d, video, train), about 270 GB of models
   python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
   python pod.py up image --community       also consider Community Cloud (off by default since 0.8.0)
-  python pod.py up image --models-url URL  your own models.json for this pod (a raw URL)
+  python pod.py up image --models-url URL  your own models.json for this pod (a raw link, or a Google
+                                           Drive, Dropbox or GitHub share link)
   python pod.py up train --name jar-lora   a second training pod, known here as `jar-lora`
   python pod.py status [pod]       status, GPU, data center, cost so far, ComfyUI address, last log lines
   python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
@@ -84,7 +85,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -124,7 +125,7 @@ def load_settings():
 
 
 def comfy_tag():
-    return load_settings().get("AINVFX_COMFY_TAG", "v0.39.0")
+    return load_settings().get("AINVFX_COMFY_TAG", "v0.40.0")
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
@@ -158,14 +159,15 @@ STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds wit
 # on Secure Cloud, `up` proposes the cheapest GPU in stock with at least that VRAM and a Blackwell chip
 # or newer (see "Choosing the GPU" below).
 # Since 0.8.0 (10 Oct 2026) the profiles are atomic and combine: `up image+3d`, `up image+video`,
-# `up video+train`, `up all`. gb is the size of the profile's models in models.json; the container
-# disk is computed from the sum (115% of the models plus 30 GB for the environment, rounded up to
-# 10, never under 100). The GPU is the one of the profile that needs the most VRAM.
+# `up video+train`, `up all`. Since 0.8.1 (13 Oct 2026) the size of the models comes from the list the
+# pod downloads (models.json next to this script, or your own list): the container disk is 115% of it
+# plus 30 GB for the environment, rounded up to 10, never under 100. The GPU is the one of the profile
+# that needs the most VRAM.
 PROFILES = {
-    "image": dict(gb=86, vram=32, gpu="NVIDIA GeForce RTX 5090"),   # 87 GB in models.json since 11 Oct; the 15% margin covers it
-    "3d":    dict(gb=30, vram=32, gpu="NVIDIA GeForce RTX 5090"),
-    "video": dict(gb=85, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
-    "train": dict(gb=68, vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+    "image": dict(vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "3d":    dict(vram=32, gpu="NVIDIA GeForce RTX 5090"),
+    "video": dict(vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+    "train": dict(vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
 PROFILE_ORDER = ["image", "3d", "video", "train"]
 
@@ -182,13 +184,60 @@ def parse_profiles(text):
     return [p for p in PROFILE_ORDER if p in parts]
 
 
-def profile_spec(profiles):
-    """disk, vram, gpu and the label (`image+3d`) for one or several profiles."""
-    gb = sum(PROFILES[p]["gb"] for p in profiles)
+def direct_url(url):
+    """A share link turned into a link to the file itself: Google Drive, Dropbox, a file page on GitHub."""
+    m = re.match(r"https?://drive\.google\.com/(?:file/d/|open\?id=)([\w-]+)", url)
+    if m:
+        return "https://drive.google.com/uc?export=download&id=" + m.group(1)
+    url = re.sub(r"^https?://github\.com/([^/]+)/([^/]+)/blob/", r"https://raw.githubusercontent.com/\1/\2/", url)
+    return re.sub(r"(dropbox\.com/.*[?&])dl=0\b", r"\1dl=1", url)
+
+
+def read_models(url=DEFAULT_MODELS_URL):
+    """The list the pod will download: the copy next to this script for the course's list, else fetched."""
+    try:
+        local = HERE / "models.json"
+        if url == DEFAULT_MODELS_URL and local.is_file():
+            data = json.loads(local.read_text(encoding="utf-8"))
+        else:
+            req = urllib.request.Request(direct_url(url), headers={"User-Agent": "ainvfx-runpod/" + VERSION})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        if not (isinstance(data, dict) and isinstance(data.get("profiles"), dict) and isinstance(data.get("files"), dict)):
+            raise ValueError("no profiles and files")
+        return data
+    except ValueError:                        # a web page, or JSON of another shape
+        why = "the link gives a web page or another file, not the JSON itself"
+    except OSError as e:                      # unreachable, 404, refused
+        why = str(e)
+    die("the models list at {} could not be read: {}. Give a raw link, or a Google Drive, Dropbox or GitHub "
+        "share link to the file.".format(url, why))
+
+
+def profile_spec(profiles, models=None):
+    """disk, vram, gpu, the size of the models (GB) and the label (`image+3d`) for one or several profiles."""
+    models = models or read_models()
+    missing = [p for p in profiles if p not in models["profiles"]]
+    if missing:
+        die("the models list has no profile {} (it has: {}).".format(", ".join(missing), ", ".join(models["profiles"])))
+    keys = []
+    def walk(name, seen=()):                  # `@image` inside a profile includes the image profile
+        for item in models["profiles"].get(name, []):
+            if item.startswith("@"):
+                if item[1:] not in seen:
+                    walk(item[1:], seen + (name,))
+            elif item not in keys:
+                keys.append(item)
+    for p in profiles:
+        walk(p)
+    unknown = [k for k in keys if k not in models["files"]]
+    if unknown:
+        die("the models list names files that are not in its files list: {}.".format(", ".join(unknown)))
+    gb = sum(models["files"][k].get("gb") or 0 for k in keys)
     vram = max(PROFILES[p]["vram"] for p in profiles)
     gpu = next(PROFILES[p]["gpu"] for p in profiles if PROFILES[p]["vram"] == vram)
     disk = max(100, int(-(-(gb * 1.15 + 30) // 10) * 10))
-    return dict(disk=disk, vram=vram, gpu=gpu, gb=gb, label="+".join(profiles))
+    return dict(disk=disk, vram=vram, gpu=gpu, gb=round(gb), label="+".join(profiles))
 # Choosing the GPU. Two rules, learned on 5 and 7 October 2026, when a pod created with no data center
 # named landed on a host scheduled for removal (console notice "This server will be removed from the
 # platform"; the container never started), although the catalog showed no stock for that GPU:
@@ -1199,8 +1248,7 @@ def create_pod(cfg, body, where):
 def cmd_up(args):
     cfg = load_config()
     profiles = parse_profiles(args.profile)
-    spec = profile_spec(profiles)
-    profile = spec["label"]                   # `image+3d`: the value AINVFX_PROFILE carries
+    profile = "+".join(profiles)              # `image+3d`: the value AINVFX_PROFILE carries
     api_key(cfg)
     tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile.replace("+", "-")
     cfg.setdefault("pods", {})
@@ -1221,7 +1269,6 @@ def cmd_up(args):
 
     region = args.region or cfg.get("region") or local_region()
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
-    disk = args.disk or spec["disk"]
     name = "ainvfx-{}-{}".format(profile.replace("+", "-"), tag if tag != profile.replace("+", "-")
                                  else datetime.now().strftime("%m%d-%H%M"))
     env = dict(load_settings())              # settings.env, then settings.local.env: tag, Python, PyTorch, models...
@@ -1238,6 +1285,8 @@ def cmd_up(args):
         env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
     if not args.selftest:
         env["AINVFX_SELFTEST"] = "0"
+    spec = profile_spec(profiles, read_models(env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)))  # before any spend
+    disk = args.disk or spec["disk"]
 
     # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
     catalogs = {}
@@ -1731,7 +1780,8 @@ def main():
                    help="replace one settings.env value for this pod (repeatable), for example "
                         "--set AINVFX_COMFY_TAG=master; lasting changes go in settings.local.env")
     p.add_argument("--models-url", metavar="URL",
-                   help="the raw URL of your own models.json for this pod (the same as --set AINVFX_MODELS_URL=URL)")
+                   help="your own models.json for this pod: a raw link, or a Google Drive, Dropbox or GitHub share link "
+                        "(the same as --set AINVFX_MODELS_URL=URL)")
     p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")

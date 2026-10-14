@@ -28,6 +28,9 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.7 (13 Oct 2026): default ComfyUI tag v0.40.0. A share link given as AINVFX_MODELS_URL (Google Drive,
+# Dropbox, a file page on GitHub) becomes a link to the file itself, and a list that is not a models.json
+# (a web page) is refused with one warning instead of an empty plan.
 # v5.6 (10 Oct 2026): AINVFX_PROFILE takes one profile or several joined by + (image+3d, image+video+train)
 # or all; models.json profiles are atomic (a new 3d profile; video is LTX only; train the bf16 files only),
 # so the video sessions ask for image+video and the training sessions for video+train.
@@ -65,7 +68,7 @@
 #   AINVFX_PROFILE        image (default) · 3d · video · train, one or several joined by + (image+3d), or all:
 #                         which sets of models.json to download (v5.6, 10 Oct 2026: profiles are atomic, so
 #                         video no longer includes image: ask for image+video)
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.39.0; master for the latest)
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.40.0; master for the latest)
 #   AINVFX_PYTHON         the Python version of the environment (default 3.13)
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
 #                         "--pre torch torchvision torchaudio" for nightlies)
@@ -110,7 +113,7 @@ if [ "$MODE" = "models" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.39.0}"
+TAG="${AINVFX_COMFY_TAG:-v0.40.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
@@ -407,9 +410,15 @@ fi   # end of steps 0 to 3
 # ---------------------------------------------------------------- 4. models
 say "step 4/5 models of profile $PROFILE"
 MODELS_JSON=$ROOT/models.json
-curl -fsSL --retry 3 "$MODELS_URL" -o "$MODELS_JSON.new" && mv -f "$MODELS_JSON.new" "$MODELS_JSON"
+MODELS_SRC=$(printf '%s' "$MODELS_URL" | sed -E \
+  -e 's#^https?://drive\.google\.com/(file/d/|open\?id=)([A-Za-z0-9_-]+).*#https://drive.google.com/uc?export=download\&id=\2#' \
+  -e 's#^https?://github\.com/([^/]+)/([^/]+)/blob/#https://raw.githubusercontent.com/\1/\2/#' \
+  -e '/dropbox\.com/s#([?&])dl=0#\1dl=1#')   # a share link becomes the file itself
+curl -fsSL --retry 3 "$MODELS_SRC" -o "$MODELS_JSON.new" \
+  && python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert isinstance(d["profiles"], dict) and isinstance(d["files"], dict)' "$MODELS_JSON.new" 2>/dev/null \
+  && mv -f "$MODELS_JSON.new" "$MODELS_JSON"; rm -f "$MODELS_JSON.new"
 if [ ! -s "$MODELS_JSON" ]; then
-  warn "models.json could not be fetched: no model downloaded. Use the Manager's model library."
+  warn "no models.json at $MODELS_URL (no file, or a web page instead of the file: give a raw link or a share link to the file): no model downloaded. Use the Manager's model library."
 else
   mkdir -p "$STAGE"
   # The plan first (v5.3): which files are missing, their number and their size, so every
@@ -493,7 +502,7 @@ for r in rows:
     else:
         print("|".join(r[:5] + ["", str(n_todo), "", "%.1f" % gb_todo, r[5]]))
 PY
-  N_ALL=$(grep -c . "$LIST" 2>/dev/null || echo 0)
+  N_ALL=$(grep -c . "$LIST" 2>/dev/null); N_ALL=${N_ALL:-0}
   N_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f7); N_TODO=${N_TODO:-0}
   GB_TODO=$(head -1 "$LIST" 2>/dev/null | cut -d'|' -f9); GB_TODO=${GB_TODO:-0}
   # the rest of the plan, by state: present, gated without a token, waiting for a licence, moved
