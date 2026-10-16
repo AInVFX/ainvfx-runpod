@@ -28,6 +28,9 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.9 (16 Oct 2026): the gated repos are named from models.json, never hard-coded: the token lines no longer
+# say LTX; after the plan, one line per gated repo of the profile (files, how many wait, and how its licence
+# is approved, read from the Hugging Face API: at once, or by the authors); ACTION NEEDED says the same per page.
 # v5.8 (15 Oct 2026): default ComfyUI tag v0.41.1 (FLUX 3 Image Klein); the image profile gains its four
 # gated Klein files (models.json, 23 files, about 108 GB, the prompt upsampler included).
 # v5.7 (13 Oct 2026): default ComfyUI tag v0.40.0. A share link given as AINVFX_MODELS_URL (Google Drive,
@@ -80,7 +83,8 @@
 #   AINVFX_HEALTHCHECK    1 (default) measures the disk; 0 skips the measurement
 #   AINVFX_SELFTEST       1 (default) generates the test image at the end; 0 skips it
 #   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork): fetched and run in place of this one
-#   HF_TOKEN              a Hugging Face read token, for the gated files (LTX). Without it they are skipped.
+#   HF_TOKEN              a Hugging Face read token, for the gated files of models.json (FLUX 3 Image Klein in
+#                         image, LTX in video and train). Without it they are skipped.
 #                         Runpod fills it from the secret `huggingface_token` when the value is
 #                         {{ RUNPOD_SECRET_huggingface_token }}; an unresolved placeholder counts as absent.
 #
@@ -197,13 +201,24 @@ hf_state() {   # ok, gated, missing or error for one file of Hugging Face: one H
 }
 NEED_REPOS=""; NOTOKEN_REPOS=""; WAITING=0; SKIPPED=0; HF_USER=""
 print_links() {   # one page link per repo, each repo once, in the order met
-  local r
+  local r m
   # shellcheck disable=SC2086
-  for r in $(printf '%s\n' $1 | awk 'NF && !seen[$0]++'); do say "   https://huggingface.co/$r"; done
+  for r in $(printf '%s\n' $1 | awk 'NF && !seen[$0]++'); do
+    m=$(awk -F'|' -v r="$r" '$1==r {print $4}' "${GATED_INFO:-/dev/null}" 2>/dev/null)
+    say "   https://huggingface.co/$r · $(mode_text "${m:-unknown}")"
+  done
+}
+mode_text() {   # v5.9: what accepting the licence of a gated repo takes, from the Hugging Face API (gated: auto or manual)
+  case "$1" in
+    auto)   echo "approved at once on « Agree and access repository »" ;;
+    manual) echo "approved by the repo's authors after a request (this can take days)" ;;
+    open)   echo "not gated any more: a download will work" ;;
+    *)      echo "approval mode unknown (the API did not answer)" ;;
+  esac
 }
 access_summary() {   # the gated files that did not come, with the page of each and what to do
   if [ -n "$NEED_REPOS" ]; then
-    say "ACTION NEEDED · $WAITING gated file(s) wait for a licence that the Hugging Face account${HF_USER:+ $HF_USER} has not accepted. Logged in to huggingface.co with that account, open each page and click « Agree and access repository » (the LTX pages approve at once):"
+    say "ACTION NEEDED · $WAITING gated file(s) wait for a licence that the Hugging Face account${HF_USER:+ $HF_USER} has not accepted. Logged in to huggingface.co with that account, open each page and click « Agree and access repository »:"
     print_links "$NEED_REPOS"
     say "   then fetch them on this pod, without a new one: bash $SELF models   (in JupyterLab's terminal, or after python pod.py ssh)"
     say "   a Read token works; a fine-grained token also needs its permission to read public gated repos"
@@ -238,9 +253,9 @@ if [ -n "${HF_TOKEN:-}" ]; then
   esac
 fi
 if [ -n "${HF_TOKEN:-}" ]; then
-  say "HF_TOKEN present${HF_USER:+, Hugging Face account $HF_USER}: gated files (LTX) allowed once their licence is accepted"
+  say "HF_TOKEN present${HF_USER:+, Hugging Face account $HF_USER}: the gated files of the profile come once that account has accepted their licence (the repos are named with the models plan)"
 else
-  say "no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"
+  say "no HF_TOKEN: the gated files of the profile will be skipped (their repos are named with the models plan); the public files come without it"
 fi
 
 if [ "$MODE" != "models" ]; then   # steps 0 to 3; the models mode goes straight to step 4
@@ -429,7 +444,8 @@ else
   # yet accepted is told with its page instead of failing a download. Every row ends with its state:
   # todo, present, notoken (gated, no token), gated (licence not accepted) or missing (path gone).
   LIST=$ROOT/models.list
-  python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "${HF_TOKEN:-}" > "$LIST" <<'PY'
+  GATED_INFO=$ROOT/models.gated   # v5.9: repo|files|waiting|mode, one line per gated repo of the profile
+  python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "${HF_TOKEN:-}" "$GATED_INFO" > "$LIST" <<'PY'
 import json, os, sys, urllib.error, urllib.parse, urllib.request
 spec = json.load(open(sys.argv[1]))
 files, profiles, root, token = spec["files"], spec["profiles"], sys.argv[3], sys.argv[4]
@@ -492,6 +508,25 @@ for k in keys:
     else:
         state = "todo"
     rows.append([f["repo"], f["path"], f["dir"], "1" if gated else "0", str(f.get("gb", "?")), state, f.get("gb") or 0])
+gated_repos = {}
+for r in rows:
+    if r[3] == "1":
+        g = gated_repos.setdefault(r[0], {"n": 0, "wait": 0})
+        g["n"] += 1
+        if r[5] in ("gated", "notoken"):
+            g["wait"] += 1
+def approval(repo):
+    """auto (approved at once), manual (the authors decide), open, or unknown: the repo's gated field on the API."""
+    req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
+                                 headers={"Authorization": "Bearer " + token} if token else {})
+    try:
+        g = json.load(urllib.request.urlopen(req, timeout=20)).get("gated")
+    except Exception:
+        return "unknown"
+    return "auto" if g == "auto" else "manual" if g == "manual" else "open" if g is False else "unknown"
+with open(sys.argv[5], "w") as out:
+    for repo, g in gated_repos.items():
+        out.write("%s|%d|%d|%s\n" % (repo, g["n"], g["wait"], approval(repo) if g["wait"] else "accepted"))
 todo = [r for r in rows if r[5] == "todo"]
 n_todo = len(todo)
 gb_todo = round(sum(r[6] for r in todo), 1)
@@ -515,6 +550,14 @@ PY
     if (n["missing"]) s = s " · " n["missing"] " moved"
     print s}' "$LIST")
   say "models: $N_ALL files in profile $PROFILE · $N_TODO to download ($GB_TODO GB)$PLAN_REST"
+  if [ -s "$GATED_INFO" ]; then   # v5.9: the gated repos of this profile, by name, and what their licence takes
+    while IFS='|' read -r grepo gn gwait gmode; do
+      case "$gmode" in
+        accepted) say "models: gated repo $grepo · $gn file(s) · licence accepted${HF_USER:+ by $HF_USER}" ;;
+        *) say "models: gated repo $grepo · $gn file(s), $gwait waiting · $(mode_text "$gmode") · https://huggingface.co/$grepo" ;;
+      esac
+    done < "$GATED_INFO"
+  fi
   TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
   while IFS='|' read -r repo path dir _ gb k n_todo gb_before gb_todo state; do
     [ -z "$repo" ] && continue

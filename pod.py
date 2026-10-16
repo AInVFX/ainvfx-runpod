@@ -85,7 +85,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -1179,7 +1179,7 @@ def cmd_setup(args):
         cfg["template_id"] = TEMPLATE_ID
     say("   template: {}".format(cfg["template_id"] or "none (the pod is described by this script itself)"))
 
-    say("\n3. Hugging Face token (optional: only the gated LTX files need it, for the video and LoRA sessions).")
+    say("\n3. Hugging Face token (for the gated files of models.json: FLUX 3 Image Klein in the image profile, LTX in video and train).")
     if args.hf_token:
         say("   The token is stored on Runpod as the secret '{}' and never on this machine. Pods created".format(HF_SECRET))
         say("   by `up` receive it as HF_TOKEN. A read token from https://huggingface.co/settings/tokens.")
