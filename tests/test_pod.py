@@ -448,7 +448,7 @@ class Helpers(unittest.TestCase):
                                                    "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
             pod.SETTINGS_LOCAL = pod.Path(d) / "missing.local.env"
             self.assertEqual(pod.load_settings(), {})
-            self.assertEqual(pod.comfy_tag(), "v0.40.0")
+            self.assertEqual(pod.comfy_tag(), "v0.41.2")
         finally:
             pod.SETTINGS, pod.SETTINGS_LOCAL = old, old_local
             shutil.rmtree(d, ignore_errors=True)
@@ -562,7 +562,7 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.parse_profiles("3d+image"), ["image", "3d"])
         self.assertEqual(pod.parse_profiles("image, video,train"), ["image", "video", "train"])
         self.assertEqual(pod.parse_profiles("all"), ["image", "3d", "video", "train"])
-        self.assertEqual(pod.profile_spec(["image"])["disk"], 130)
+        self.assertEqual(pod.profile_spec(["image"])["disk"], 160)
         self.assertEqual(pod.profile_spec(["image"])["gpu"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.profile_spec(["3d"])["disk"], 100, "never under 100 GB")
         self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
@@ -570,7 +570,7 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.profile_spec(["image", "video"])["vram"], 96)
         self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 210)
         spec = pod.profile_spec(["image", "3d", "video", "train"])
-        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 340))
+        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 360))
         with self.assertRaises(SystemExit):
             pod.parse_profiles("nope+3d")
 
@@ -877,8 +877,8 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image+3d", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn("profile image+3d: about 115 GB of models, a 170 GB container disk", out, out)
-        self.assertEqual(STATE["posts"][0].get("disk"), 170, out)
+        self.assertIn("profile image+3d: about 132 GB of models, a 190 GB container disk", out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), 190, out)
         self.assertEqual((STATE["posts"][0].get("env") or {}).get("AINVFX_PROFILE"), "image+3d", out)
         self.assertEqual(STATE["posts"][0]["gpu"]["id"], "NVIDIA GeForce RTX 5090", out)
         self.assertIn("READY", out, out)
@@ -894,7 +894,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
-        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 130 GB disk, billed from creation? [Y/n]", out, out)
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 160 GB disk, billed from creation? [Y/n]", out, out)
         self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertIn("READY", out, out)

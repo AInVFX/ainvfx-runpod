@@ -28,6 +28,8 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.10 (16 Oct 2026): default ComfyUI tag v0.41.2 (templates 0.11.86); the Klein prompt upsampler is the
+# w4a8 file of the 0.11.86 templates (6.72 GB, against 9.75 GB for int8): image profile about 105 GB.
 # v5.9 (16 Oct 2026): the gated repos are named from models.json, never hard-coded: the token lines no longer
 # say LTX; after the plan, one line per gated repo of the profile (files, how many wait, and how its licence
 # is approved, read from the Hugging Face API: at once, or by the authors); ACTION NEEDED says the same per page.
@@ -73,7 +75,7 @@
 #   AINVFX_PROFILE        image (default) · 3d · video · train, one or several joined by + (image+3d), or all:
 #                         which sets of models.json to download (v5.6, 10 Oct 2026: profiles are atomic, so
 #                         video no longer includes image: ask for image+video)
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.41.1; master for the latest)
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.41.2; master for the latest)
 #   AINVFX_PYTHON         the Python version of the environment (default 3.13)
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
 #                         "--pre torch torchvision torchaudio" for nightlies)
@@ -119,7 +121,7 @@ if [ "$MODE" = "models" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.41.1}"
+TAG="${AINVFX_COMFY_TAG:-v0.41.2}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"

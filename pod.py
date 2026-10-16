@@ -6,7 +6,7 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
 
   python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
   python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
-  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 108 GB)
+  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 105 GB)
   python pod.py up image+3d        the image models plus the 3D block (RTX 5090)
   python pod.py up image+video     image plus LTX 2.5 for the video sessions (RTX PRO 6000)
   python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
@@ -85,7 +85,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.8.3"
+VERSION = "0.8.4"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -125,7 +125,7 @@ def load_settings():
 
 
 def comfy_tag():
-    return load_settings().get("AINVFX_COMFY_TAG", "v0.41.1")
+    return load_settings().get("AINVFX_COMFY_TAG", "v0.41.2")
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
