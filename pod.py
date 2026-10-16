@@ -6,11 +6,11 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
 
   python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
   python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
-  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 87 GB)
+  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 108 GB)
   python pod.py up image+3d        the image models plus the 3D block (RTX 5090)
   python pod.py up image+video     image plus LTX 2.5 for the video sessions (RTX PRO 6000)
   python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
-  python pod.py up all             every profile (image, 3d, video, train), about 270 GB of models
+  python pod.py up all             every profile (image, 3d, video, train), about 290 GB of models
   python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
   python pod.py up image --community       also consider Community Cloud (off by default since 0.8.0)
   python pod.py up image --models-url URL  your own models.json for this pod (a raw link, or a Google
@@ -85,7 +85,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -125,7 +125,7 @@ def load_settings():
 
 
 def comfy_tag():
-    return load_settings().get("AINVFX_COMFY_TAG", "v0.40.0")
+    return load_settings().get("AINVFX_COMFY_TAG", "v0.41.1")
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
 COMFY_PORT = 8188
 JUPYTER_PORT = 8888
@@ -343,7 +343,7 @@ class ApiError(Exception):
         if self.code == 402:
             return "Insufficient balance on the Runpod account: add credit, then try again."
         if self.code == 429:
-            return "Too many requests: wait a minute, then try again."
+            return "Too many requests: the Runpod API allows 180 a minute and 3,600 an hour per account; wait a minute, then try again."
         if self.code == 0 and self.timed_out:
             return "The server accepted the request but did not answer in time: a host that is not responding, or a slow link. Try again; `python pod.py status` shows the pod."
         if self.code == 0:
@@ -355,12 +355,31 @@ class ApiError(Exception):
         return "timed out" in (self.detail or "").lower()
 
 
+RATE_RETRIES = 5    # 0.8.2: on a 429 from api.runpod.io, wait Retry-After or 2, 4, 8, 16, 32 s, then give up
+
+
 def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
     """One HTTP request with urllib. Returns parsed JSON, bytes (raw=True), or the open response (stream=True).
     `body` is sent as JSON; `data` as given (bytes), with the Content-Type of `headers`.
     Every network failure, including a timeout while the server prepares its answer, is an ApiError
     with code 0: nothing here raises a bare socket error (a pod on a host that does not respond
-    once made `up` stop with a traceback)."""
+    once made `up` stop with a traceback).
+    Since 0.8.2: a 429 from the Runpod API (api.runpod.io: 180 requests a minute, 3,600 an hour,
+    43,200 a day from 27 Oct 2026) is retried RATE_RETRIES times, after the Retry-After the server gives
+    or an exponential wait; a pod's proxy and Hugging Face are not retried here."""
+    runpod_host = url.startswith(API) or url.startswith(GRAPHQL)
+    for attempt in range(RATE_RETRIES + 1):
+        try:
+            return _request_once(method, url, key, body, timeout, raw, headers, stream, data)
+        except ApiError as e:
+            if e.code != 429 or not runpod_host or attempt == RATE_RETRIES:
+                raise
+            wait = int(e.retry_after) if (e.retry_after or "").isdigit() else 2 ** (attempt + 1)
+            print("   Runpod rate limit (429): waiting {} s, try {} of {}".format(wait, attempt + 2, RATE_RETRIES + 1), flush=True)
+            time.sleep(wait)
+
+
+def _request_once(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
     hdrs = {"Accept": "application/json", "User-Agent": "ainvfx-runpod/" + VERSION}
     if key:
         hdrs["Authorization"] = "Bearer " + key

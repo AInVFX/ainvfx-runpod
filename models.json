@@ -1,5 +1,5 @@
 {
-  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10 and 11 October 2026.",
+  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11 and 15 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -20,7 +20,11 @@
       "qwen_image_2512_fp8",
       "qwen_image_2512_lightning",
       "qwen_360_lora",
-      "qwen_edit_360_lora"
+      "qwen_edit_360_lora",
+      "flux3_klein_distilled_int8",
+      "flux3_klein_text_encoder_int8",
+      "flux3_klein_vae",
+      "flux3_klein_prompt_upsampler"
     ],
     "3d": [
       "trellis_2_int8",
@@ -429,6 +433,34 @@
       "path": "251018_MICKMUMPITZ_QWEN-EDIT_360_03.safetensors",
       "dir": "loras",
       "gb": 0.3
+    },
+    "flux3_klein_distilled_int8": {
+      "repo": "black-forest-labs/flux-3-image-klein-comfy",
+      "path": "diffusion_models/flux3_image_klein_sd_int8_convrot.safetensors",
+      "dir": "diffusion_models",
+      "gb": 5.83,
+      "gated": true
+    },
+    "flux3_klein_text_encoder_int8": {
+      "repo": "black-forest-labs/flux-3-image-klein-comfy",
+      "path": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "dir": "text_encoders",
+      "gb": 4.86,
+      "gated": true
+    },
+    "flux3_klein_vae": {
+      "repo": "black-forest-labs/flux-3-image-klein-comfy",
+      "path": "vae/flux2-vae.safetensors",
+      "dir": "vae",
+      "gb": 0.34,
+      "gated": true
+    },
+    "flux3_klein_prompt_upsampler": {
+      "repo": "black-forest-labs/flux-3-image-klein-comfy",
+      "path": "text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
+      "dir": "text_encoders",
+      "gb": 9.75,
+      "gated": true
     }
   }
 }

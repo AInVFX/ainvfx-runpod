@@ -28,6 +28,8 @@
 # AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
 # bootstrap, fetched and run instead of this one).
 #
+# v5.8 (15 Oct 2026): default ComfyUI tag v0.41.1 (FLUX 3 Image Klein); the image profile gains its four
+# gated Klein files (models.json, 23 files, about 108 GB, the prompt upsampler included).
 # v5.7 (13 Oct 2026): default ComfyUI tag v0.40.0. A share link given as AINVFX_MODELS_URL (Google Drive,
 # Dropbox, a file page on GitHub) becomes a link to the file itself, and a list that is not a models.json
 # (a web page) is refused with one warning instead of an empty plan.
@@ -68,7 +70,7 @@
 #   AINVFX_PROFILE        image (default) · 3d · video · train, one or several joined by + (image+3d), or all:
 #                         which sets of models.json to download (v5.6, 10 Oct 2026: profiles are atomic, so
 #                         video no longer includes image: ask for image+video)
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.40.0; master for the latest)
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.41.1; master for the latest)
 #   AINVFX_PYTHON         the Python version of the environment (default 3.13)
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
 #                         "--pre torch torchvision torchaudio" for nightlies)
@@ -113,7 +115,7 @@ if [ "$MODE" = "models" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.40.0}"
+TAG="${AINVFX_COMFY_TAG:-v0.41.1}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
