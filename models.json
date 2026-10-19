@@ -436,7 +436,7 @@
     },
     "flux3_klein_distilled_int8": {
       "repo": "black-forest-labs/flux-3-image-klein-comfy",
-      "path": "diffusion_models/flux3_image_klein_sd_int8_convrot.safetensors",
+      "path": "diffusion_models/flux3-image-klein-int8-convrot.safetensors",
       "dir": "diffusion_models",
       "gb": 5.83,
       "gated": true
