@@ -12,6 +12,7 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
   python pod.py up all             every profile (image, 3d, video, train), about 290 GB of models
   python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
+  python pod.py up video --gpu B200 --gpu B300 --retry   wait until a B200 or a B300 is free, then create it
   python pod.py up image --community       also consider Community Cloud (off by default since 0.8.0)
   python pod.py up image --models-url URL  your own models.json for this pod (a raw link, or a Google
                                            Drive, Dropbox or GitHub share link)
@@ -52,7 +53,9 @@ Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, 
 names the data center. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
 the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer,
 not a 1g MIG slice), cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own;
---max-price changes that), and prints the command to take another one. Community Cloud (machines owned
+--max-price changes that), and prints the command to take another one. With --retry, `up` waits instead of
+stopping: it reads the catalog again every 15 seconds (AINVFX_RETRY_EVERY) and creates the first GPU free,
+by the same rules, then stops (one pod). Its question comes once, before the wait. Community Cloud (machines owned
 by third parties, cheaper, the host picked by Runpod) is left out unless `--community` is given: on
 9 October 2026 the first pod of the session, a Community RTX 5090, never started. Right after creation
 `up` reads the pod's host: a host with maintenance under way or starting within 24 hours is terminated
@@ -85,7 +88,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.8.4"
+VERSION = "0.9.0"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -256,6 +259,13 @@ SMALL_SLICE = re.compile(r"\bMIG 1g\.", re.I)
 MAX_PRICE = float(os.environ.get("AINVFX_MAX_PRICE", "2.5"))     # USD per hour: the most `up` picks on its own
 MAINT_HOURS = float(os.environ.get("AINVFX_MAINT_HOURS", "24"))  # maintenance starting sooner than this is refused
 HOST_WAIT = int(os.environ.get("AINVFX_HOST_WAIT", "40"))        # seconds to wait for the API to name the host
+# `up --retry` (0.9.0, 19 Oct 2026: each B200 and B300 freed on Secure Cloud was taken within seconds, before
+# a person could run `up` again). Instead of stopping when nothing is free, `up` reads the catalog again every
+# RETRY_EVERY seconds and creates the first GPU free, by the same rules as without --retry, then stops: one
+# pod, never more. One read is one request per cloud: 240 an hour at 15 s, against the 3,600 an hour that
+# Runpod allows from 27 Oct 2026; never under 1 s. A "still waiting" line comes every RETRY_NOTE seconds.
+RETRY_EVERY = max(1, int(os.environ.get("AINVFX_RETRY_EVERY", "15")))
+RETRY_NOTE = int(os.environ.get("AINVFX_RETRY_NOTE", "60"))
 GRAPHQL = os.environ.get("AINVFX_GRAPHQL", "https://api.runpod.io/graphql")   # the test harness points this at a fake
 # The same command as the public template. If GitHub cannot be reached, the pod falls back to
 # Runpod's own /start.sh (SSH and JupyterLab), so the error can be read instead of a restart loop.
@@ -696,7 +706,8 @@ def find_gpu(catalog, ref):
     if len(hits) == 1:
         return hits[0]
     if not hits:
-        die("no GPU type named \"{}\" in the Runpod catalog. `python pod.py up` lists the GPUs in stock.".format(ref))
+        die("no GPU type named \"{}\" in the Runpod catalog. `python pod.py up` lists the GPUs in stock. "
+            "For several GPUs, repeat --gpu: --gpu B200 --gpu B300.".format(ref))
     die("\"{}\" matches several GPU types: {}. Give one of these names to --gpu.".format(
         ref, ", ".join('"{}"'.format(g.get("name") or g["id"]) for g in hits[:12])))
 
@@ -1264,73 +1275,43 @@ def create_pod(cfg, body, where):
     return None
 
 
-def cmd_up(args):
-    cfg = load_config()
-    profiles = parse_profiles(args.profile)
-    profile = "+".join(profiles)              # `image+3d`: the value AINVFX_PROFILE carries
-    api_key(cfg)
-    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile.replace("+", "-")
-    cfg.setdefault("pods", {})
-    old = cfg["pods"].get(tag)
-    if old:
-        try:
-            pod = get_pod(cfg, old["id"])
-            st = pod_status(pod)
-            if st not in FINAL and st != "?":
-                say("A pod already exists as `{}`: {} ({}). Address: {}".format(tag, old.get("name"), st, pod_url(old["id"])))
-                say("Use it, terminate it first (python pod.py down {}), or create another one with `up {} --name <name>`."
-                    .format(tag, profile))
-                return
-        except ApiError as e:
-            if e.code != 404:
-                die("{}\n{}".format(e, e.hint()))
-        remember_pod(cfg, tag, None)
-
-    region = args.region or cfg.get("region") or local_region()
-    country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
-    name = "ainvfx-{}-{}".format(profile.replace("+", "-"), tag if tag != profile.replace("+", "-")
-                                 else datetime.now().strftime("%m%d-%H%M"))
-    env = dict(load_settings())              # settings.env, then settings.local.env: tag, Python, PyTorch, models...
-    for item in (args.set or []):            # `--set KEY=VALUE`, for this pod only
-        key, sep, value = item.partition("=")
-        key, value = key.strip(), value.strip()
-        if not sep or not key.startswith("AINVFX_") or not value:
-            die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
-        env[key] = value
-    if args.models_url:                       # `--models-url URL`, the same as --set AINVFX_MODELS_URL=URL
-        env["AINVFX_MODELS_URL"] = args.models_url.strip()
-    env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
-    if cfg.get("hf_secret") or secret_exists(cfg):
-        env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
-    if not args.selftest:
-        env["AINVFX_SELFTEST"] = "0"
-    spec = profile_spec(profiles, read_models(env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)))  # before any spend
-    disk = args.disk or spec["disk"]
-
-    # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
+def read_catalogs(cfg, community, fatal=True):
+    """The catalog of each cloud `up` considers, as {cloud: GPU types}. When the Secure catalog cannot be read,
+    `up` stops (fatal), or the ApiError goes up to the --retry wait, which reads again at its next try."""
     catalogs = {}
-    for cloud in (("SECURE", "COMMUNITY") if args.community else ("SECURE",)):
+    for cloud in (("SECURE", "COMMUNITY") if community else ("SECURE",)):
         try:
             catalogs[cloud] = read_catalog(cfg, cloud)
         except ApiError as e:
             if cloud == "SECURE":
+                if not fatal:
+                    raise
                 die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
-            say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
-    secure = catalogs.get("SECURE") or []
-    max_price = MAX_PRICE if args.max_price is None else args.max_price
-    if args.gpu:
-        want = find_gpu(secure + (catalogs.get("COMMUNITY") or []), args.gpu)
-    else:
-        want = next((g for g in secure if g["id"] == spec["gpu"]), {"id": spec["gpu"], "name": spec["gpu"]})
-    offers = make_offers(catalogs, region, country)
-    mine = [o for o in offers if o["id"] == want["id"]]
-    preferred = next((o for o in mine if o["cloud"] == "SECURE"), None)
-    fits = [o for o in offers if fits_profile(o, spec["vram"])]
-    wname = str(want.get("name") or want["id"])
+            if fatal:
+                say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
+    return catalogs
 
+
+def pick_candidates(catalogs, wants, named, spec, region, country, max_price):
+    """What `up` may create now, in the order it tries them. With --gpu: the GPUs named, in the order given.
+    Without: the profile's GPU on Secure Cloud, then every GPU that fits the profile at max_price or less,
+    cheapest first. Returns (offers, fits, preferred, candidates)."""
+    offers = make_offers(catalogs, region, country)
+    fits = [o for o in offers if fits_profile(o, spec["vram"])]
+    if named:
+        return offers, fits, None, [o for w in wants for o in offers if o["id"] == w["id"]]
+    preferred = next((o for o in offers if o["id"] == wants[0]["id"] and o["cloud"] == "SECURE"), None)
+    rest = [o for o in fits if o is not preferred and o["price"] <= max_price]
+    return offers, fits, preferred, ([preferred] + rest) if preferred else rest
+
+
+def gpu_report(want, offers, region, community):
+    """Four lines on one GPU type: its availability on Secure Cloud, where it is in stock, its prices."""
+    wname = str(want.get("name") or want["id"])
+    secure = next((o for o in offers if o["id"] == want["id"] and o["cloud"] == "SECURE"), None)
+    dcs = secure["dcs"] if secure else []
     price = want.get("price") or {}
     p_secure, p_comm = price.get("secure"), price.get("community")
-    dcs = preferred["dcs"] if preferred else []
     say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(
         wname, str(want.get("availability", "?")).upper(), MIN_CUDA))
     say("   in stock in {}: {}".format(REGION_NAMES.get(region, region),
@@ -1338,76 +1319,31 @@ def cmd_up(args):
     say("   elsewhere: {}".format(", ".join(d for d in dcs if region_of(d) != region) or "none"))
     say("   price per hour: {} Secure, {} Community{}".format(
         fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?",
-        "" if args.community else " (not considered: add --community)"))
-    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
-    if models_url != DEFAULT_MODELS_URL:
-        say("   models list: {} (your own, not the course's)".format(models_url))
-    for key in sorted(k for k in env if k.startswith("AINVFX_") and k not in ("AINVFX_PROFILE", "AINVFX_MODELS_URL", "AINVFX_SELFTEST")
-                      and read_env_file(SETTINGS).get(k) != env[k]):
-        say("   {}: {} (yours)".format(key, env[key]))
+        "" if community else " (not considered: add --community)"))
 
-    profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
-        spec["vram"], MIN_CUDA)
-    say("   profile {}: about {} GB of models, a {} GB container disk".format(profile, spec["gb"], disk))
-    if args.gpu:
-        candidates = mine                     # the GPU named on the command line, and nothing else
-        if not candidates:
-            say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if not args.community else ""))
-            others = [o for o in fits if o["id"] != want["id"]]
-            if others:
-                say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
-                show_offers(others, None, max_price)
-                say('   To take one:  python pod.py up {} --gpu "{}"'.format(profile, others[0]["name"]))
-            die("nothing created.")
-    elif preferred:
-        say("   tried first: {}".format(dcs[0]))
-        candidates = [preferred] + [o for o in fits if o is not preferred and o["price"] <= max_price]
-    else:
-        say("   No {} is free on Secure Cloud. `up` never creates a pod where the catalog shows no stock:".format(wname))
-        say("   Runpod would then pick any host, and twice that was a host being removed from the platform.")
-        candidates = [o for o in fits if o["price"] <= max_price]
-        if candidates:
-            say("   Replacement: {}.".format(offer_line(candidates[0])))
-        say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
-        if fits:
-            show_offers(fits, candidates[0] if candidates else None, max_price)
-        else:
-            say("   none right now.")
-        if not candidates:
-            if fits:
-                say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
-                    fmt_money(max_price), profile, fits[0]["name"]))
-            die("nothing in stock fits the {} profile at {} per hour or less. Try again in a few minutes.".format(
-                profile, fmt_money(max_price)))
-        other = next((o for o in fits if o["id"] != candidates[0]["id"]), None)
-        if other:
-            say('   To choose another one:  python pod.py up {} --gpu "{}"   (any name from the GPU column)'.format(
-                profile, other["name"]))
-        if not args.community:
-            say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
-                " picked by Runpod and can fail to start, as on 9 October 2026).")
 
-    first = candidates[0]
-    balance, spend = account_money(cfg)
-    if balance is not None:
-        line = "   Your Runpod credit: {}, about {} hours of {} at {} per hour".format(
-            fmt_money(balance), int(balance // first["price"]), first["name"], fmt_money(first["price"]))
-        if spend:
-            line += "; your account already spends {} per hour".format(fmt_money(spend))
-        say(line + ".")
-        if balance < 3 * first["price"]:
-            say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
-    if not args.yes:
-        if len(candidates) > 1:
-            say("   If it is taken in the meantime, `up` tries the next GPUs that fit, cheapest first, up to {} per hour."
-                .format(fmt_money(max(o["price"] for o in candidates))))
-        ans = input("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
-            first["name"], fmt_money(first["price"]), disk)).strip().lower()
-        if ans not in ("", "y", "yes"):
-            say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
-            return
+def retry_cap(wants, named, community, max_price):
+    """The highest price per hour a --retry wait may create at: the dearest GPU named with --gpu, on the clouds
+    considered; without --gpu, max_price or the profile's GPU, whichever costs more. None when unknown."""
+    keys = ("secure", "community") if community else ("secure",)
+    prices = []
+    for w in wants:
+        for k in keys:
+            try:
+                prices.append(float((w.get("price") or {}).get(k)))
+            except (TypeError, ValueError):
+                pass
+    if not named:
+        prices.append(max_price)
+    return max(prices) if prices else None
 
-    created, host = None, None
+
+def try_create(cfg, candidates, name, disk, env):
+    """Create one pod from the candidates, in order: for a Secure offer, every data center the catalog lists
+    with stock; then the next offer. A pod whose host has maintenance under way, or starting within MAINT_HOURS,
+    is terminated at once and the next machine tried. Returns (pod, host, stray): pod is None when no pod could be created; stray
+    lists the refused pods that could not be terminated."""
+    stray = []
     for n, offer in enumerate(candidates):
         if n:
             say("   Next: {}.".format(offer_line(offer)))
@@ -1440,6 +1376,7 @@ def cmd_up(args):
                 except ApiError as e:
                     say("   pod {} COULD NOT BE TERMINATED ({}): run `python pod.py down {}` once this ends."
                         .format(pod["id"], e.detail[:100], pod["id"]))
+                    stray.append(pod["id"])
                 continue
             if machine is None:
                 say("   host check skipped: the GraphQL API did not answer. The log below shows whether the host works.")
@@ -1448,13 +1385,245 @@ def cmd_up(args):
             else:
                 say("   host checked: no maintenance planned{}.".format(
                     " ({})".format(machine["dataCenterId"]) if machine.get("dataCenterId") else ""))
-            created, host = pod, (machine or {})
-            break
-        if created:
-            break
+            return pod, (machine or {}), stray
+    return None, None, stray
+
+
+def stop_on_stray(stray):
+    """A --retry wait never goes on while a refused pod still runs: it would bill next to the next pod."""
+    if stray:
+        die("pod {} could not be terminated, and it bills: `python pod.py down {}` terminates it. "
+            "The wait stops here.".format(", ".join(stray), stray[0]))
+
+
+def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name, disk, env):
+    """`up --retry`: read the catalog every RETRY_EVERY seconds until a candidate is free, then create it: one
+    pod, never more. Returns (pod, host, name). Ctrl+C ends the wait with a message, exit code 130.
+    A wait can last hours, so before each creation the record of `tag` is read again: if another `up` has
+    created a pod under the same name in the meantime, the wait stops instead of creating a second one."""
+    if named:
+        what = " or ".join(str(w.get("name") or w["id"]) for w in wants)
+    else:
+        what = "{}, or any GPU that fits the {} profile at up to {} per hour".format(
+            wants[0].get("name") or wants[0]["id"], spec["label"], fmt_money(max_price))
+    say("\nWaiting on {} for {}. Every {} s, `up` reads the catalog and creates the first one free.".format(
+        "Secure and Community Cloud" if args.community else "Secure Cloud", what, RETRY_EVERY))
+    say("Ctrl+C stops the wait. No pod bills before one is created.")
+
+    def reads(n):
+        return "{} read{}".format(n, "" if n == 1 else "s")
+    started = last_note = time.time()
+    tries, creating, name = 0, False, None
+    try:
+        while True:
+            time.sleep(RETRY_EVERY)
+            tries += 1
+            now = datetime.now().strftime("%H:%M:%S")
+            try:
+                catalogs = read_catalogs(cfg, args.community, fatal=False)
+            except ApiError as e:
+                if e.code in (401, 403):
+                    die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
+                if time.time() - last_note >= RETRY_NOTE:
+                    say("   {}  the catalog could not be read ({}): still waiting".format(now, e.code or e.detail[:80]))
+                    last_note = time.time()
+                continue
+            candidates = pick_candidates(catalogs, wants, named, spec, region, country, max_price)[3]
+            if not candidates:
+                if time.time() - last_note >= RETRY_NOTE:
+                    say("   {}  still waiting: {} in {}, none free".format(
+                        now, reads(tries), fmt_duration((time.time() - started) / 3600)))
+                    last_note = time.time()
+                continue
+            first = candidates[0]
+            say("   {}  {} free on {} Cloud ({}): creating it".format(now, first["name"], first["cloud"].title(), offer_where(first)))
+            rec = (load_config().get("pods") or {}).get(tag)
+            if rec:
+                die("a pod was recorded as `{}` while this wait ran, by another command on this machine: {} ({}). "
+                    "The wait stops here, so that two pods do not bill. `python pod.py list` shows your pods.".format(
+                        tag, rec.get("name"), rec.get("id")))
+            name = make_name()
+            creating = True
+            pod, host, stray = try_create(cfg, candidates, name, disk, env)
+            creating = False
+            if pod:
+                say("   The wait took {} ({}).".format(fmt_duration((time.time() - started) / 3600), reads(tries)))
+                return pod, host, name
+            stop_on_stray(stray)
+            say("   {}  taken in the meantime: still waiting".format(datetime.now().strftime("%H:%M:%S")))
+            last_note = time.time()
+    except KeyboardInterrupt:
+        if creating:
+            say("\nStopped during a creation request: `python pod.py list` shows whether pod {0} exists, and "
+                "`python pod.py down {0}` terminates it.".format(name))
+        else:
+            say("\nStopped waiting after {}: this wait created no pod.".format(reads(tries)))
+        sys.exit(130)
+
+
+def cmd_up(args):
+    cfg = load_config()
+    profiles = parse_profiles(args.profile)
+    profile = "+".join(profiles)              # `image+3d`: the value AINVFX_PROFILE carries
+    api_key(cfg)
+    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile.replace("+", "-")
+    cfg.setdefault("pods", {})
+    old = cfg["pods"].get(tag)
+    if old:
+        try:
+            pod = get_pod(cfg, old["id"])
+            st = pod_status(pod)
+            if st not in FINAL and st != "?":
+                say("A pod already exists as `{}`: {} ({}). Address: {}".format(tag, old.get("name"), st, pod_url(old["id"])))
+                say("Use it, terminate it first (python pod.py down {}), or create another one with `up {} --name <name>`."
+                    .format(tag, profile))
+                return
+        except ApiError as e:
+            if e.code != 404:
+                die("{}\n{}".format(e, e.hint()))
+        remember_pod(cfg, tag, None)
+
+    region = args.region or cfg.get("region") or local_region()
+    country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
+    def make_name():                          # called at creation: after a --retry wait, the name has the creation's time
+        return "ainvfx-{}-{}".format(profile.replace("+", "-"), tag if tag != profile.replace("+", "-")
+                                     else datetime.now().strftime("%m%d-%H%M"))
+    env = dict(load_settings())              # settings.env, then settings.local.env: tag, Python, PyTorch, models...
+    for item in (args.set or []):            # `--set KEY=VALUE`, for this pod only
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key.startswith("AINVFX_") or not value:
+            die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
+        env[key] = value
+    if args.models_url:                       # `--models-url URL`, the same as --set AINVFX_MODELS_URL=URL
+        env["AINVFX_MODELS_URL"] = args.models_url.strip()
+    env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
+    if cfg.get("hf_secret") or secret_exists(cfg):
+        env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
+    if not args.selftest:
+        env["AINVFX_SELFTEST"] = "0"
+    spec = profile_spec(profiles, read_models(env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)))  # before any spend
+    disk = args.disk or spec["disk"]
+
+    # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
+    catalogs = read_catalogs(cfg, args.community)
+    secure = catalogs.get("SECURE") or []
+    max_price = MAX_PRICE if args.max_price is None else args.max_price
+    named = bool(args.gpu)
+    if named:                                 # `--gpu B200 --gpu B300`: those GPUs only, in that order
+        wants = []
+        for ref in args.gpu:
+            g = find_gpu(secure + (catalogs.get("COMMUNITY") or []), ref)
+            if all(g["id"] != w["id"] for w in wants):
+                wants.append(g)
+    else:
+        wants = [next((g for g in secure if g["id"] == spec["gpu"]), {"id": spec["gpu"], "name": spec["gpu"]})]
+    offers, fits, preferred, candidates = pick_candidates(catalogs, wants, named, spec, region, country, max_price)
+    wname = " or ".join(str(w.get("name") or w["id"]) for w in wants)
+
+    for want in wants:
+        gpu_report(want, offers, region, args.community)
+    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
+    if models_url != DEFAULT_MODELS_URL:
+        say("   models list: {} (your own, not the course's)".format(models_url))
+    for key in sorted(k for k in env if k.startswith("AINVFX_") and k not in ("AINVFX_PROFILE", "AINVFX_MODELS_URL", "AINVFX_SELFTEST")
+                      and read_env_file(SETTINGS).get(k) != env[k]):
+        say("   {}: {} (yours)".format(key, env[key]))
+
+    profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
+        spec["vram"], MIN_CUDA)
+    say("   profile {}: about {} GB of models, a {} GB container disk".format(profile, spec["gb"], disk))
+    if named:                                 # the GPUs named on the command line, and nothing else
+        if not candidates:
+            say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if not args.community else ""))
+            others = [o for o in fits if all(o["id"] != w["id"] for w in wants)]
+            if others:
+                say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
+                show_offers(others, None, max_price)
+                say('   To take one:  python pod.py up {} --gpu "{}"'.format(profile, others[0]["name"]))
+            if not args.retry:
+                die("nothing created.")
+    elif preferred:
+        say("   tried first: {}".format(preferred["dcs"][0]))
+    else:
+        say("   No {} is free on Secure Cloud. `up` never creates a pod where the catalog shows no stock:".format(wname))
+        say("   Runpod would then pick any host, and twice that was a host being removed from the platform.")
+        if candidates:
+            say("   Replacement: {}.".format(offer_line(candidates[0])))
+        say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
+        if fits:
+            show_offers(fits, candidates[0] if candidates else None, max_price)
+        else:
+            say("   none right now.")
+        if not candidates:
+            if fits:
+                say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
+                    fmt_money(max_price), profile, fits[0]["name"]))
+            if not args.retry:
+                die("nothing in stock fits the {} profile at {} per hour or less. Try again in a few minutes.".format(
+                    profile, fmt_money(max_price)))
+        else:
+            other = next((o for o in fits if o["id"] != candidates[0]["id"]), None)
+            if other:
+                say('   To choose another one:  python pod.py up {} --gpu "{}"   (any name from the GPU column)'.format(
+                    profile, other["name"]))
+        if not args.community:
+            say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
+                " picked by Runpod and can fail to start, as on 9 October 2026).")
+
+    balance, spend = account_money(cfg)
+    cap = retry_cap(wants, named, args.community, max_price) if args.retry else None
+    created, host = None, None
+    if candidates:
+        first = candidates[0]
+        if balance is not None:
+            line = "   Your Runpod credit: {}, about {} hours of {} at {} per hour".format(
+                fmt_money(balance), int(balance // first["price"]), first["name"], fmt_money(first["price"]))
+            if spend:
+                line += "; your account already spends {} per hour".format(fmt_money(spend))
+            say(line + ".")
+            if balance < 3 * first["price"]:
+                say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
+        if not args.yes:
+            if len(candidates) > 1:
+                say("   If it is taken in the meantime, `up` tries {}, up to {} per hour.".format(
+                    "the next GPU named, in the order given" if len(wants) > 1 else "the next GPUs that fit, cheapest first",
+                    fmt_money(max(o["price"] for o in candidates))))
+            if args.retry:
+                say("   With --retry: if none can be created now, `up` reads the catalog every {} s and creates the first "
+                    "one free{}, without asking again.".format(RETRY_EVERY, ", at up to {} per hour".format(fmt_money(cap)) if cap else ""))
+            ans = input("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
+                first["name"], fmt_money(first["price"]), disk)).strip().lower()
+            if ans not in ("", "y", "yes"):
+                say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
+                return
+        name = make_name()
+        created, host, stray = try_create(cfg, candidates, name, disk, env)
+        if not created:
+            if not args.retry:
+                die("no pod could be created: the machines in stock were taken in the meantime, or under maintenance.\n"
+                    "Try again in a minute: `python pod.py up {}` reads the stock again.".format(profile))
+            stop_on_stray(stray)
+            say("   None could be created now: waiting, as --retry asks.")
+    else:                                     # --retry and nothing free: one question, before the wait
+        if balance is not None and cap:
+            line = "   Your Runpod credit: {}, about {} hours at {} per hour, the highest price this wait accepts".format(
+                fmt_money(balance), int(balance // cap), fmt_money(cap))
+            if spend:
+                line += "; your account already spends {} per hour".format(fmt_money(spend))
+            say(line + ".")
+            if balance < 3 * cap:
+                say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
+        if not args.yes:
+            ans = input("   Wait, then create the first {} free ({}a {} GB disk, billed from creation)? [Y/n] ".format(
+                wname if named else "GPU that fits", "up to {} per hour, ".format(fmt_money(cap)) if cap else "",
+                disk)).strip().lower()
+            if ans not in ("", "y", "yes"):
+                say("Nothing created.")
+                return
     if not created:
-        die("no pod could be created: the machines in stock were taken in the meantime, or under maintenance.\n"
-            "Try again in a minute: `python pod.py up {}` reads the stock again.".format(profile))
+        created, host, name = wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name,
+                                             disk, env)
 
     pod_id = created["id"]
     created_at = datetime.now(timezone.utc)
@@ -1786,8 +1955,9 @@ def main():
                         "image+video, video+train), or all (default image)")
     p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`); "
                                   "the other commands then take that name")
-    p.add_argument("--gpu", help='a GPU from the list `up` shows, by its name ("RTX PRO 4500 SE") or its full id; '
-                                 "only that GPU is tried")
+    p.add_argument("--gpu", action="append", metavar="NAME",
+                   help='a GPU from the list `up` shows, by its name ("RTX PRO 4500 SE") or its full id; only that GPU '
+                        "is tried. Repeat it to accept several, tried in the order given: --gpu B200 --gpu B300")
     p.add_argument("--max-price", type=float, help="the most per hour `up` takes on its own when the profile's GPU "
                                                    "has no stock (default {:.2f} USD)".format(MAX_PRICE))
     p.add_argument("--disk", type=int, help="container disk in GB")
@@ -1802,6 +1972,10 @@ def main():
                    help="your own models.json for this pod: a raw link, or a Google Drive, Dropbox or GitHub share link "
                         "(the same as --set AINVFX_MODELS_URL=URL)")
     p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
+    p.add_argument("--retry", action="store_true",
+                   help="when nothing is free, read the catalog again every {} s (AINVFX_RETRY_EVERY) and create the "
+                        "first GPU free, by the same rules: one pod. The question comes once, before the wait (-y skips "
+                        "it); Ctrl+C stops the wait".format(RETRY_EVERY))
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
     p.set_defaults(func=cmd_up)

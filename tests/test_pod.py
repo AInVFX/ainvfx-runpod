@@ -23,9 +23,15 @@ summary, a container that does not start (the stall warning), and a log route th
 must stop there, say what to do, and exit non-zero. Then what 7 October 2026 taught: no RTX 5090 on
 Secure Cloud (the GPUs in stock that fit are listed, the cheapest is created in its own data center,
 never a pod without stock), a host under maintenance (terminated at once, the next GPU tried), and
---gpu by short name. The fake also answers GET /v2/catalog/gpus and the GraphQL host query.
+--gpu by short name. Then what 19 October 2026 taught (each B200 and B300 freed was taken within seconds):
+several GPUs named with --gpu, tried in the order given, and `up --retry`, which reads the catalog again until
+a GPU is free, creates one pod, goes on when the machine is taken in the meantime, keeps the price ceiling,
+asks its question once, and stops on Ctrl+C. The fake also answers GET /v2/catalog/gpus (and counts the Secure
+reads, so a GPU can come into stock at a given read) and the GraphQL host query. A client that closes a
+connection while the fake still writes is normal here (pod.py closes its log stream on purpose, every few
+seconds and on READY; the slow route's client gives up after 1 s): the fake server stays quiet about it.
 """
-import json, os, re, shutil, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
+import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -87,15 +93,33 @@ NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
          "no_5090": False, "maint_dcs": set(), "maint_community": False, "graphql_down": False,
          "full_dcs": set(), "pro6000_dcs": None, "balance": 212.40,
+         "catalog_reads": 0,      # GET /v2/catalog/gpus on Secure Cloud so far (pod.py 0.9.0, --retry)
+         "schedule": {},          # GPU id -> [(first read, data centers with stock), ...]: see stock_now()
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
+
+
+def stock_now(gid, default):
+    """The Secure data centers with stock for one GPU type at this catalog read. STATE["schedule"] maps a GPU id
+    to [(first read, data centers), ...]: the last step reached wins, so a GPU can come into stock, or move,
+    while `up --retry` waits. A GPU type not in it keeps its usual stock."""
+    plan = STATE.get("schedule", {}).get(gid)
+    if plan is None:
+        return default
+    dcs = ()
+    for first_read, step in plan:
+        if STATE["catalog_reads"] >= first_read:
+            dcs = step
+    return tuple((d, "LOW") for d in dcs)
 
 
 def fake_catalog(cloud):
     """GET /v2/catalog/gpus for one cloud, in the shape read from Runpod on 7 October 2026: Secure stock
     lists its data centers, Community stock comes with none. STATE["no_5090"] reproduces that morning:
-    no RTX 5090 on Secure Cloud anywhere, some on Community."""
+    no RTX 5090 on Secure Cloud anywhere, some on Community. The B200 (prices of 19 October 2026) has no
+    stock unless STATE["schedule"] gives it some."""
     def gpu(gid, name, mem, p_secure, p_comm, secure_dcs=(), community=False):
+        secure_dcs = stock_now(gid, secure_dcs)
         e = {"id": gid, "name": name, "memory": mem, "manufacturer": "NVIDIA",
              "price": {"secure": p_secure, "community": p_comm}}
         if cloud == "SECURE":
@@ -116,6 +140,7 @@ def fake_catalog(cloud):
         gpu("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000", 96, 2.49, 1.69,
             STATE.get("pro6000_dcs") or (("US-NC-2", "LOW"), ("CA-MTL-1", "LOW"), ("EU-CZ-1", "LOW"))),
         gpu("NVIDIA B300 SXM6 AC", "B300", 288, 7.89, 6.94, (("EU-NL-1", "LOW"),)),
+        gpu("NVIDIA B200", "B200", 180, 7.99, 5.98),
     ]
 
 
@@ -153,6 +178,17 @@ def pod_of(path):
         if "/" + pid in path:
             return pid, pod
     return None, None
+
+
+class QuietServer(ThreadingHTTPServer):
+    """The fake server. socketserver prints a traceback for any error in a request thread; a connection that
+    the client closed while the fake still wrote (BrokenPipeError, or ConnectionResetError when the client's
+    side has already reset it: seen with Python 3.14 on Ubuntu, 16 and 19 Oct 2026) is normal here, not a
+    failure, so it prints nothing. Every other error still prints its traceback."""
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
 
 def ts_of(sec):
@@ -213,7 +249,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.problem(404, "pod not found")
             return self.send_json(200, self.view_of(pod))
         if p == "/v2/catalog/gpus":
-            return self.send_json(200, {"gpus": fake_catalog(q.get("cloud", ["SECURE"])[0])})
+            cloud = q.get("cloud", ["SECURE"])[0]
+            if cloud == "SECURE":
+                STATE["catalog_reads"] += 1
+            return self.send_json(200, {"gpus": fake_catalog(cloud)})
         if p.startswith("/v2/catalog/gpus/"):
             return self.send_json(200, {
                 "id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "availability": "LOW",
@@ -338,14 +377,14 @@ class Handler(BaseHTTPRequestHandler):
                 ev = "id: {}\ndata: {}\n\n".format(ts_of(s), json.dumps({"ts": ts_of(s), "source": src, "line": line}))
                 try:
                     self.wfile.write(ev.encode()); self.wfile.flush()
-                except BrokenPipeError:
+                except ConnectionError:            # the client closed the stream: pod.py does it on purpose
                     return
                 idx += 1
             if time.time() - last_keepalive > 1:   # keepalives defeat an idle timeout
                 last_keepalive = time.time()
                 try:
                     self.wfile.write(b": keepalive\n\n"); self.wfile.flush()
-                except BrokenPipeError:
+                except ConnectionError:
                     return
             time.sleep(0.1)
 
@@ -539,6 +578,32 @@ class Helpers(unittest.TestCase):
         with self.assertRaises(SystemExit):
             pod.find_gpu(both, "GTX 1080")           # none
 
+    def test_several_gpus_named_and_the_retry_ceiling(self):
+        """0.9.0: `--gpu B300 --gpu B200` tries the B300 first, although the B200 costs less: the order given wins.
+        Without --gpu, nothing above max_price follows the profile's GPU. The price ceiling of a --retry wait is
+        the dearest GPU named, or max_price without --gpu."""
+        cat = {"SECURE": [
+            {"id": "NVIDIA B200", "name": "B200", "memory": 180, "price": {"secure": 7.99, "community": 5.98},
+             "availability": "LOW", "dataCenters": [{"id": "US-TX-3", "availability": "LOW"}]},
+            {"id": "NVIDIA B300 SXM6 AC", "name": "B300", "memory": 288, "price": {"secure": 8.99, "community": 6.94},
+             "availability": "LOW", "dataCenters": [{"id": "EU-NL-1", "availability": "LOW"}]},
+            {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "name": "RTX PRO 6000", "memory": 96,
+             "price": {"secure": 2.49, "community": 1.69}, "availability": "LOW",
+             "dataCenters": [{"id": "US-NC-1", "availability": "LOW"}]}]}
+        b200, b300, pro = cat["SECURE"]
+        spec = {"vram": 96, "gpu": pro["id"]}
+        cands = pod.pick_candidates(cat, [b300, b200], True, spec, "NA", "CA", 2.5)[3]
+        self.assertEqual([o["name"] for o in cands], ["B300", "B200"])
+        offers, fits, preferred, cands = pod.pick_candidates(cat, [pro], False, spec, "NA", "CA", 2.5)
+        self.assertEqual(preferred["name"], "RTX PRO 6000")
+        self.assertEqual([o["name"] for o in cands], ["RTX PRO 6000"], "the B200 and the B300 cost more than 2.50 USD")
+        self.assertEqual([o["name"] for o in fits], ["RTX PRO 6000", "B200", "B300"])
+        self.assertEqual(pod.retry_cap([b200, b300], True, False, 2.5), 8.99)
+        self.assertEqual(pod.retry_cap([b200], True, True, 2.5), 7.99, "Community is cheaper: the ceiling stays the Secure price")
+        self.assertEqual(pod.retry_cap([pro], False, False, 2.5), 2.5)
+        self.assertEqual(pod.retry_cap([pro], False, False, 2.0), 2.49, "the profile's GPU is taken above max_price")
+        self.assertIsNone(pod.retry_cap([{"id": "x", "name": "x"}], True, False, 2.5))
+
     def test_two_commands_keep_each_others_pods(self):
         """Two `up` started at once from one machine (7 Oct 2026): both records must survive."""
         d = tempfile.mkdtemp(prefix="ainvfx-cfg-")
@@ -584,7 +649,7 @@ class Helpers(unittest.TestCase):
 class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.server = QuietServer(("127.0.0.1", 0), Handler)
         cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
 
@@ -596,7 +661,7 @@ class EndToEnd(unittest.TestCase):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
-                      "balance": 212.40, "files": {}})
+                      "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {}})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -787,7 +852,8 @@ class EndToEnd(unittest.TestCase):
         settings.env key by key and survives `git pull`; `--models-url` and `--set` replace a value for
         one pod; a `--set` without an AINVFX_ key creates nothing."""
         self.run_pod("setup", "-y")
-        course = open(os.path.join(os.path.dirname(POD_PY), "models.json"), "rb").read()
+        with open(os.path.join(os.path.dirname(POD_PY), "models.json"), "rb") as f:
+            course = f.read()
         STATE["files"].update({"/files/mine/models.json": course, "/files/gist/models.json": course})
         mine = "http://127.0.0.1:{}/files/mine/models.json".format(self.port)
         with open(os.path.join(self.home, "settings.local.env"), "w", encoding="utf-8") as f:
@@ -829,7 +895,8 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(pod.direct_url("https://www.dropbox.com/scl/fi/abc/models.json?rlkey=x&dl=0"),
                          "https://www.dropbox.com/scl/fi/abc/models.json?rlkey=x&dl=1")
         self.assertEqual(pod.direct_url(pod.DEFAULT_MODELS_URL), pod.DEFAULT_MODELS_URL)
-        lst = json.load(open(os.path.join(os.path.dirname(POD_PY), "models.json"), encoding="utf-8"))
+        with open(os.path.join(os.path.dirname(POD_PY), "models.json"), encoding="utf-8") as f:
+            lst = json.load(f)
         lst["profiles"]["image"] = ["z_image_turbo", "z_image_turbo_text_encoder", "z_image_vae", "z_image_full"]
         STATE["files"].update({"/files/zimage.json": json.dumps(lst).encode(),
                                "/files/page.html": b"<!DOCTYPE html><html><body>Google Drive</body></html>"})
@@ -978,6 +1045,171 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn("[AINVFX] READY", out, out)
         self.assertNotEqual(rc, 0, out)
         self.run_pod("down", "-y")
+
+    def test_several_gpus_named(self):
+        """0.9.0: `--gpu B200 --gpu B300` tries those two only, in the order given. With neither in stock, nothing
+        is created; with the B300 alone in stock, the B300 is. One --gpu holding two names is refused with a hint."""
+        STATE["schedule"] = {"NVIDIA B300 SXM6 AC": [(0, ())]}
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--gpu", "B200", "--gpu", "b300", "-y", "--wait", "1", timeout=60)
+        self.assertNotIn("Traceback", out, out)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("B200: availability NONE on Secure Cloud", out, out)
+        self.assertIn("B300: availability NONE on Secure Cloud", out, out)
+        self.assertIn("price per hour: 7.99 USD Secure, 5.98 USD Community", out, out)
+        self.assertIn("No B200 or B300 in stock right now on Secure Cloud.", out, out)
+        self.assertIn('To take one:  python pod.py up video --gpu "RTX PRO 6000"', out, out)
+        self.assertIn("ERROR: nothing created.", out, out)
+        self.assertEqual(STATE["posts"], [], out)
+        STATE["schedule"] = {}
+        out, rc = self.run_pod("up", "video", "--gpu", "B200", "--gpu", "B300", "-y", "--wait", "1", timeout=90)
+        self.assertEqual([(p["gpu"]["id"], p.get("dataCenterIds")) for p in STATE["posts"]],
+                         [("NVIDIA B300 SXM6 AC", ["EU-NL-1"])], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+        out, rc = self.run_pod("up", "video", "--gpu", "B200 B300", "-y")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("For several GPUs, repeat --gpu: --gpu B200 --gpu B300.", out, out)
+        self.assertEqual(len(STATE["posts"]), 1, out)
+
+    def test_retry_waits_until_a_named_gpu_is_free(self):
+        """19 Oct 2026: no B200 and no B300 on Secure Cloud. `up --gpu B200 --gpu B300 --retry` asks once, before
+        the wait, then reads the catalog again until the B200 comes into stock (at the fourth read here), and
+        creates it there: one pod, then the usual follow until READY."""
+        STATE["schedule"] = {"NVIDIA B300 SXM6 AC": [(0, ())], "NVIDIA B200": [(4, ("US-TX-3",))]}
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--gpu", "B200", "--gpu", "B300", "--retry", "--wait", "1",
+                               input="y\n", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertNotIn("ERROR", out, out)
+        self.assertIn("No B200 or B300 in stock right now on Secure Cloud.", out, out)
+        self.assertIn("Your Runpod credit: 212.40 USD, about 26 hours at 7.99 USD per hour, the highest price this "
+                      "wait accepts.", out, out)
+        self.assertRegex(out, r"Wait, then create the first B200 or B300 free \(up to 7\.99 USD per hour, a \d+ GB disk, "
+                              r"billed from creation\)\? \[Y/n\]")
+        self.assertEqual(out.count("[Y/n]"), 1, "one question, before the wait")
+        self.assertIn("Waiting on Secure Cloud for B200 or B300. Every 1 s, `up` reads the catalog and creates the "
+                      "first one free.", out, out)
+        self.assertIn("still waiting: 1 read in under a minute, none free", out, out)
+        self.assertIn("B200 free on Secure Cloud (US-TX-3): creating it", out, out)
+        self.assertIn("The wait took under a minute (3 reads).", out, out)
+        self.assertEqual([(p["gpu"]["id"], p.get("dataCenterIds")) for p in STATE["posts"]],
+                         [("NVIDIA B200", ["US-TX-3"])], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_retry_goes_on_when_the_machine_is_taken_in_the_meantime(self):
+        """A B200 shows in the catalog, but its machine is gone by the time `up` asks for it (the 400 of
+        19 Oct 2026: There are no longer any instances available): the wait goes on, and the next free
+        machine is created. One pod, never more."""
+        STATE["schedule"] = {"NVIDIA B200": [(3, ("US-GA-1",)), (5, ("US-TX-3",))]}
+        STATE["full_dcs"] = {"US-GA-1"}
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--gpu", "B200", "--retry", "-y", "--wait", "1", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertNotIn("[Y/n]", out, "-y: no question at all")
+        self.assertIn("SECURE US-GA-1: no machine (400", out, out)
+        self.assertIn("taken in the meantime: still waiting", out, out)
+        self.assertEqual([p.get("dataCenterIds") for p in STATE["posts"]], [["US-GA-1"], ["US-GA-1"], ["US-TX-3"]], out)
+        self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [False], "one pod, never more")
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_retry_without_gpu_keeps_the_price_ceiling(self):
+        """`up video --retry` with no RTX PRO 6000 free and a B300 in stock at 7.89 USD per hour: the B300 is
+        never created, since `up` takes nothing above 2.50 USD per hour on its own. The RTX PRO 6000 is, once it
+        comes back (the third read here)."""
+        STATE["schedule"] = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": [(3, ("US-NC-2",))]}
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--retry", "-y", "--wait", "1", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn('To take one above 2.50 USD per hour:  python pod.py up video --gpu "B300"', out, out)
+        self.assertIn("Waiting on Secure Cloud for RTX PRO 6000, or any GPU that fits the video profile at up to "
+                      "2.50 USD per hour.", out, out)
+        self.assertIn("RTX PRO 6000 free on Secure Cloud (US-NC-2): creating it", out, out)
+        self.assertEqual([p["gpu"]["id"] for p in STATE["posts"]], ["NVIDIA RTX PRO 6000 Blackwell Server Edition"], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_retry_after_a_failed_first_attempt_asks_no_second_question(self):
+        """The RTX PRO 6000 is in stock at the first read, but each machine is taken before `up` asks for it.
+        With --retry, the one question is the usual one, with a line on what --retry will do; the wait that
+        follows creates the pod without asking again."""
+        full = ("US-NC-2", "CA-MTL-1", "EU-CZ-1")
+        STATE["schedule"] = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": [(0, full), (3, ("US-TX-3",))]}
+        STATE["full_dcs"] = set(full)
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--retry", "--wait", "1", input="y\n", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("With --retry: if none can be created now, `up` reads the catalog every 1 s and creates the first "
+                      "one free, at up to 2.50 USD per hour, without asking again.", out, out)
+        self.assertIn("Create a RTX PRO 6000 at 2.49 USD per hour", out, out)
+        self.assertEqual(out.count("[Y/n]"), 1, out)
+        self.assertIn("None could be created now: waiting, as --retry asks.", out, out)
+        self.assertEqual(len(STATE["posts"]), 7, "three full data centers twice, then US-TX-3")
+        self.assertEqual(STATE["posts"][-1].get("dataCenterIds"), ["US-TX-3"], out)
+        self.assertEqual([p["deleted"] for p in STATE["pods"].values()], [False], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+
+    def test_retry_asks_once_and_no_means_nothing(self):
+        STATE["schedule"] = {"NVIDIA B300 SXM6 AC": [(0, ())]}
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--gpu", "B200", "--retry", input="n\n", timeout=60)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("Wait, then create the first B200 free (up to 7.99 USD per hour", out, out)
+        self.assertIn("Nothing created.", out, out)
+        self.assertNotIn("Waiting on", out, out)
+        self.assertEqual(STATE["posts"], [], out)
+        self.assertEqual(rc, 0, out)
+
+    def test_retry_stops_when_another_up_takes_the_name(self):
+        """A wait can last hours. When another `up` creates a pod under the same name in the meantime (here
+        `up video --gpu "RTX PRO 6000"` in a second terminal), the wait stops when its GPU comes into stock,
+        instead of creating a second pod that would bill unnoticed."""
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        waiting = subprocess.Popen([sys.executable, POD_PY, "up", "video", "--gpu", "B200", "--retry", "-y", "--wait", "1"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env)
+        deadline = time.time() + 60
+        while STATE["catalog_reads"] < 2 and time.time() < deadline:
+            time.sleep(0.1)
+        out, rc = self.run_pod("up", "video", "--gpu", "RTX PRO 6000", "-y", "--wait", "1", timeout=90)
+        self.assertIn("READY", out, out)
+        STATE["schedule"] = {"NVIDIA B200": [(0, ("US-TX-3",))]}
+        out, _ = waiting.communicate(timeout=60)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("a pod was recorded as `video` while this wait ran", out, out)
+        self.assertNotEqual(waiting.returncode, 0, out)
+        self.assertEqual([p["gpu"]["id"] for p in STATE["posts"]], ["NVIDIA RTX PRO 6000 Blackwell Server Edition"], out)
+        self.run_pod("down", "-y")
+
+    @unittest.skipIf(os.name == "nt", "Ctrl+C reaches the process as SIGINT on Linux and macOS only")
+    def test_retry_stops_on_ctrl_c(self):
+        """Ctrl+C during the wait: a message, exit code 130, no pod."""
+        self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
+        self.run_pod("setup", "-y")
+        proc = subprocess.Popen([sys.executable, POD_PY, "up", "video", "--gpu", "B200", "--retry", "-y"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env)
+        deadline = time.time() + 60
+        while STATE["catalog_reads"] < 3 and time.time() < deadline:
+            time.sleep(0.1)
+        proc.send_signal(signal.SIGINT)
+        out, _ = proc.communicate(timeout=30)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("Stopped waiting after", out, out)
+        self.assertIn("this wait created no pod.", out, out)
+        self.assertEqual(proc.returncode, 130, out)
+        self.assertEqual(STATE["posts"], [], out)
 
 
 if __name__ == "__main__":
