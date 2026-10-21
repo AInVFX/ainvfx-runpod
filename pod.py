@@ -21,7 +21,7 @@ Nothing but the Runpod API key is stored on this machine, in a file only your ac
   python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
   python pod.py open [pod]         open ComfyUI in your browser
   python pod.py push [pod] FILES...   copy images or videos into the pod's input folder
-  python pod.py pull [pod]         download the pod's outputs into outputs/<pod name>/
+  python pod.py pull [pod]         download every file of the pod's output folder into outputs/<pod name>/
   python pod.py down [pod]         pull, terminate (billing stops), then what it cost and the credit left; `--all`
   python pod.py ssh [pod]          a terminal on the pod
   python pod.py list               every pod of your account, with its hourly price
@@ -88,7 +88,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.9.2"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -1785,43 +1785,185 @@ def cmd_pull(args):
     say("{} file(s) new in {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
 
 
+# 0.9.2 (22 Oct 2026, after BTC2 session 6): `pull`, and so `down`, brought back only the files that ComfyUI's history
+# reports under five keys (images, gifs, videos, audio, files). ComfyUI reports every 3D save under "3d" (Save 3D
+# Model, Save 3D (Advanced), Save Splat, Save Point Cloud: comfy_api/latest/_ui.py, Saved3DModels, v0.42.1), so the
+# session's GLB files were terminated with their pods. Two sources now, joined:
+#  1. the whole output folder, walked through JupyterLab's contents API with the token of the bootstrap's READY line
+#     (Runpod starts JupyterLab with --ServerApp.root_dir=/ and JUPYTER_PASSWORD as its token: runpod/containers,
+#     container-template/start.sh, 4456421): it also finds what a node saves without reporting it (Save Checkpoint, a
+#     trained LoRA) and what was made before a ComfyUI restart, since the history lives in memory;
+#  2. ComfyUI's history, every key, through /view: the fallback when JupyterLab is off.
+# ComfyUI itself has no recursive listing: /internal/files/output lists the top folder only and is meant for its own
+# frontend (api_server/routes/internal/internal_routes.py).
+OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root (/, or /workspace)
+SKIP_NAMES = {"_output_images_will_be_put_here"}                # the empty placeholder ComfyUI creates
+
+
+def history_files(history):
+    """(subfolder, filename) of every file ComfyUI's history reports in the output folder, whatever the key: images,
+    gifs, videos, audio, 3d, files, or a key a custom node invents. Entries of the temp and input folders are left out."""
+    found = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            if isinstance(v.get("filename"), str) and v.get("type") in (None, "output"):
+                found.append((v.get("subfolder") or "", v["filename"]))
+                return
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+
+    for entry in (history or {}).values():
+        if isinstance(entry, dict):
+            walk(entry.get("outputs") or {})
+    seen, out = set(), []
+    for item in found:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def jupyter_token(lines):
+    """The JupyterLab token of the bootstrap's READY line (`.../lab?token=...`), or None."""
+    for line in reversed(lines or []):
+        m = re.search(r"/lab\?token=([^\s·]+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def safe_rel(rel):
+    """A relative path inside the output folder, with / separators, or None for anything that could leave it."""
+    parts = [x for x in (rel or "").replace("\\", "/").split("/") if x not in ("", ".")]
+    if not parts or any(x == ".." for x in parts) or rel.startswith("/") or ":" in parts[0]:
+        return None
+    return "/".join(parts)
+
+
+def jupyter_files(pod_id, token):
+    """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab's contents
+    API; (None, []) when JupyterLab does not answer or has no output folder."""
+    base = pod_url(pod_id, JUPYTER_PORT)
+    hdrs = {"Authorization": "token " + token}
+
+    def listing(path):
+        return request("GET", base + "/api/contents/" + urllib.parse.quote(path) + "?content=1", headers=hdrs, timeout=60)
+
+    for root in OUTPUT_DIRS:
+        try:
+            top = listing(root)
+        except ApiError:
+            continue
+        if top.get("type") != "directory":
+            continue
+        files, todo = [], [top]
+        while todo:
+            folder = todo.pop()
+            for e in folder.get("content") or []:
+                name, path = e.get("name") or "", e.get("path") or ""
+                if name.startswith(".") or name in SKIP_NAMES or not path.startswith(root + "/"):
+                    continue
+                if e.get("type") == "directory":
+                    try:
+                        todo.append(listing(path))
+                    except ApiError as err:
+                        say("  could not list {} ({})".format(path[len(root) + 1:], err.code or err.detail[:60]))
+                elif e.get("type") in ("file", "notebook"):
+                    rel = safe_rel(path[len(root) + 1:])
+                    if rel:
+                        files.append((rel, e.get("size")))
+        return root, sorted(files)
+    return None, []
+
+
+def fetch_to(url, target, headers=None, timeout=600):
+    """Download url into target through a .part file, so an interrupted download never leaves a half file. Returns
+    the size in bytes."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    part = target.with_name(target.name + ".part")
+    hdrs = {"Accept": "*/*"}
+    hdrs.update(headers or {})
+    r = request("GET", url, headers=hdrs, timeout=timeout, stream=True)
+    size = 0
+    try:
+        with r, open(part, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                size += len(chunk)
+    except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as e:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
+    os.replace(str(part), str(target))
+    return size
+
+
 def pull(cfg, rec):
-    """Every output file listed in ComfyUI's history, through the pod's own HTTP endpoints."""
-    base = pod_url(rec["id"])
-    if not comfy_alive(rec["id"]):
+    """Every file of the pod's output folder that is not here yet, into outputs/<pod name>/, subfolders kept: the whole
+    folder through JupyterLab, then whatever ComfyUI's history lists that JupyterLab did not (JupyterLab off)."""
+    pod_id = rec["id"]
+    dest = OUTPUTS / rec.get("name", pod_id)
+    comfy = comfy_alive(pod_id)
+    token = jupyter_token(proxy_log(pod_id)) if comfy else None
+    count, listed = 0, set()
+
+    def got(target, size):
+        say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), size / 1e6))
+
+    root = None
+    if token:
+        root, files = jupyter_files(pod_id, token)
+        if root:
+            base = pod_url(pod_id, JUPYTER_PORT)
+            for rel, size in files:
+                listed.add(rel)
+                target = dest.joinpath(*rel.split("/"))
+                if target.exists() and (size is None or target.stat().st_size == size):
+                    continue
+                try:
+                    n = fetch_to(base + "/files/" + urllib.parse.quote(root + "/" + rel), target,
+                                 headers={"Authorization": "token " + token})
+                except ApiError as e:
+                    say("  skipped {} ({})".format(rel, e.code or e.detail[:60]))
+                    continue
+                count += 1
+                got(target, n)
+    if not comfy:
         say("ComfyUI does not answer on the pod: nothing to pull through it.")
-        return 0
+        return count
+    base = pod_url(pod_id)
     try:
         history = request("GET", base + "/history", timeout=60)
     except ApiError as e:
         say("could not read the history: {}".format(e))
-        return 0
-    dest = OUTPUTS / rec.get("name", rec["id"])
-    dest.mkdir(parents=True, exist_ok=True)
-    seen, count = set(), 0
-    for _, entry in (history or {}).items():
-        for _, out in (entry.get("outputs") or {}).items():
-            for kind in ("images", "gifs", "videos", "audio", "files"):
-                for item in out.get(kind, []) or []:
-                    if item.get("type") not in (None, "output"):
-                        continue
-                    name, sub = item.get("filename"), item.get("subfolder", "")
-                    if not name or (name, sub) in seen:
-                        continue
-                    seen.add((name, sub))
-                    target = dest / sub / name if sub else dest / name
-                    if target.exists():
-                        continue
-                    q = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": "output"})
-                    try:
-                        data = request("GET", base + "/view?" + q, timeout=600, raw=True)
-                    except ApiError as e:
-                        say("  skipped {} ({})".format(name, e.code))
-                        continue
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
-                    count += 1
-                    say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), len(data) / 1e6))
+        history = None
+    for sub, name in history_files(history):
+        rel = safe_rel((sub + "/" + name) if sub else name)
+        if not rel or rel in listed:
+            continue
+        target = dest.joinpath(*rel.split("/"))
+        if target.exists():
+            continue
+        q = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": "output"})
+        try:
+            n = fetch_to(base + "/view?" + q, target)
+        except ApiError as e:
+            say("  skipped {} ({})".format(name, e.code))
+            continue
+        count += 1
+        got(target, n)
+    if not root:
+        say("JupyterLab did not answer: only the files in ComfyUI's history came back. A file saved before a ComfyUI "
+            "restart, or by a node that reports nothing, stays on the pod: fetch it from JupyterLab's file browser.")
     return count
 
 

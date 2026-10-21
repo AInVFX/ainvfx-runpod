@@ -96,6 +96,8 @@ STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "upl
          "catalog_reads": 0,      # GET /v2/catalog/gpus on Secure Cloud so far (pod.py 0.9.0, --retry)
          "schedule": {},          # GPU id -> [(first read, data centers with stock), ...]: see stock_now()
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
+         "history_3d": False,     # 0.9.2: the history also reports a GLB under "3d", and a temp preview
+         "outfiles": None,        # 0.9.2: the pod's output folder as {relative path: bytes}; None = JupyterLab off
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
 
@@ -394,12 +396,22 @@ class Handler(BaseHTTPRequestHandler):
         up = pod and not pod["deleted"] and pod_seconds(pod) >= STATE["pull_seconds"] + 4
         if not up:
             return self.problem(502, "no comfy yet")
+        if "/%d/" % 8888 in p:
+            return self.jupyter_get(p)
         if p.endswith("/system_stats"):
             return self.send_json(200, {"system": {"comfyui_version": "0.39.0"}})
         if p.endswith("/history"):
             done = pod_seconds(pod) >= STATE["pull_seconds"] + 7
-            return self.send_json(200, {"p1": {"outputs": {"9": {"images": [{"filename": "ainvfx_selftest_00001_.png",
-                                        "subfolder": "", "type": "output"}]}}, "status": {"completed": True}}} if done else {})
+            hist = {"p1": {"outputs": {"9": {"images": [{"filename": "ainvfx_selftest_00001_.png",
+                                        "subfolder": "", "type": "output"}]}}, "status": {"completed": True}}}
+            if STATE["history_3d"]:      # the shape of ComfyUI 0.42.1's Save 3D (Advanced) and a temp preview
+                hist["p2"] = {"outputs": {"12": {"3d": [{"filename": "D6_E2_mesh_00001_.glb", "subfolder": "BTC2",
+                                                         "type": "output"}],
+                                                 "camera_info": [{"position": [0, 1, 2]}], "model_3d_info": []},
+                                          "7": {"images": [{"filename": "ComfyUI_temp_00001_.png", "subfolder": "",
+                                                            "type": "temp"}]}},
+                              "status": {"completed": True}}
+            return self.send_json(200, hist if done else {})
         if p.endswith("/view"):
             if q.get("type") == ["input"] and q.get("filename") == ["bootstrap.log"] and q.get("subfolder") == ["ainvfx"]:
                 if STATE["no_proxy_log"]:
@@ -407,6 +419,45 @@ class Handler(BaseHTTPRequestHandler):
                 data = "\n".join(l for _, l in visible_lines(pod)).encode()
             else:
                 data = b"\x89PNG fake image bytes"
+            self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+            self.wfile.write(data); return
+        return self.problem(404, "no route")
+
+    def jupyter_get(self, p):
+        """A fake JupyterLab with its root at /, as Runpod starts it: the contents API (one folder per request) and
+        the raw files handler, behind the token of the READY line."""
+        files = STATE["outfiles"]
+        if files is None:
+            return self.problem(404, "no jupyter")
+        if self.headers.get("Authorization") != "token faketoken":
+            return self.problem(403, "Forbidden")
+        root = "workspace/ComfyUI/output"
+        rest = urllib.parse.unquote(p.split("/8888/", 1)[1])
+        if rest.startswith("api/contents/"):
+            path = rest[len("api/contents/"):].strip("/")
+            if not (path == root or path.startswith(root + "/")):
+                return self.problem(404, "No such file or directory: " + path)
+            sub = path[len(root):].strip("/")
+            prefix = sub + "/" if sub else ""
+            entries, dirs = [], set()
+            for rel, data in files.items():
+                if not rel.startswith(prefix):
+                    continue
+                tail = rel[len(prefix):]
+                if "/" in tail:
+                    dirs.add(tail.split("/")[0])
+                else:
+                    entries.append({"name": tail, "path": root + "/" + rel, "type": "file", "size": len(data)})
+            entries += [{"name": n, "path": root + "/" + prefix + n, "type": "directory", "size": None} for n in sorted(dirs)]
+            if sub and not entries:
+                return self.problem(404, "No such file or directory: " + path)
+            return self.send_json(200, {"name": path.split("/")[-1], "path": path, "type": "directory", "content": entries})
+        if rest.startswith("files/"):
+            path = rest[len("files/"):]
+            rel = path[len(root) + 1:] if path.startswith(root + "/") else None
+            if rel not in files:
+                return self.problem(404, "no such file")
+            data = files[rel]
             self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
             self.wfile.write(data); return
         return self.problem(404, "no route")
@@ -627,7 +678,7 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.parse_profiles("3d+image"), ["image", "3d"])
         self.assertEqual(pod.parse_profiles("image, video,train"), ["image", "video", "train"])
         self.assertEqual(pod.parse_profiles("all"), ["image", "3d", "video", "train"])
-        self.assertEqual(pod.profile_spec(["image"])["disk"], 160)
+        self.assertEqual(pod.profile_spec(["image"])["disk"], 170)   # 0.9.1 data (20 Oct): MOSS-Image joins image
         self.assertEqual(pod.profile_spec(["image"])["gpu"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.profile_spec(["3d"])["disk"], 100, "never under 100 GB")
         self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
@@ -635,9 +686,33 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.profile_spec(["image", "video"])["vram"], 96)
         self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 210)
         spec = pod.profile_spec(["image", "3d", "video", "train"])
-        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 360))
+        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 380))   # and MoGe 3 joins 3d
         with self.assertRaises(SystemExit):
             pod.parse_profiles("nope+3d")
+
+    def test_history_files_takes_every_key_but_temp(self):
+        """0.9.2: the 3D saves report under "3d"; temp previews and non-file values are left out; one entry per file."""
+        h = {"p1": {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]},
+                                "12": {"3d": [{"filename": "m.glb", "subfolder": "BTC2", "type": "output"}],
+                                       "camera_info": [{"position": [0, 1, 2]}]},
+                                "7": {"images": [{"filename": "t.png", "subfolder": "", "type": "temp"}]},
+                                "8": {"text": ["Vertices: 12"]}}},
+             "p2": {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]},
+                                "5": {"latents": [{"filename": "l.latent", "subfolder": "latents"}]}}}}
+        self.assertEqual(pod.history_files(h), [("", "a.png"), ("BTC2", "m.glb"), ("latents", "l.latent")])
+        self.assertEqual(pod.history_files({}), [])
+        self.assertEqual(pod.history_files(None), [])
+
+    def test_jupyter_token_and_safe_paths(self):
+        ready = ("[AINVFX] READY · ComfyUI https://x-8188.proxy.runpod.net · JupyterLab "
+                 "https://x-8888.proxy.runpod.net/lab?token=abc123 · log /workspace/ComfyUI/input/ainvfx/bootstrap.log")
+        self.assertEqual(pod.jupyter_token(["[AINVFX] step 5/5", ready]), "abc123")
+        self.assertIsNone(pod.jupyter_token(["[AINVFX] READY · ComfyUI https://x · JupyterLab off"]))
+        self.assertIsNone(pod.jupyter_token([]))
+        self.assertEqual(pod.safe_rel("BTC2/D6_E2_mesh_00001_.glb"), "BTC2/D6_E2_mesh_00001_.glb")
+        self.assertEqual(pod.safe_rel("a\\b.png"), "a/b.png")
+        for bad in ("../x.png", "BTC2/../../x", "/etc/passwd", "C:/x.png", ""):
+            self.assertIsNone(pod.safe_rel(bad), bad)
 
     def test_profiles_and_start_command(self):
         self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
@@ -661,7 +736,8 @@ class EndToEnd(unittest.TestCase):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
-                      "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {}})
+                      "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
+                      "history_3d": False, "outfiles": None})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -720,6 +796,38 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
         self.assertIn("Nothing bills", out, out)
+
+    def test_pull_takes_every_file_of_the_output_folder(self):
+        """0.9.2: the GLB that ComfyUI reports under "3d", and a file that only the folder holds (a trained LoRA), come
+        back; the placeholder does not; a second pull fetches nothing; JupyterLab off, the history still brings the GLB."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["history_3d"] = True
+        STATE["outfiles"] = {"ainvfx_selftest_00001_.png": b"\x89PNG fake image bytes",
+                             "BTC2/D6_E2_mesh_00001_.glb": b"glTF fake mesh",
+                             "loras/jar/jar_lora_000250.safetensors": b"fake lora weights",
+                             "_output_images_will_be_put_here": b""}
+        out, rc = self.run_pod("pull")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("3 file(s) new", out, out)
+        self.assertNotIn("JupyterLab did not answer", out, out)
+        got = {os.path.relpath(os.path.join(r, f), os.path.join(self.home, "outputs")).replace(os.sep, "/").split("/", 1)[1]
+               for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs}
+        self.assertEqual(got, {"ainvfx_selftest_00001_.png", "BTC2/D6_E2_mesh_00001_.glb",
+                               "loras/jar/jar_lora_000250.safetensors"}, out)
+        out, rc = self.run_pod("pull")
+        self.assertIn("0 file(s) new", out, out)
+        STATE["outfiles"] = None                                    # JupyterLab off: the history alone
+        shutil.rmtree(os.path.join(self.home, "outputs"))
+        out, rc = self.run_pod("pull")
+        self.assertIn("2 file(s) new", out, out)
+        self.assertIn("D6_E2_mesh_00001_.glb", out, out)
+        self.assertNotIn("ComfyUI_temp", out, out)
+        self.assertIn("JupyterLab did not answer", out, out)
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
     def test_whole_session_with_both_log_sources(self):
         """The live stream keeps its keepalives and never delivers READY; the pod's copy does."""
@@ -944,8 +1052,8 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image+3d", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn("profile image+3d: about 132 GB of models, a 190 GB container disk", out, out)
-        self.assertEqual(STATE["posts"][0].get("disk"), 190, out)
+        self.assertIn("profile image+3d: about 148 GB of models, a 210 GB container disk", out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), 210, out)
         self.assertEqual((STATE["posts"][0].get("env") or {}).get("AINVFX_PROFILE"), "image+3d", out)
         self.assertEqual(STATE["posts"][0]["gpu"]["id"], "NVIDIA GeForce RTX 5090", out)
         self.assertIn("READY", out, out)
@@ -961,7 +1069,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
-        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 160 GB disk, billed from creation? [Y/n]", out, out)
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 170 GB disk, billed from creation? [Y/n]", out, out)
         self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertIn("READY", out, out)

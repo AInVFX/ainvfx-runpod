@@ -38,7 +38,7 @@ python pod.py setup        # once: your Runpod API key, your nearest data center
 python pod.py setup --hf-token   # optional: your Hugging Face token, stored on Runpod as a secret (gated files)
 python pod.py up image     # creates the pod on Secure Cloud, follows its log until READY
 python pod.py open         # opens ComfyUI in your browser
-python pod.py pull         # downloads the pod's outputs into outputs/<pod name>/
+python pod.py pull         # downloads every file of the pod's output folder into outputs/<pod name>/
 python pod.py down         # pulls, then terminates (billing stops)
 ```
 
@@ -150,7 +150,7 @@ The gated repositories (FLUX 3 Image Klein in the `image` profile, LTX 2.5 in `v
 
 - **Workflow files** (`.json`): drag and drop them onto the ComfyUI canvas, as at home.
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
-- **Results out**: the Assets panel in ComfyUI's sidebar, or `python pod.py pull`, which downloads every output listed in the pod's history that you do not have yet, into `outputs/<pod name>/` next to the script (or the folder named in `AINVFX_OUTPUTS`).
+- **Results out**: the Assets panel in ComfyUI's sidebar, or `python pod.py pull`, which downloads every file of the pod's output folder that you do not have yet, subfolders kept, into `outputs/<pod name>/` next to the script (or the folder named in `AINVFX_OUTPUTS`): images, videos, 3D files (GLB, PLY), and files a node saves without showing them, such as a trained LoRA. It walks the folder through the pod's JupyterLab, with the token of the log's READY line; when JupyterLab is off, it falls back to the files ComfyUI's history lists. `python pod.py down` runs the same pull before it terminates the pod.
 - **Many files at once**: JupyterLab, from the link on the `READY` line (its token is in it) or from the pod's Connect button. Its terminal is under File, New, Terminal.
 
 ## How `up` picks the machine
