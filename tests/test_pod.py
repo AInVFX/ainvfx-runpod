@@ -1140,6 +1140,56 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(STATE["pods"]["fakepod2"]["deleted"], out)
         self.assertEqual(rc, 0, out)
 
+    def recorded(self, pods):
+        """Write pod records into this test's configuration, as `up` or an attach would."""
+        path = os.path.join(self.home, ".ainvfx-runpod", "config.json")
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg.setdefault("pods", {}).update(pods)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return path
+
+    def test_records_of_terminated_pods_are_forgotten(self):
+        """0.9.3 (22 Oct 2026): seven records, one pod alive (the others terminated from the console or
+        elsewhere). A command without a name forgets the gone ones and takes the live one."""
+        self.run_pod("setup", "-y")
+        live = Handler.new_pod("ainvfx-image-3d-video-1021-2016", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
+        path = self.recorded({
+            "image-3d-video": {"id": live["id"], "name": live["name"], "profile": "image-3d-video", "created": ""},
+            "image": {"id": "gone1", "name": "ainvfx-image-video-1019-2157", "profile": "image", "created": ""},
+            "MySecondPod": {"id": "gone2", "name": "ainvfx-image-MySecondPod", "profile": "image", "created": ""}})
+        out, rc = self.run_pod("status")
+        self.assertIn("forgot 2 pod(s) no longer on Runpod", out, out)
+        self.assertNotIn("several pods recorded", out, out)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["pods"]), ["image-3d-video"])
+
+    def test_list_forgets_records_of_terminated_pods(self):
+        self.run_pod("setup", "-y")
+        live = Handler.new_pod("ainvfx-image-1021-0900", "NVIDIA GeForce RTX 5090", "CA-MTL-1")
+        path = self.recorded({"image": {"id": live["id"], "name": live["name"], "profile": "image", "created": ""},
+                              "CST_B200_01": {"id": "gone3", "name": "ainvfx-image-video-CST_B200_01",
+                                              "profile": "image-video", "created": ""}})
+        out, rc = self.run_pod("list")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("here: `image`", out, out)
+        self.assertIn("Forgot 1 record(s) of pods no longer on Runpod: ainvfx-image-video-CST_B200_01.", out, out)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["pods"]), ["image"])
+
+    def test_two_live_pods_still_ask_for_a_name(self):
+        self.run_pod("setup", "-y")
+        a = Handler.new_pod("ainvfx-image-1021-0900", "NVIDIA GeForce RTX 5090", "CA-MTL-1")
+        b = Handler.new_pod("ainvfx-video-1021-0910", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
+        self.recorded({"image": {"id": a["id"], "name": a["name"], "profile": "image", "created": ""},
+                       "video": {"id": b["id"], "name": b["name"], "profile": "video", "created": ""},
+                       "old": {"id": "gone4", "name": "ainvfx-image-old", "profile": "image", "created": ""}})
+        out, rc = self.run_pod("status")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("forgot 1 pod(s) no longer on Runpod: ainvfx-image-old", out, out)
+        self.assertIn("several pods recorded, name one: image (ainvfx-image-1021-0900)  video (ainvfx-video-1021-0910)", out, out)
+
     def test_up_stops_on_a_failed_line(self):
         """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):
         `up` must stop on that line, say what to do, and exit non-zero, instead of waiting for READY."""

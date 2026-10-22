@@ -88,7 +88,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 # The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
@@ -529,6 +529,19 @@ def dc_order(dc_id, region, country):
             1 if same_region else 2 if region_of(dc_id) in REGION_NAMES else 3)
 
 
+def forget_gone(cfg, account):
+    """Remove the records of pods that are no longer in the account (terminated from the Runpod console,
+    from another machine, or by Runpod itself): only `down` removed a record before 0.9.3, so such pods
+    stayed recorded here and every command without a name asked which one (Adrien, 22 Oct 2026: seven
+    records, one pod). A stopped pod (EXITED) is still in the account and keeps its record. Returns the
+    names forgotten."""
+    alive = {str(p.get("id")) for p in account}
+    gone = [(t, r) for t, r in list((cfg.get("pods") or {}).items()) if str(r.get("id")) not in alive]
+    for t, _ in gone:
+        remember_pod(cfg, t, None)
+    return [r.get("name") or t for t, r in gone]
+
+
 def which_pod(cfg, ref):
     """The pod a command targets: (tag, record). `ref` is a tag (a profile name, or the `--name`
     given to `up`), a pod name, a pod id, or nothing when one pod is recorded. A pod that exists in
@@ -538,6 +551,14 @@ def which_pod(cfg, ref):
     if ref:
         ref = ref.strip().replace("+", "-")   # `down image+3d` and `down image-3d` name the same pod
     if ref is None:
+        if len(pods) > 1:                   # 0.9.3: first forget the pods that no longer exist
+            try:
+                gone = forget_gone(cfg, list_pods(cfg, quiet=True))
+            except ApiError:
+                gone = []
+            if gone:
+                say("forgot {} pod(s) no longer on Runpod: {}".format(len(gone), ", ".join(gone)))
+            pods = cfg.setdefault("pods", {})
         if len(pods) == 1:
             tag = next(iter(pods))
             return tag, pods[tag]
@@ -2025,7 +2046,9 @@ def cmd_down(args):
 
 def cmd_list(args):
     cfg = load_config()
-    list_pods(cfg)
+    gone = forget_gone(cfg, list_pods(cfg))
+    if gone:
+        say("Forgot {} record(s) of pods no longer on Runpod: {}.".format(len(gone), ", ".join(gone)))
 
 
 def cmd_ssh(args):
