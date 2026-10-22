@@ -108,7 +108,7 @@ Three ways to change a value, from the most lasting to the most temporary:
 | `AINVFX_MODELS_URL` | this repository's `models.json` | Your own list of models (below) |
 | `AINVFX_CUSTOM_NODES` | none | Git URLs separated by spaces; each is cloned into `custom_nodes` and its `requirements.txt` installed |
 | `AINVFX_HEALTHCHECK` | `1` | `0` skips the disk speed test at start |
-| `AINVFX_SELFTEST` | `1` | `0` skips the test image at the end (`up --no-selftest` does the same) |
+| `AINVFX_SELFTEST` | `1` | `0` skips the test image at the end (`up --no-selftest` does the same). It needs the `image` profile |
 | `AINVFX_BOOTSTRAP_URL` | this repository's | The raw URL of a fork's own `bootstrap.sh`, run in place of this one |
 
 Values with spaces need no quotes; lines starting with `#` are comments.
@@ -134,7 +134,7 @@ Some repositories are **gated**: Hugging Face serves their files only to an acco
 
 1. It reads Runpod's catalog: every GPU type in stock on hosts with CUDA 13.0 or newer (driver 580 or newer, which the course's int8 models need).
 2. It tries the profile's GPU on **Secure Cloud** (Runpod's own data centers), in the nearest data center first: your country, then your region, then the other region. Your country comes from your computer's clock (`America/Toronto` gives Canada); `setup --region EU --country FR` changes it.
-3. When that GPU has no stock, it lists every GPU in stock that fits the profile, cheapest first, and proposes the cheapest. To fit, a GPU needs the profile's memory (32 GB for `image` and `3d`, 96 GB for `video` and `train`), a Blackwell chip or newer, and must not be a 1g MIG slice (the smallest share of a bigger GPU: one took seven times longer on the test image than an RTX 5090). `up` never takes more than 2.50 USD per hour on its own (`--max-price` changes it).
+3. When that GPU has no stock, it lists every GPU in stock that fits the profile, cheapest first, and proposes the cheapest. To fit, a GPU needs the profile's memory (32 GB for `image` and `3d`, 96 GB for `video` and `train`), a Blackwell chip or newer, and must not be a 1g MIG slice (the smallest share of a bigger GPU: one was seven times slower than an RTX 5090 in our tests). `up` never takes more than 2.50 USD per hour on its own (`--max-price` changes it).
 4. It creates a pod only where the catalog shows stock, and always names the data center. Left to choose, Runpod has twice placed a pod on a host being removed from the platform.
 5. Right after creation, it checks the host. A host with maintenance under way, or due within 24 hours, is terminated at once (a few seconds billed), and the next machine is tried.
 
@@ -157,7 +157,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 | 2 | Install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at the tag of `AINVFX_COMFY_TAG`, the Manager, your custom nodes. A failed download is retried; PyTorch then comes from PyPI, the same CUDA 13.0 build | `FAILED` when the pod cannot work on that machine |
 | 3 | ComfyUI starts for Runpod's proxy | `COMFYUI UP`, then `PROXY OK` |
 | 4 | The models of the profile, one by one. Each line gives file k of n, GB done, percent and time left. Files already present are skipped | `MODELS DONE` with the total time and speed |
-| 5 | One Z-Image Turbo test image, 1024 x 1024 in 8 steps | `SELFTEST OK`, then `READY` with the ComfyUI and JupyterLab links |
+| 5 | A test image by MOSS-Image, 1024 x 1024 in 25 steps: a thank-you poster with this repository's address over eight VFX stills. It needs the `image` profile; without it, the step is skipped with a note | `SELFTEST OK`, then `READY` with the ComfyUI and JupyterLab links |
 
 The image is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the one of Runpod's own "Runpod Pytorch 2.8.0" template. Runpod keeps it on its hosts, so the container starts within seconds. Its own PyTorch and CUDA toolkit are not used: `bootstrap.sh` installs PyTorch built for CUDA 13.0, which carries its own CUDA libraries.
 

@@ -43,7 +43,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command

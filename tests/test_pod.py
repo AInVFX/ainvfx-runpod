@@ -38,7 +38,7 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (5, "[AINVFX] models 1/14 · z_image_turbo_int8_convrot.safetensors in 10 s · 600 MB/s · 6.2 of 62.9 GB (9%) · about 1 min 34 s left"),
     (6, "[AINVFX] MODELS DONE 14/14 present · 59G on disk · 59 GB downloaded in 91 s (650 MB/s)"),
     (6, "[AINVFX] step 5/5 self-test"),
-    (7, "[AINVFX] SELFTEST OK · Z-Image Turbo 1024 x 1024, 8 steps, in 16.0 s (models loaded from disk) · output/ainvfx_selftest_00001_.png"),
+    (7, "[AINVFX] SELFTEST OK · MOSS-Image 1024 x 1024, 25 steps, in 38.0 s (models loaded from disk) · output/ainvfx_selftest_00001_.png"),
     (7, "[AINVFX] READY · ComfyUI https://fakepod1-8188.proxy.runpod.net · JupyterLab https://fakepod1-8888.proxy.runpod.net/lab?token=faketoken · log /workspace/ComfyUI/input/ainvfx/bootstrap.log"),
     (7, "[AINVFX] remember: terminate the pod when you are done"),
 ]

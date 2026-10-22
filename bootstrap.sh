@@ -8,7 +8,7 @@
 #   2. install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at a pinned tag, the Manager, custom nodes
 #   3. start ComfyUI for Runpod's proxy on port 8188           -> COMFYUI UP, PROXY OK
 #   4. the models of the profile, from models.json             -> MODELS DONE
-#   5. one Z-Image Turbo test image                            -> SELFTEST OK, then READY
+#   5. one MOSS-Image test image (a thank-you poster)          -> SELFTEST OK, then READY
 # A pod that cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints FAILED and stays up
 # so its log can be read; pod.py stops on that line.
 #
@@ -574,29 +574,73 @@ fi
 
 # ---------------------------------------------------------------- 5. self-test, then READY
 say "step 5/5 self-test"
-if [ "$SELFTEST" = "1" ] && [ -s $COMFY/models/diffusion_models/z_image_turbo_int8_convrot.safetensors ] \
-   && [ -s $COMFY/models/text_encoders/qwen_3_4b_fp8_mixed.safetensors ] && [ -s $COMFY/models/vae/ae.safetensors ] \
-   && curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
+SELFTEST_FILES="diffusion_models/moss_image_sft_int8_convrot.safetensors text_encoders/qwen3.5_9b_w4a8_gptq.safetensors vae/flux2-vae_small.safetensors"
+MISSING=""
+for f in $SELFTEST_FILES; do [ -s "$COMFY/models/$f" ] || MISSING="$MISSING $(basename "$f")"; done
+if [ "$SELFTEST" != "1" ]; then
+  say "self-test skipped (AINVFX_SELFTEST=$SELFTEST)"
+elif [ -n "$MISSING" ]; then
+  say "self-test skipped: the test image needs the MOSS-Image files of the image profile, and this pod (profile $PROFILE) lacks$MISSING. Nothing is wrong: add image to the profile for the test image"
+elif ! curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
+  warn "self-test skipped: ComfyUI does not answer (read $ROOT/comfy.log)"
+else
   python - "$PORT" <<'PY'
-import json, sys, time, urllib.request
-port = sys.argv[1]
-base = "http://127.0.0.1:%s" % port
+# A thank-you poster from MOSS-Image (Apache 2.0): a title, the repository's address and eight VFX stills, placed
+# with MOSS-Image's layout prompt (the JSON that the core node MOSSImageLayoutPrompt writes). Sampling settings
+# from the official template image_moss_image_t2i_bboxes.
+import json, math, sys, time, urllib.request
+W = H = 1024
+def box(y0, x0, y1, x1):   # 0 to 1000 [y0, x0, y1, x1] -> pixel edges, origin at the canvas centre
+    return [math.floor(y0 * H / 1000) - H // 2, math.floor(x0 * W / 1000) - W // 2,
+            math.ceil(y1 * H / 1000) - H // 2, math.ceil(x1 * W / 1000) - W // 2]
+stills = [
+    "a wildfire wall of flames consuming a pine forest at night, swirling embers",
+    "a colossal storm wave crashing over a stone lighthouse, spray frozen mid-air",
+    "a high-speed macro photograph of an orange juice splash, suspended droplets and pulp on black",
+    "a green aurora over a frozen lake, cracked turquoise ice in the foreground",
+    "a red sports car racing down a rainy neon-lit city street at night, wet reflections, motion blur",
+    "an erupting volcano, a glowing lava river under an ash cloud split by lightning",
+    "purple and teal smoke billowing through an abandoned industrial hall, volumetric god rays",
+    "a snowy mountain ridge at golden hour, a blizzard of windblown snow, a warm lens flare",
+]
+def item(label, caption, bbox, text=None, palette=None):   # the key order of MOSSImageLayoutPrompt's output
+    it = {"label": label, "caption": caption}
+    if text:
+        it["text"] = text
+    if palette:
+        it["palette"] = palette
+    it["bbox"] = bbox
+    return it
+items = [item("text", "A bold white sans-serif title centred across the top of the poster, one line, crisp and perfectly legible",
+              box(40, 40, 140, 960), "Thank you for using ainvfx-runpod", ["#FFFFFF"]),
+         item("text", "A smaller golden monospace web address centred under the title, crisp and perfectly legible",
+              box(150, 220, 195, 780), "github.com/AInVFX/ainvfx-runpod", ["#F5B800"])]
+for i, still in enumerate(stills):
+    row, col = divmod(i, 4)
+    items.append(item("object", "A photorealistic cinematic film still: " + still,
+                      box(225 + row * 385, 30 + col * 237, 600 + row * 385, 257 + col * 237)))
+layout = json.dumps({"summary": {"caption": (
+    "A premium cinematic poster on a deep charcoal background. At the top, a large white title and a golden web address. "
+    "Below, a clean grid of eight hyperrealistic film stills of visual effects, two rows of four, separated by thin dark "
+    "gutters: fire, an ocean wave, a liquid splash, an aurora over ice, a car in neon rain, a volcano, coloured smoke, "
+    "a blizzard. Diverse lighting and palettes, sharp focus, rich detail, high dynamic range.")},
+    "items": items, "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}, separators=(",", ":"))
 prompt = {
- "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_int8_convrot.safetensors", "weight_dtype": "default"}},
- "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b_fp8_mixed.safetensors", "type": "lumina2", "device": "default"}},
- "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
- "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text":
-       "Studio packshot of a matte black protein powder jar on a seamless light grey background, soft studio lighting, product photography"}},
- "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
- "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
- "7": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep",
-       "scheduler": "simple", "denoise": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "moss_image_sft_int8_convrot.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"}},
+ "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae_small.safetensors"}},
+ "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": layout}},
+ "5": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact"}},
+ "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": W, "height": H, "batch_size": 1}},
+ "7": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 25, "cfg": 2.5, "sampler_name": "er_sde", "scheduler": "simple",
+       "denoise": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
  "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
  "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ainvfx_selftest", "images": ["8", 0]}},
 }
+#--- end of the graph
 def call(path, body=None):
-    req = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request("http://127.0.0.1:%s%s" % (sys.argv[1], path), headers={"Content-Type": "application/json"},
+                                 data=json.dumps(body).encode() if body is not None else None)
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read().decode())
 t0 = time.time()
@@ -618,13 +662,11 @@ while time.time() - t0 < 300:
             print("[AINVFX] WARNING: SELFTEST FAILED:", detail); sys.exit(0)
         outs = [i for o in h.get("outputs", {}).values() for i in o.get("images", [])]
         if outs:
-            print("[AINVFX] SELFTEST OK · Z-Image Turbo 1024 x 1024, 8 steps, in %.1f s (models loaded from disk) · output/%s"
-                  % (time.time() - t0, outs[0].get("filename")))
+            print("[AINVFX] SELFTEST OK · MOSS-Image %d x %d, 25 steps, in %.1f s (models loaded from disk) · output/%s"
+                  % (W, H, time.time() - t0, outs[0].get("filename")))
             sys.exit(0)
-print("[AINVFX] WARNING: SELFTEST did not finish within 5 minutes: read %s/comfy.log" % "/workspace")
+print("[AINVFX] WARNING: SELFTEST did not finish within 5 minutes: read /workspace/comfy.log")
 PY
-else
-  say "self-test skipped (AINVFX_SELFTEST=$SELFTEST, or the Z-Image Turbo files are missing)"
 fi
 
 access_summary
