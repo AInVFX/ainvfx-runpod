@@ -8,182 +8,176 @@
 
 Rent a GPU on [Runpod](https://www.runpod.io/), get [ComfyUI](https://github.com/Comfy-Org/ComfyUI) running on it with the right models, work, download your results, terminate. From the browser or from one script, on Windows, macOS or Linux.
 
-Built by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/), in partnership with Runpod, the bootcamp's GPU infrastructure partner. Anyone may use it: the ComfyUI version and the model list are plain files you can change.
+Built by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/), with Runpod as the bootcamp's GPU infrastructure partner. Anyone may use it: the ComfyUI version and the list of models are plain files you can change.
 
 ## How it works
 
-A **pod** is a Linux machine with a GPU, rented by the second. You create one from the AInVFX template, the pod installs ComfyUI and the course models on its own, and you reach ComfyUI from your browser at `https://<pod id>-8188.proxy.runpod.net`. When you are done, you download your results and terminate the pod. Nothing stays on Runpod between sessions, so you pay only for the hours you work.
+A **pod** is a Linux machine with a GPU, rented by the second. You create it from the AInVFX template. On its own, the pod installs ComfyUI and the models of the **profile** you chose (a set of models for one block of the course). You open ComfyUI in your browser at `https://<pod id>-8188.proxy.runpod.net`. At the end, you download your results and terminate the pod. Nothing stays on Runpod, so you pay only for the hours you work.
 
-Two ways to create a pod. Both give the same machine.
+There are two ways to create a pod. Both give the same machine.
 
-| | What you need | What you do |
+| | You need | You do |
 |---|---|---|
 | **Browser** | a Runpod account with credit | open the template's deploy page, pick a GPU, deploy, read the log until `READY` |
 | **Script** | the same, plus Python 3.8 or newer and Git | `python pod.py up image`, then `open`, `pull`, `down` |
 
-## Quick start, browser only
+## Quick start, browser
 
 1. Open [the AInVFX template](https://console.runpod.io/deploy?template=4i789znkrd&ref=iad0yzht) (template id `4i789znkrd`).
-2. Pick the GPU: **RTX 5090** for image work. If it is out of stock, open the **Filter** button of the Compute section and set **Cloud type** to **Community** (machines owned by third parties, cheaper and often better stocked; the console shows a warning), or pick a slice of the RTX PRO 6000.
-3. Click **Deploy On-Demand**. The pod appears under Pods; its **Logs** button shows the install running.
-4. Wait for the line `READY`: 5 to 15 minutes depending on the data center (the log's first lines are Runpod's own: the image found on the host, the container started; then every line of ours starts with `[AINVFX]`). Open `https://<pod id>-8188.proxy.runpod.net` (also behind the pod's **Connect** button): that is your ComfyUI. The `READY` line also gives JupyterLab's link, its token included. If the button opens a blank "403" page, press Enter in the address bar: ComfyUI refuses a page opened by a click from another site (its protection against sites that would drive it), never the address typed or opened by `pod.py open`.
-5. When you are done: download your results (the Assets panel in ComfyUI), then **Terminate** the pod. Stop is not enough: a stopped pod keeps a dead entry and may keep billing storage.
+2. Pick the GPU: **RTX 5090** for the `image` and `3d` profiles, **RTX PRO 6000** (96 GB) for `video` and `train`. If it is out of stock, pick another GPU with as much memory. Community Cloud (machines owned by third parties) is cheaper and often in stock, but Runpod picks the host and it can fail to start.
+3. For another profile, set the `AINVFX_PROFILE` environment variable (for example `image+3d`). The template's 200 GB **Container Disk** holds any single profile; for a combination, raise it to the size given in [Profiles](#profiles).
+4. Click **Deploy On-Demand**. The pod appears under Pods; its **Logs** button shows the install.
+5. Wait for the line `READY`, 5 to 15 minutes after creation depending on the data center. Then open `https://<pod id>-8188.proxy.runpod.net`, also behind the pod's **Connect** button: that is your ComfyUI. The `READY` line also gives the JupyterLab link, with its token.
+6. When you are done, download your results (the Assets panel in ComfyUI), then **Terminate** the pod. Stop is not enough: a stopped pod keeps an entry and can keep billing storage.
 
 ## Quick start, script
 
 ```bash
 git clone https://github.com/AInVFX/ainvfx-runpod
 cd ainvfx-runpod
-python pod.py setup        # once: your Runpod API key, your nearest data centers, your SSH key (optional)
-python pod.py setup --hf-token   # optional: your Hugging Face token, stored on Runpod as a secret (gated files)
-python pod.py up image     # creates the pod on Secure Cloud, follows its log until READY
-python pod.py open         # opens ComfyUI in your browser
-python pod.py pull         # downloads every file of the pod's output folder into outputs/<pod name>/
-python pod.py down         # pulls, then terminates (billing stops)
+python pod.py setup              # once: your Runpod API key, nearest data centers, SSH key (optional)
+python pod.py setup --hf-token   # optional: your Hugging Face token, for the gated models
+python pod.py up image           # creates the pod, follows its log until READY
+python pod.py open               # opens ComfyUI in your browser
+python pod.py pull               # downloads the pod's output folder into outputs/<pod name>/
+python pod.py down               # pulls, then terminates: billing stops
 ```
 
-The other commands: `logs` (follow the log again), `status` (GPU, cost so far, address, last log lines), `push file.png` (copy a file into the pod's input folder), `ssh` (a terminal on the pod), `list` (every pod of your account), `doctor` (check your setup). `python pod.py --help` lists them all. Ctrl+C while a log is followed stops the following only; the pod keeps running until `down`. `up image --community` also considers Community Cloud (off by default since 0.8.0: see "How `up` picks the machine"); `up image --models-url <URL>` downloads your own list of models (see "Your own settings"); `up video --gpu B200 --gpu B300 --retry` waits until one of those GPUs is free, then creates it (see "Waiting for a GPU" below).
+The script uses Python's standard library only: nothing to install. On your machine you need:
 
-While `up` waits, two kinds of lines appear. `[RUNPOD]` lines are Runpod's own system log: what the host does before our script runs (the image found on the host or fetched from Docker Hub, the container started). `[AINVFX]` lines are our script on the pod. If the host has to fetch the image, `up` prints one summary line every 15 seconds (`image download: 19 layers · 7 done · 9 extracting · 3 downloading (2 min 30 s)`), so a long pull never looks like a hang; after 8 minutes without a container, it prints a warning in capitals. The pod bills from its creation, whatever the host is doing: the answer to a stalled pod is `python pod.py down`, then `up` again, usually in another data center. An error after the pod exists is always a message that names the pod, never a traceback.
+- **Python 3.8 or newer.** Windows: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`. macOS and Linux usually have it (`python3 --version`). With [uv](https://docs.astral.sh/uv/getting-started/installation/), `uv run pod.py ...` fetches a Python for you.
+- **Git**, to clone and update this repository. GitHub's "Download ZIP" button works too.
+- **A Runpod API key.** In the console: Account, Credentials, API Keys, Create API Key. Choose *Restricted*, set **api.runpod.io/graphql** to **Read / Write** (pods, catalog, secrets, SSH keys) and leave **api.runpod.ai** on **None** (Serverless, not used). `setup` stores the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
+- **`ssh`**, optional: only `pod.py ssh` uses it.
 
-**Several pods at once** (LoRA training, for example): `up video+train --name jar-lora` creates a second pod of the same profile, known to the script as `jar-lora`. Every command then takes that name, the pod's full name or its id: `status jar-lora`, `pull ainvfx-train-jar-lora`, `down jar-lora`. `list` shows every pod of your account and which ones this machine knows; a pod created from the console or from another machine is attached by its first command (`python pod.py status <name or id>`). A pod terminated from the console, or from another machine, is forgotten here by the next `list`, or by the next command given without a name (since 0.9.3). `down --all` terminates every pod recorded here.
+## Commands
 
-Profiles, since 0.8.0 (10 October 2026): four atomic sets of models in `models.json`, combined on the command line. `up image` (the image block: Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, SeedVR2, the Qwen-Image-2512 panorama set, the 360 edit LoRA and the four FLUX 3 Image Klein files of session 5; about 105 GB) and `up 3d` (TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet; about 30 GB) rent an RTX 5090; `up video` (LTX 2.5 and its IC-LoRAs, about 85 GB) and `up train` (the bf16 LTX files of the training kit, about 68 GB) rent an RTX PRO 6000 (96 GB). Join them with `+`: `up image+3d` for the 3D session, `up image+video` for the video sessions, `up video+train` for training, `up all` for everything (about 270 GB). The container disk follows the models of the list the pod downloads, yours included (115% of their size plus 30 GB, rounded up to 10, never under 100 GB): 160 GB for `image`, 190 for `image+3d`, 250 for `image+video`, 360 for `all`; `--disk` overrides it. A profile alone downloads only its own files: `video` no longer includes `image`.
+| Command | What it does |
+|---|---|
+| `setup` | Stores the API key, guesses your nearest data centers from your clock, registers your SSH key. `--hf-token` stores your Hugging Face token; `--region EU --country FR` sets the data centers to try first |
+| `up <profiles>` | Creates a pod and follows its log until `READY` (below: [How `up` picks a GPU](#how-up-picks-a-gpu)) |
+| `status [pod]` | GPU, data center, cost so far, credit left, addresses, last log lines |
+| `logs [pod]` | Follows the log again until `READY` |
+| `open [pod]` | Opens ComfyUI in your browser |
+| `push [pod] FILES` | Copies files into the pod's input folder |
+| `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/` |
+| `down [pod]` | Pulls, terminates, then says what the pod cost and the credit left. `--all` for every pod recorded here, `--no-pull` to skip the download |
+| `ssh [pod]` | A terminal on the pod |
+| `list` | Every pod of your account, and which ones this machine knows |
+| `doctor` | Checks Python, ssh, the API key and the settings |
 
-**What you need on your machine**
+`[pod]` is the profile, the name given to `up --name`, the pod's name or its id. You can leave it out when one pod is recorded. Ctrl+C while a log is followed stops the following only: the pod keeps running until `down`. `python pod.py --help` lists every option.
 
-- **Python 3.8 or newer.** Windows: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`. macOS and Linux usually have it: `python3 --version`. Or install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run `uv run pod.py ...`, which fetches a Python for you.
-- **Git**, to clone and update this repository. Without Git, GitHub's "Download ZIP" button works too.
-- **A Runpod API key**: in the console, Account, Credentials, API Keys, "Create API Key". Name it `ainvfx-runpod` (any name works; this one says what it is for). Choose *Restricted*, then set **api.runpod.io/graphql** to **Read / Write** (the API the script uses for pods, the catalog, secrets and SSH keys) and leave **api.runpod.ai** on **None** (Serverless endpoints, not used here). The old Settings page now redirects to Credentials. The script keeps the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
-- **`ssh` is optional.** Only `pod.py ssh` uses it. Everything else goes through the browser and Runpod's proxy.
+**Several pods at once.** `up video+train --name jar-lora` creates a second pod, known here as `jar-lora`; every command then takes that name. A pod created from the console or another machine is attached by its first command (`python pod.py status <name or id>`). A pod terminated elsewhere is forgotten by the next `list`, or by the next command given without a name.
 
-The script uses Python's standard library only: nothing to install.
+## Profiles
 
-## What the pod does when it starts
+Each profile is a set of models in [`models.json`](models.json). Join them with `+` (`up image+3d`), or ask for `all`. A profile downloads only its own files: `video` does not include `image`.
 
-The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repository. Every line it writes starts with `[AINVFX]`; read them in the pod's log (Runpod console, `python pod.py logs` or `python pod.py status`).
+| Profile | Contents | GPU `up` rents | Models | Container disk |
+|---|---|---|---|---|
+| `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image | RTX 5090 (32 GB) | 117 GB | 170 GB |
+| `3d` | TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet | RTX 5090 | 32 GB | 100 GB |
+| `video` | LTX 2.5, the LTX IC-LoRAs (ainvfx-fluid and LTX Ripple included), SeedVR2 7B, RIFE | RTX PRO 6000 (96 GB) | 85 GB | 130 GB |
+| `train` | the bf16 LTX 2.5 files of the training kit | RTX PRO 6000 | 68 GB | 110 GB |
+| `image+3d` | | RTX 5090 | 148 GB | 210 GB |
+| `image+video` | | RTX PRO 6000 | 202 GB | 270 GB |
+| `all` | | RTX PRO 6000 | 301 GB | 380 GB |
 
-| Step | What happens | The log says |
-|---|---|---|
-| before | Runpod puts the image on the host. The template uses the image of Runpod's own "Runpod Pytorch 2.8.0" template, which the hosts already hold, so this takes seconds; a host that has to fetch an image from Docker Hub takes several minutes (19 layers, about 9 GB) | `[RUNPOD]` lines in `pod.py`; system log in the console |
-| 0 | SSH and JupyterLab start in the background, before anything else | JupyterLab answers within two minutes |
-| 1 | **Health check**: the GPU and its driver (580 or newer, so the CUDA 13 kernels of the int8 models run), disk write and read speed | a `WARNING` in capitals when a value is bad: terminate and create again, usually in another data center |
-| 2 | **Install**: uv, Python 3.13, PyTorch for CUDA 13.0, ComfyUI at tag `v0.41.2`, the Manager, then the custom nodes named in `settings.env`. The same lines as a manual install on your own machine. A download that fails is retried, and PyTorch then comes from PyPI, the same CUDA 13.0 build | `ComfyUI v0.40.0`; `FAILED` when the pod cannot work on that machine (below) |
-| 3 | **Start**: ComfyUI listens for the proxy | `COMFYUI UP` with the address, then `PROXY OK` |
-| 4 | **Models**: the files of the profile, from [`models.json`](models.json), one by one. A first line gives the plan (files to download, GB); then every line says file k of n, the GB done of the GB planned, the percent and the time left at the average speed so far. The first file over 1 GB judges the download speed (a `WARNING` under 50 MB/s); files already present are skipped. Each gated file is checked first: one whose licence your Hugging Face account has not accepted gets a `WAITING` line with its page, and the end of the log lists them all | `MODELS DONE 14/14` with the total time and the average speed |
-| 5 | **Self-test**: one Z-Image Turbo image, 1024 x 1024 in 8 steps, saved in `output/` | `SELFTEST OK` with the time, then `READY` with two links: ComfyUI, and JupyterLab with its token |
+Sizes read from `models.json` on 21 October 2026. A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB, never under 100 GB. `up` computes it from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
 
-`up` and `logs` read the log from two places, because Runpod's live log stream has been seen staying open and silent while the pod wrote its last lines: the stream is reopened every minute a few seconds back, and every 15 seconds the script reads the copy of the log that the pod serves itself. Whichever shows `READY` first ends the wait.
+## Your own settings
 
-If GitHub cannot be reached, the start command falls back to Runpod's own `/start.sh`: the pod still boots with SSH and JupyterLab, and the error can be read.
-
-**When the log says `FAILED`.** The pod cannot work on that machine: Python, PyTorch or ComfyUI could not be installed, or PyTorch cannot see the GPU. The line says which, and what to do. The pod stays up so the log can be read, and it bills: terminate it and create another (`python pod.py down`, then `up`), which lands on another machine. `up` stops on that line.
-
-**When the log says `ACTION NEEDED`.** Gated files did not come, and the lines below it give the Hugging Face page of each. Logged in with the account the log names, click « Agree and access repository » on each page, then fetch the files on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal (File, New, Terminal) or after `python pod.py ssh`. A pod without a token needs one first (below), then a new pod.
-
-Profile sizes (Hugging Face, 4, 10, 11, 15 and 16 October 2026): `image` 23 files, about 105 GB (four of them gated, FLUX 3 Image Klein); `3d` 15 files, about 30 GB; `video` 22 files, about 85 GB; `train` 2 files, about 68 GB; `all` 61 files, about 290 GB.
-
-Measured on two RTX 5090 pods on Secure Cloud (4 and 5 October 2026), on the image above: the container up within a minute or two of creation, PyTorch installed in 90 seconds, ComfyUI answering after about 4 minutes; the 63 GB of the `image` profile took 10 minutes in EUR-IS-2 (about 100 MB/s) and 90 seconds in EU-CZ-1 (300 to 1300 MB/s per file); the self-test 16 to 106 seconds on the first load, 2 seconds once cached; `READY` 5 to 15 minutes after creation. A third pod on 5 October, created with "any data center" after the first choice had no stock, landed on a host that Runpod had scheduled for removal: it never started its container, the API still said RUNNING, and the log stream did not answer. That pod is why `up` now warns after 8 minutes without a container and why every API error is a message. On 7 October a pod created the same way landed on such a host again, although the catalog showed no stock for that GPU: since 0.6.0, `up` never creates a pod without stock and checks the host after creation (see How `up` picks the machine, below).
-
-The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log` (also reachable as `/workspace/ainvfx-bootstrap.log`). Because it lives in ComfyUI's input folder, the pod serves it through its own proxy once ComfyUI answers (so anyone with the pod's address can read it, the JupyterLab token of its last line included: keep the address to yourself), and `pod.py` reads it there as well as through the API stream: `up` and `logs` catch `READY` either way.
-
-## Your own settings: settings.env, settings.local.env, --set
-
-Every choice the pod makes is one line of [`settings.env`](settings.env), next to the script. The values travel with the pod as environment variables, and `bootstrap.sh` reads them. An empty value means the default; `python pod.py doctor` shows what will be sent, and marks the values that are yours. From the browser, the same variables go in the Environment variables section of the template's deploy page. Deploy without touching anything and you get the course's pod.
+Every choice the pod makes is one line of [`settings.env`](settings.env). The values travel with the pod as environment variables, and `bootstrap.sh` reads them on the pod. From the browser, set the same variables in the Environment variables section of the deploy page. Change nothing and you get the course's pod.
 
 Three ways to change a value, from the most lasting to the most temporary:
 
-1. **`settings.local.env`**, a file you create next to `settings.env`, with the same `KEY=value` lines. Each key there replaces the same key of `settings.env`; the keys you leave out keep the course's value. Git ignores this file, so `git pull` never touches it, and every pod you create uses it. The place for a list of models of your own, or custom nodes you always want.
-2. **`--set AINVFX_KEY=VALUE`** on `up`, repeatable, for one pod only: `python pod.py up image --set AINVFX_COMFY_TAG=master --set AINVFX_SELFTEST=0`.
-3. **`--models-url URL`** on `up`, a shortcut for `--set AINVFX_MODELS_URL=URL`.
+1. **`settings.local.env`**, a file you create next to `settings.env`, with the same `KEY=value` lines. Each key there replaces the same key of `settings.env`. Git ignores it, so `git pull` never touches it. Do not edit `settings.env` itself: `git pull` would stop on your change.
+2. **`up --set AINVFX_KEY=VALUE`**, repeatable, for one pod: `python pod.py up image --set AINVFX_COMFY_TAG=master`.
+3. **`up --models-url URL`**, a shortcut for `--set AINVFX_MODELS_URL=URL`.
 
-Never edit `settings.env` itself: `git pull` would stop on your change. Before creating the pod, `up` prints every value that differs from `settings.env`, so you see what the pod will do.
+`up` prints every value that differs from `settings.env` before it creates the pod, and `doctor` shows them all.
 
-**Your own list of models.** Copy [`models.json`](models.json), keep its shape, and put the result somewhere the pod can download it as a plain file: a fork of this repository (`https://raw.githubusercontent.com/<you>/ainvfx-runpod/main/models.json`) or a GitHub Gist (its Raw button gives the URL). A Google Drive, Dropbox or GitHub share link to the file works too, shared with anyone who has the link: `up` reads your list before creating the pod, sizes the disk from it, and stops if the link gives a web page instead of the file. In the file, `profiles` names which entries each profile downloads (`@image` inside `video` means "everything of image, plus"), and `files` describes each entry: the Hugging Face `repo`, the `path` of the file inside it, the `dir` under `ComfyUI/models` where it goes, its size in `gb` (for the progress lines) and `gated: true` when the repository needs a token. Point `AINVFX_MODELS_URL` at your file in `settings.local.env`, or give `--models-url` for one pod: the pod downloads your list instead of the course's. For a file needed once, the pod's own terminal works too (JupyterLab, or `python pod.py ssh`): `cd /workspace/ComfyUI/models/diffusion_models && hf download <repo> <path> --local-dir .`; it is gone with the pod.
+| Variable | Default | What it sets |
+|---|---|---|
+| `AINVFX_PROFILE` | `image` | The profiles to download. `up <profiles>` sets it for you |
+| `AINVFX_COMFY_TAG` | `v0.42.1` | The ComfyUI release: a git tag, or a branch (`master` for the latest commit) |
+| `AINVFX_PYTHON` | `3.13` | The Python of the pod's environment, installed by uv |
+| `AINVFX_TORCH` | `torch torchvision torchaudio` | The PyTorch packages, with pip flags if wanted (`--pre ...` for nightlies) |
+| `AINVFX_TORCH_INDEX` | the CUDA 13.0 stable index | The wheel index PyTorch comes from (`.../whl/nightly/cu130` for nightlies) |
+| `AINVFX_MODELS_URL` | this repository's `models.json` | Your own list of models (below) |
+| `AINVFX_CUSTOM_NODES` | none | Git URLs separated by spaces; each is cloned into `custom_nodes` and its `requirements.txt` installed |
+| `AINVFX_HEALTHCHECK` | `1` | `0` skips the disk speed test at start |
+| `AINVFX_SELFTEST` | `1` | `0` skips the test image at the end (`up --no-selftest` does the same) |
+| `AINVFX_BOOTSTRAP_URL` | this repository's | The raw URL of a fork's own `bootstrap.sh`, run in place of this one |
 
-**`AINVFX_PROFILE`** · which sets of `models.json` to download. Default `image`.
-`image` (105 GB) · `3d` (30 GB) · `video` (LTX 2.5, 85 GB) · `train` (the bf16 training files, 68 GB) · several joined by `+`, for example `image+3d` or `image+video+train` · `all`. `up <profiles>` sets it for you.
+Values with spaces need no quotes; lines starting with `#` are comments.
 
-**`AINVFX_COMFY_TAG`** · the ComfyUI release. Default `v0.41.2`.
-A git tag (`v0.41.2`) · a branch (`master` for the latest commit).
-
-**`AINVFX_PYTHON`** · the Python of the pod's environment, installed by uv. Default `3.13`.
-`3.12` · `3.13` · `3.14`.
-
-**`AINVFX_TORCH`** · the PyTorch packages, with pip flags if wanted. Default `torch torchvision torchaudio`.
-`torch torchvision torchaudio` (stable) · `--pre torch torchvision torchaudio` (nightlies) · a pinned `torch==2.9.1 torchvision==0.24.1`.
-
-**`AINVFX_TORCH_INDEX`** · the wheel index PyTorch comes from. Default: the cu130 stable index.
-`https://download.pytorch.org/whl/cu130` (stable, CUDA 13.0) · `https://download.pytorch.org/whl/nightly/cu130` (nightlies) · the `cu128` index with a 12.8 driver.
-
-**`AINVFX_MODELS_URL`** · where the list of models comes from. Default: this repository's `models.json` on `main`.
-A link to a `models.json` shaped like this one (a raw link, or a Google Drive, Dropbox or GitHub share link: above), in `settings.local.env` or with `up --models-url`.
-
-**`AINVFX_CUSTOM_NODES`** · custom nodes installed at start. Default: none.
-Git URLs separated by spaces, for example `https://github.com/kijai/ComfyUI-KJNodes https://github.com/rgthree/rgthree-comfy`. Each is cloned into `custom_nodes` and its `requirements.txt` installed.
-
-**`AINVFX_HEALTHCHECK`** · the disk measurement at start. Default `1`.
-`1` measures and warns when slow · `0` skips it.
-
-**`AINVFX_SELFTEST`** · the test image at the end. Default `1`.
-`1` renders one Z-Image Turbo image, which proves the GPU, the kernels and the models · `0` skips it (`up --no-selftest` does the same).
-
-**`AINVFX_BOOTSTRAP_URL`** · a fork's own `bootstrap.sh`, run in place of this repository's. Default: this repository's on `main`.
-The raw URL of the script.
-
-**`HF_TOKEN`** · the Hugging Face token for the gated files of `models.json` (FLUX 3 Image Klein in `image`, LTX in `video` and `train`). Never written in this file.
-`setup --hf-token` stores it as the Runpod secret `huggingface_token`; `up` sends the reference `{{ RUNPOD_SECRET_huggingface_token }}`. Without it the gated files are skipped and the log says so; the image models need none.
-
-Values with spaces need no quotes (`AINVFX_TORCH=--pre torch torchvision torchaudio` is read whole); lines starting with `#` are comments.
+**Your own list of models.** Copy [`models.json`](models.json) and keep its shape. In `profiles`, each profile names its entries (`@image` inside a profile means "everything of image, plus"). In `files`, each entry gives the Hugging Face `repo`, the `path` of the file in it, the `dir` under `ComfyUI/models` where it goes, its size in `gb`, and `gated: true` when the repository needs a token. Put the file where the pod can download it: a fork of this repository, a GitHub Gist (its Raw button gives the URL), or a Google Drive, Dropbox or GitHub share link open to anyone with the link. Then set `AINVFX_MODELS_URL` in `settings.local.env`, or give `--models-url` for one pod. `up` reads your list before it creates the pod, and stops if the link gives a web page instead of the file. For a file needed once, the pod's terminal is enough: `cd /workspace/ComfyUI/models/<folder> && hf download <repo> <path> --local-dir .`
 
 ## The Hugging Face token
 
-The gated repositories (FLUX 3 Image Klein in the `image` profile, LTX 2.5 in `video` and `train`; `gated: true` in `models.json`) need a Hugging Face read token: a free Hugging Face account, the licence accepted once on the model's page ("Agree and access repository"), then a token of type Read from Settings, Access Tokens. The token never travels in a slide, a chat or a file:
+Some repositories are **gated**: Hugging Face serves their files only to an account that has accepted their licence. Here: FLUX 3 Image Klein in `image`, LTX 2.5 in `video` and `train` (`gated: true` in `models.json`). They need a free Hugging Face account, the licence accepted on each model's page ("Agree and access repository"), and a token of type Read (Settings, Access Tokens).
 
-- `python pod.py setup --hf-token` stores it on Runpod as the secret `huggingface_token` (or do it in the console: Account, Credentials, Secrets, same name).
-- Pods receive it as the variable `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots.
-- Without a secret of that name, the pod receives the placeholder unchanged, notices it, ignores it and skips the gated files. The log says so, with the page of each file. Nothing else breaks.
-- The pod checks the token once and names its Hugging Face account in the log. A token that Hugging Face refuses is dropped, with a `WARNING`.
-- Each gated repository has its own licence: the FLUX 3 Image Klein repo (approved at once), the LTX 2.5 models, then each LTX IC-LoRA. Since 5.9 the log names, after the models plan, every gated repo of the profile with its number of files, how many wait, and how its licence is approved (at once, or by the authors), read from the Hugging Face API. A licence not accepted yet stops nothing else: the end of the log lists the page of each file waiting (`ACTION NEEDED`, above).
+- `python pod.py setup --hf-token` stores the token on Runpod as the secret `huggingface_token`, never on your machine. From the console: Account, Credentials, Secrets, same name.
+- Each pod receives `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots. Without that secret, the pod ignores the placeholder and skips the gated files. Nothing else breaks.
+- The log names the Hugging Face account of the token, lists each gated repository with how its licence is approved (at once, or by its authors), and ends with the page of every file still waiting.
 
 ## Files in and out
 
-- **Workflow files** (`.json`): drag and drop them onto the ComfyUI canvas, as at home.
+- **Workflows** (`.json`): drag them onto the ComfyUI canvas, as at home.
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
-- **Results out**: the Assets panel in ComfyUI's sidebar, or `python pod.py pull`, which downloads every file of the pod's output folder that you do not have yet, subfolders kept, into `outputs/<pod name>/` next to the script (or the folder named in `AINVFX_OUTPUTS`): images, videos, 3D files (GLB, PLY), and files a node saves without showing them, such as a trained LoRA. It walks the folder through the pod's JupyterLab, with the token of the log's READY line; when JupyterLab is off, it falls back to the files ComfyUI's history lists. `python pod.py down` runs the same pull before it terminates the pod.
-- **Many files at once**: JupyterLab, from the link on the `READY` line (its token is in it) or from the pod's Connect button. Its terminal is under File, New, Terminal.
+- **Results out**: the Assets panel in ComfyUI, or `python pod.py pull`. It downloads every file of the pod's output folder that you do not have yet, subfolders kept: images, videos, 3D files, and files a node saves without showing them, such as a trained LoRA. It walks the folder through the pod's JupyterLab, with the token of the `READY` line. When JupyterLab is off, it falls back to the files ComfyUI's history lists. Results go to `outputs/<pod name>/` next to the script, or to the folder named in `AINVFX_OUTPUTS`. `down` runs the same pull first.
+- **Many files at once**: JupyterLab, from the link on the `READY` line. Its terminal is under File, New, Terminal.
 
-## How `up` picks the machine
+## How `up` picks a GPU
 
-The script reads Runpod's catalog once per cloud: every GPU type with its stock on hosts with CUDA 13.0 or newer. It orders the data centers by distance to you: your country first (Runpod names its data centers by country: `CA-MTL-1`, `US-TX-3`, `EU-FR-1`, `EUR-IS-2`), then the rest of your region (Europe or North America), then the other region. Country and region are guessed from this computer's clock (`America/Toronto` gives Canada; `Europe/Paris` gives France) and changed with `setup --region EU --country FR`. `up` prints where the profile's GPU is in stock, in your region and elsewhere, and its hourly price.
+1. It reads Runpod's catalog: every GPU type in stock on hosts with CUDA 13.0 or newer (driver 580 or newer, which the course's int8 models need).
+2. It tries the profile's GPU on **Secure Cloud** (Runpod's own data centers), in the nearest data center first: your country, then your region, then the other region. Your country comes from your computer's clock (`America/Toronto` gives Canada); `setup --region EU --country FR` changes it.
+3. When that GPU has no stock, it lists every GPU in stock that fits the profile, cheapest first, and proposes the cheapest. To fit, a GPU needs the profile's memory (32 GB for `image` and `3d`, 96 GB for `video` and `train`), a Blackwell chip or newer, and must not be a 1g MIG slice (the smallest share of a bigger GPU: one took seven times longer on the test image than an RTX 5090). `up` never takes more than 2.50 USD per hour on its own (`--max-price` changes it).
+4. It creates a pod only where the catalog shows stock, and always names the data center. Left to choose, Runpod has twice placed a pod on a host being removed from the platform.
+5. Right after creation, it checks the host. A host with maintenance under way, or due within 24 hours, is terminated at once (a few seconds billed), and the next machine is tried.
 
-`up` creates a pod only where the catalog shows stock, on Secure Cloud, and always names the data center. With no data center named, Runpod picks any host, and on 5 and 7 October 2026 that host was one being removed from the platform. **Community Cloud is left out unless you add `--community`** (since 0.8.0): its machines belong to third parties, cost less and carry no data center in the catalog, so Runpod picks the host; on 9 October 2026 the first pod of a session, a Community RTX 5090, never started. With `--community`, `up` reads that catalog too and may propose a Community GPU when it is the cheapest that fits. When the profile's GPU has no stock on Secure Cloud, `up` lists every GPU in stock that fits the profile (32 GB of VRAM or more for `image`, 96 GB for `video` and `train`, a Blackwell chip or newer), cheapest first. It leaves out the 1g MIG slices. A MIG slice (Multi-Instance GPU) is a fixed share of a bigger GPU, with its own memory, and a 1g slice is the smallest share: one seventh of a B300. On 7 October 2026 a B300 MIG 1g.34gb ran the image self-test in 111 s, against 16.1 s on an RTX 5090. `--gpu "B300 MIG 34GB"` still takes one. It marks the one it will create and prints the command to take another one, for example `python pod.py up image --gpu "RTX PRO 4500 SE"` (the name from the GPU column, or the full id). It never takes a GPU above 2.50 USD per hour on its own (`--max-price` changes that). If a GPU is taken between the catalog read and the creation, `up` tries its other data centers with stock, then the next GPU that fits, cheapest first. Community Cloud stock comes with no data center in the catalog, so a Community pod is the one case where Runpod picks the host.
+Before its question, `up` shows your credit and how many hours it buys at the proposed price. `--gpu NAME` takes one GPU from the list, by its short name (`"RTX PRO 4500 SE"`) or full id; repeat it to accept several, tried in the order given (`--gpu B200 --gpu B300`). `--community` also considers Community Cloud.
 
-Right after each creation, `up` reads the pod's host through Runpod's GraphQL API (the REST API does not report it). A host with maintenance under way, or starting within 24 hours, is terminated at once (a few seconds billed), and the next GPU is tried. `--gpu` tries only the GPU you name, on Secure Cloud unless `--community` is added. Repeat it to accept several GPUs, tried in the order given: `--gpu B200 --gpu B300`.
-
-**Waiting for a GPU: `--retry`** (since 0.9.0). When nothing that fits is free, `up` stops. With `--retry`, it waits instead. It reads the catalog again every 15 seconds and creates the first GPU free, by the same rules as without `--retry`: the GPUs named with `--gpu`, or else the profile's GPU and any GPU that fits at 2.50 USD per hour or less. It creates one pod, then follows its log as usual. Its question comes once, before the wait, and names the highest price the wait accepts; `-y` skips it. A machine taken between the catalog read and the creation does not end the wait. Ctrl+C ends it, and no pod bills before one is created. If another `up` creates a pod under the same name during the wait, the wait stops instead of creating a second pod. On 19 October 2026, each B200 and B300 freed on Secure Cloud was taken within seconds. This command waits for the first one free:
+**Waiting for a GPU.** With `--retry`, `up` waits instead of stopping when nothing that fits is free. It reads the catalog every 15 seconds (`AINVFX_RETRY_EVERY`) and creates the first GPU free, by the same rules: one pod, never more. It asks its question once, before the wait (`-y` skips it). Ctrl+C ends the wait, and nothing bills before a pod exists. One read every 15 seconds is 240 requests an hour, well under Runpod's limit of 3,600.
 
 ```bash
 python pod.py up image+video --gpu B200 --gpu B300 --retry
 ```
 
-Each read is one request to the Runpod API (two with `--community`): 240 an hour at 15 seconds, against the 3,600 an hour that Runpod allows from 27 October 2026. `AINVFX_RETRY_EVERY` sets another interval, in seconds.
+## What the pod does when it starts
 
-**What it costs.** Before its question, `up` shows your Runpod credit and how many hours it buys on the card it proposes, and the question names the price per hour. `down` says what each pod cost (its hours at its price: an estimate, since Runpod bills from creation), lists any pod still running with its price per hour and the total, and gives the credit left. `status` shows the cost so far and the hours left at that pod's price. The credit comes from Runpod's GraphQL API; when it cannot be read, these lines are left out.
+The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repository. Every line it writes starts with `[AINVFX]`. Before it, `up` shows Runpod's own system log as `[RUNPOD]` lines: the host fetching the image, then starting the container.
 
-By default `up` creates the pod from the AInVFX template (`4i789znkrd`); `setup --template <id>` points it at another. Without a template the script describes the pod itself: the same image, ports 8188 and 8888 over HTTP and 22 over TCP, the same start command.
+| Step | What happens | The log says |
+|---|---|---|
+| 0 | SSH and JupyterLab start in the background | JupyterLab answers within two minutes |
+| 1 | Health check: the GPU, its driver (580 or newer), the disk speed | a `WARNING` in capitals when a value is bad |
+| 2 | Install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at the tag of `AINVFX_COMFY_TAG`, the Manager, your custom nodes. A failed download is retried; PyTorch then comes from PyPI, the same CUDA 13.0 build | `FAILED` when the pod cannot work on that machine |
+| 3 | ComfyUI starts for Runpod's proxy | `COMFYUI UP`, then `PROXY OK` |
+| 4 | The models of the profile, one by one. Each line gives file k of n, GB done, percent and time left. Files already present are skipped | `MODELS DONE` with the total time and speed |
+| 5 | One Z-Image Turbo test image, 1024 x 1024 in 8 steps | `SELFTEST OK`, then `READY` with the ComfyUI and JupyterLab links |
 
-**The image** is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the image of Runpod's own "Runpod Pytorch 2.8.0" template. Runpod keeps the images of its own templates on its hosts, so the container starts within seconds; any other tag has to be fetched from Docker Hub by the host first (the `1.0.7-cu1300-torch291` tag tried on 5 October 2026: 19 layers, about 9 GB, over 5 minutes before we gave up). The image's own PyTorch and CUDA toolkit are not used: `bootstrap.sh` builds the pod's environment with the cu130 PyTorch wheels, which carry their own CUDA 13 libraries, and the GPU driver is the host's. The toolkit of the image only matters to a custom node that compiles a CUDA kernel from source; none of the course's does, and if one did, `uv pip install nvidia-cuda-nvcc==13.0.88` in the venv provides the CUDA 13 compiler.
+The image is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the one of Runpod's own "Runpod Pytorch 2.8.0" template. Runpod keeps it on its hosts, so the container starts within seconds. Its own PyTorch and CUDA toolkit are not used: `bootstrap.sh` installs PyTorch built for CUDA 13.0, which carries its own CUDA libraries.
 
-## Costs, as read on 8 October 2026
+The log is written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log`. Because it sits in ComfyUI's input folder, the pod serves it through its proxy, and `pod.py` reads it there as well as through Runpod's log stream: that stream has been seen staying silent while the pod wrote its last lines.
 
-RTX 5090: 1.19 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96 GB): 2.49 and 1.69. The container disk costs 0.10 USD per GB per month while the pod runs, nothing after termination. Billing is by the second, from creation to termination. Current prices: [Runpod pricing](https://docs.runpod.io/pods/pricing).
+## When something goes wrong
 
-## Security notes
+- **`FAILED` in the log.** The pod cannot work on that machine: Python, PyTorch or ComfyUI could not be installed, or PyTorch cannot see the GPU. The line says which. The pod stays up so the log can be read, and it bills. Terminate it and create another (`python pod.py down`, then `up`): it lands on another machine. `up` stops on that line.
+- **`ACTION NEEDED` in the log.** Some gated files did not come. Logged in to Hugging Face with the account the log names, click "Agree and access repository" on each page listed. Then fetch them on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal or after `python pod.py ssh`. A pod without a token needs one first (`setup --hf-token`), then a new pod.
+- **No container after 8 minutes.** `up` prints a warning in capitals: the host is still fetching the image, or does not respond. The pod bills meanwhile. Run `python pod.py down`, then `up` again, usually in another data center.
+- **A blank "403" page from the Connect button.** Press Enter in the address bar. ComfyUI refuses a page opened by a click from another site (its protection against sites that would drive it), never an address typed or opened by `pod.py open`.
+- **GitHub unreachable at start.** The start command falls back to Runpod's own `/start.sh`: the pod still boots with SSH and JupyterLab, so the error can be read.
+- **Any other error after the pod exists.** It is a message that names the pod, never a traceback. `python pod.py list` shows your pods, `down` terminates one. `AINVFX_DEBUG=1` prints the full trace for a bug report.
 
-- The proxy address is public: the pod id is its only protection, and ComfyUI has no login. Do not share the address; terminate the pod when you are done.
-- Community Cloud pods run on machines owned by third parties. Fine for public material; keep client material on Secure Cloud, or at home.
-- The API key is written to one file with restricted permissions (`chmod 600`, or an `icacls` grant to your account on Windows). `RUNPOD_API_KEY` in the environment takes precedence, which lets you avoid the file entirely.
+## Security
+
+- ComfyUI has no login, and its proxy address is public: the pod id is its only protection. The log, served at that address, holds JupyterLab's token. Keep the address to yourself, and terminate the pod when you are done.
+- Community Cloud runs on machines owned by third parties. Keep client material on Secure Cloud, or at home.
+- The API key sits in one file readable by your account only (`chmod 600`, or an `icacls` grant on Windows). `RUNPOD_API_KEY` in the environment takes precedence, so you can avoid the file entirely.
+- The Hugging Face token stays on Runpod as a secret; pods receive it at boot.
 - Nothing survives termination. That is the design: your work travels with you.
 
 ## Updating
@@ -192,12 +186,12 @@ RTX 5090: 1.19 USD per hour on Secure Cloud, 0.69 on Community. RTX PRO 6000 (96
 git pull
 ```
 
-The ComfyUI tag and the other choices live in `settings.env` (and, for browser users, in the template's variables); the model list in `models.json`; your own values in `settings.local.env`, which `git pull` leaves alone. A pod created after a change uses the new values; a running pod keeps its own.
+A pod created after the update uses the new values; a running pod keeps its own. Prices change: `up` always shows the live price, and [Runpod's pricing page](https://docs.runpod.io/pods/pricing) lists them all.
 
 ## For contributors
 
-`python -m unittest discover tests` (or `pytest`) runs the tests in `tests/test_pod.py`: unit tests of the helpers, then every command end to end against a fake Runpod API and a fake ComfyUI started on your own machine. Nothing is billed, your configuration is untouched, and the log stream's reconnect behaviour that once hid `READY` is reproduced. Standard library only, in the script and in the tests; keep it that way.
+`python -m unittest discover tests` runs [`tests/test_pod.py`](tests/test_pod.py): unit tests of the helpers, then every command end to end against a fake Runpod API, a fake ComfyUI and a fake JupyterLab on your own machine. Nothing is billed and your configuration is untouched. Standard library only, in the script and in the tests: keep it that way.
 
 ## Credits and licence
 
-Maintained by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/) and open to everyone, in partnership with [Runpod](https://www.runpod.io/), the bootcamp's GPU infrastructure partner. Not affiliated with [Comfy Org](https://www.comfy.org/): [ComfyUI](https://github.com/Comfy-Org/ComfyUI) is theirs, under the [GPL-3.0 licence](https://github.com/Comfy-Org/ComfyUI/blob/master/LICENSE). The models come from their authors on [Hugging Face](https://huggingface.co/), each under its own licence (see the model page named in [`models.json`](models.json)); the gated models (FLUX 3 Image Klein, LTX) need a Hugging Face token. The Runpod logo belongs to [Runpod](https://www.runpod.io/) and the AInVFX logo to [AInVFX](https://www.ainvfx.com/). This code is released under the [Apache License 2.0](LICENSE). Questions and bugs: [the issues page](https://github.com/AInVFX/ainvfx-runpod/issues), or [the AInVFX Discord](https://discord.gg/6CKSa3b5ks).
+Maintained by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/) and open to everyone, in partnership with [Runpod](https://www.runpod.io/). Not affiliated with [Comfy Org](https://www.comfy.org/): [ComfyUI](https://github.com/Comfy-Org/ComfyUI) is theirs, under the [GPL-3.0 licence](https://github.com/Comfy-Org/ComfyUI/blob/master/LICENSE). The models come from their authors on [Hugging Face](https://huggingface.co/), each under its own licence (see the repository named in [`models.json`](models.json)). The Runpod logo belongs to Runpod and the AInVFX logo to AInVFX. This code is released under the [Apache License 2.0](LICENSE). Questions and bugs: [the issues page](https://github.com/AInVFX/ainvfx-runpod/issues), or [the AInVFX Discord](https://discord.gg/6CKSa3b5ks).

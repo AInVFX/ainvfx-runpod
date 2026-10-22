@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
-"""Tests for pod.py. Standard library only, nothing reaches Runpod, nothing is billed, and the
-real ~/.ainvfx-runpod is untouched (the end-to-end tests run with HOME in a temporary folder).
+"""Tests for pod.py. Standard library only: nothing reaches Runpod, nothing is billed, and the real
+~/.ainvfx-runpod is untouched (the end-to-end tests run with HOME in a temporary folder).
 
     python -m unittest discover tests      # from the repository root
-    python tests/test_pod.py               # the same, directly
-    pytest                                 # if you have it
 
-Two groups. `Helpers` are unit tests of the pure functions (data center order, the place guessed
-from the clock, the stream resume point, the error hints). `EndToEnd` starts a fake Runpod API v2
-and a fake ComfyUI on 127.0.0.1 and runs the real commands (setup, doctor, up, status, pull, push,
-list, down) through subprocess, as a user would. The fake reproduces what the real log stream was
-seen doing on 4 and 5 October 2026: events carry a timestamp as id, a `since` cursor is exclusive
-at one-second resolution, the stream stays open with keepalive lines, and the lines written after
-SELFTEST OK (READY, remember) never arrive on a live connection: only a fresh request serves them.
-Before 0.3.1, `up` therefore sat on SELFTEST OK until its deadline. Three scenarios: both sources
-available; the pod's own copy of the log unavailable (READY must come from a reopened stream);
-the log endpoint answering 403 (READY must come from the pod's own copy). Then several pods at
-once: `up --name`, commands by name or id, attaching a pod created elsewhere, `down --all`. Then
-what the 5 October pods taught: Runpod's system log (the image pull, layer by layer) shown as one
-summary, a container that does not start (the stall warning), and a log route that does not answer
-(a message, not a traceback). Then a pod whose log stops at a FAILED line (bootstrap.sh 5.4): `up`
-must stop there, say what to do, and exit non-zero. Then what 7 October 2026 taught: no RTX 5090 on
-Secure Cloud (the GPUs in stock that fit are listed, the cheapest is created in its own data center,
-never a pod without stock), a host under maintenance (terminated at once, the next GPU tried), and
---gpu by short name. Then what 19 October 2026 taught (each B200 and B300 freed was taken within seconds):
-several GPUs named with --gpu, tried in the order given, and `up --retry`, which reads the catalog again until
-a GPU is free, creates one pod, goes on when the machine is taken in the meantime, keeps the price ceiling,
-asks its question once, and stops on Ctrl+C. The fake also answers GET /v2/catalog/gpus (and counts the Secure
-reads, so a GPU can come into stock at a given read) and the GraphQL host query. A client that closes a
-connection while the fake still writes is normal here (pod.py closes its log stream on purpose, every few
-seconds and on READY; the slow route's client gives up after 1 s): the fake server stays quiet about it.
+`Helpers` are unit tests of the pure functions. `EndToEnd` starts a fake Runpod API (REST v2, the GraphQL
+host and credit queries, the GPU catalog), a fake ComfyUI and a fake JupyterLab on 127.0.0.1, and runs the real
+commands through subprocess, as a user would. The fake log stream behaves as the real one was seen to: events
+carry their time as id, a `since` cursor is exclusive at one-second resolution, the stream stays open with
+keepalives, and the lines after SELFTEST OK never arrive on a live connection (only a fresh request serves
+them). Each test's docstring names the incident it reproduces.
 """
 import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -93,11 +73,11 @@ NEVER_LIVE = {l for _, l in BOOT[LIVE_LIMIT:]}
 STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
          "no_5090": False, "maint_dcs": set(), "maint_community": False, "graphql_down": False,
          "full_dcs": set(), "pro6000_dcs": None, "balance": 212.40,
-         "catalog_reads": 0,      # GET /v2/catalog/gpus on Secure Cloud so far (pod.py 0.9.0, --retry)
+         "catalog_reads": 0,      # GET /v2/catalog/gpus on Secure Cloud so far (--retry)
          "schedule": {},          # GPU id -> [(first read, data centers with stock), ...]: see stock_now()
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
-         "history_3d": False,     # 0.9.2: the history also reports a GLB under "3d", and a temp preview
-         "outfiles": None,        # 0.9.2: the pod's output folder as {relative path: bytes}; None = JupyterLab off
+         "history_3d": False,     # the history also reports a GLB under "3d", and a temp preview
+         "outfiles": None,        # the pod's output folder as {relative path: bytes}; None = JupyterLab off
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
 
@@ -176,9 +156,9 @@ def visible_lines(pod):
 
 
 def pod_of(path):
-    for pid, pod in STATE["pods"].items():
+    for pid, p in STATE["pods"].items():
         if "/" + pid in path:
-            return pid, pod
+            return pid, p
     return None, None
 
 
@@ -224,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path
         if p.startswith("/proxy/"):
             return self.proxy_get(p, q)
-        if p.startswith("/files/"):          # a models list served as a raw file (0.8.1)
+        if p.startswith("/files/"):          # a models list served as a raw file
             body = STATE["files"].get(p)
             if body is None:
                 return self.problem(404, "no such file")
@@ -255,12 +235,6 @@ class Handler(BaseHTTPRequestHandler):
             if cloud == "SECURE":
                 STATE["catalog_reads"] += 1
             return self.send_json(200, {"gpus": fake_catalog(cloud)})
-        if p.startswith("/v2/catalog/gpus/"):
-            return self.send_json(200, {
-                "id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "availability": "LOW",
-                "price": {"secure": 0.99, "community": 0.69},
-                "dataCenters": [{"id": "EU-CZ-1", "availability": "LOW"}, {"id": "US-TX-3", "availability": "HIGH"},
-                                {"id": "CA-MTL-1", "availability": "LOW"}, {"id": "EUR-NO-1", "availability": "NONE"}]})
         if p == "/v2/account/secrets":
             return self.send_json(200, {"secrets": []})
         if p == "/v2/account/ssh-keys":
@@ -297,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"errors": [{"message": "Unauthorized"}], "data": {"pod": None}})
         if STATE["graphql_down"]:
             return self.problem(503, "unavailable")
-        if "myself" in query:            # the credit and the spend rate (pod.py 0.7.0)
+        if "myself" in query:            # the credit and the spend rate
             running = [p for p in STATE["pods"].values() if not p.get("deleted")]
             return self.send_json(200, {"data": {"myself": {"clientBalance": STATE["balance"],
                                                             "currentSpendPerHr": round(sum(p["cost"] for p in running), 2)}}})
@@ -526,19 +500,16 @@ class Helpers(unittest.TestCase):
         try:
             self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "master", "AINVFX_TORCH": "--pre torch torchvision",
                                                    "AINVFX_PYTHON": "3.14"})
-            self.assertEqual(pod.comfy_tag(), "master")
-            with open(pod.SETTINGS_LOCAL, "w", encoding="utf-8") as fh:   # 0.8.0: the local file wins, key by key
+            with open(pod.SETTINGS_LOCAL, "w", encoding="utf-8") as fh:   # the local file wins, key by key
                 fh.write("AINVFX_COMFY_TAG=v0.38.2\nAINVFX_MODELS_URL=https://example.org/mine/models.json\n")
             self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "v0.38.2", "AINVFX_TORCH": "--pre torch torchvision",
                                                    "AINVFX_PYTHON": "3.14",
                                                    "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
-            self.assertEqual(pod.comfy_tag(), "v0.38.2")
             pod.SETTINGS = pod.Path(d) / "missing.env"
             self.assertEqual(pod.load_settings(), {"AINVFX_COMFY_TAG": "v0.38.2",
                                                    "AINVFX_MODELS_URL": "https://example.org/mine/models.json"})
             pod.SETTINGS_LOCAL = pod.Path(d) / "missing.local.env"
             self.assertEqual(pod.load_settings(), {})
-            self.assertEqual(pod.comfy_tag(), "v0.41.2")
         finally:
             pod.SETTINGS, pod.SETTINGS_LOCAL = old, old_local
             shutil.rmtree(d, ignore_errors=True)
@@ -630,7 +601,7 @@ class Helpers(unittest.TestCase):
             pod.find_gpu(both, "GTX 1080")           # none
 
     def test_several_gpus_named_and_the_retry_ceiling(self):
-        """0.9.0: `--gpu B300 --gpu B200` tries the B300 first, although the B200 costs less: the order given wins.
+        """`--gpu B300 --gpu B200` tries the B300 first, although the B200 costs less: the order given wins.
         Without --gpu, nothing above max_price follows the profile's GPU. The price ceiling of a --retry wait is
         the dearest GPU named, or max_price without --gpu."""
         cat = {"SECURE": [
@@ -672,13 +643,13 @@ class Helpers(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_combined_profiles(self):
-        """0.8.0 (10 Oct 2026): atomic profiles that combine. The disk follows the models, the GPU the
+        """Atomic profiles that combine. The disk follows the models, the GPU the
         profile that needs the most VRAM; `all` is every profile; an unknown profile is refused."""
         self.assertEqual(pod.parse_profiles("image"), ["image"])
         self.assertEqual(pod.parse_profiles("3d+image"), ["image", "3d"])
         self.assertEqual(pod.parse_profiles("image, video,train"), ["image", "video", "train"])
         self.assertEqual(pod.parse_profiles("all"), ["image", "3d", "video", "train"])
-        self.assertEqual(pod.profile_spec(["image"])["disk"], 170)   # 0.9.1 data (20 Oct): MOSS-Image joins image
+        self.assertEqual(pod.profile_spec(["image"])["disk"], 170)   # follows models.json
         self.assertEqual(pod.profile_spec(["image"])["gpu"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.profile_spec(["3d"])["disk"], 100, "never under 100 GB")
         self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
@@ -691,7 +662,7 @@ class Helpers(unittest.TestCase):
             pod.parse_profiles("nope+3d")
 
     def test_history_files_takes_every_key_but_temp(self):
-        """0.9.2: the 3D saves report under "3d"; temp previews and non-file values are left out; one entry per file."""
+        """The 3D saves report under "3d"; temp previews and non-file values are left out; one entry per file."""
         h = {"p1": {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]},
                                 "12": {"3d": [{"filename": "m.glb", "subfolder": "BTC2", "type": "output"}],
                                        "camera_info": [{"position": [0, 1, 2]}]},
@@ -714,10 +685,8 @@ class Helpers(unittest.TestCase):
         for bad in ("../x.png", "BTC2/../../x", "/etc/passwd", "C:/x.png", ""):
             self.assertIsNone(pod.safe_rel(bad), bad)
 
-    def test_profiles_and_start_command(self):
+    def test_profiles(self):
         self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
-        self.assertIn("bootstrap.sh", pod.START_CMD)
-        self.assertTrue(pod.START_CMD.endswith('|| /start.sh"'))
 
 
 # ----------------------------------------------------------------------------- end to end
@@ -798,7 +767,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Nothing bills", out, out)
 
     def test_pull_takes_every_file_of_the_output_folder(self):
-        """0.9.2: the GLB that ComfyUI reports under "3d", and a file that only the folder holds (a trained LoRA), come
+        """The GLB that ComfyUI reports under "3d", and a file that only the folder holds (a trained LoRA), come
         back; the placeholder does not; a second pull fetches nothing; JupyterLab off, the history still brings the GLB."""
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)
@@ -911,8 +880,8 @@ class EndToEnd(unittest.TestCase):
 
     def test_no_stock_proposes_the_cheapest_secure_fit_and_never_any_host(self):
         """7 Oct 2026: no RTX 5090 on Secure Cloud. `up` must not create one there: it lists the GPUs in
-        stock that fit the image profile, cheapest first, and creates the cheapest. Since 0.8.0 (9 Oct
-        2026, a Community pod that never started) Community Cloud is left out unless --community is
+        stock that fit the image profile, cheapest first, and creates the cheapest. Since a Community pod
+        never started (9 Oct 2026), Community Cloud is left out unless --community is
         given, so the replacement is the Secure RTX PRO 4500 SE, not the cheaper Community RTX 5090. It
         leaves out what does not fit (24 GB, Hopper, a 1g MIG slice) and never picks on its own what
         costs more than 2.50 USD per hour."""
@@ -940,7 +909,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("down", "-y")
 
     def test_community_cloud_only_with_the_flag(self):
-        """With --community, the 0.7.0 behaviour: the Community RTX 5090 at 0.69 is the cheapest fit and
+        """With --community: the Community RTX 5090 at 0.69 is the cheapest fit and
         is created with no data center named (Runpod picks the host)."""
         STATE["no_5090"] = True
         self.run_pod("setup", "-y")
@@ -956,7 +925,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("down", "-y")
 
     def test_local_settings_and_command_line_overrides(self):
-        """0.8.0, Félix's question of 9 Oct 2026: a models.json of one's own. settings.local.env replaces
+        """A models.json of one's own (a participant's question, 9 Oct 2026). settings.local.env replaces
         settings.env key by key and survives `git pull`; `--models-url` and `--set` replace a value for
         one pod; a `--set` without an AINVFX_ key creates nothing."""
         self.run_pod("setup", "-y")
@@ -994,7 +963,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(STATE["posts"]), 2, "nothing created")
 
     def test_own_models_list(self):
-        """0.8.1, Adrien's pod of 13 Oct 2026 with a Google Drive link: a share link becomes the file's own
+        """A pod of 13 Oct 2026 with a Google Drive link: a share link becomes the file's own
         link, the disk follows your list, and a web page stops `up` before anything is created."""
         self.assertEqual(pod.direct_url("https://drive.google.com/file/d/1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh/view?usp=sharing"),
                          "https://drive.google.com/uc?export=download&id=1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh")
@@ -1064,7 +1033,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("unknown profile(s): nope", out, out)
 
     def test_money_lines(self):
-        """Adrien, 8 Oct 2026: the price in the question, the credit and the hours it buys before it, then
+        """The price in the question, the credit and the hours it buys before it, then
         what the pod cost, the other pods still running with their price, and the credit left after down."""
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
@@ -1087,7 +1056,7 @@ class EndToEnd(unittest.TestCase):
 
     def test_every_data_center_with_stock_is_tried(self):
         """Ten pods created in the same minutes: the first seven data centers listed for the RTX PRO 6000
-        are full by the time this one asks, the eighth has a GPU. 0.6.0 stopped after six."""
+        are full by the time this one asks, the eighth has a GPU. An earlier version stopped after six."""
         dcs = ["CA-MTL-1", "CA-MTL-3", "US-CA-2", "US-GA-1", "US-IL-1", "US-NC-2", "US-TX-3", "EUR-IS-1"]
         STATE["pro6000_dcs"] = tuple((d, "LOW") for d in dcs)
         STATE["full_dcs"] = set(dcs[:7])
@@ -1151,7 +1120,7 @@ class EndToEnd(unittest.TestCase):
         return path
 
     def test_records_of_terminated_pods_are_forgotten(self):
-        """0.9.3 (22 Oct 2026): seven records, one pod alive (the others terminated from the console or
+        """Seven records, one pod alive (the others terminated from the console or
         elsewhere). A command without a name forgets the gone ones and takes the live one."""
         self.run_pod("setup", "-y")
         live = Handler.new_pod("ainvfx-image-3d-video-1021-2016", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
@@ -1205,7 +1174,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("down", "-y")
 
     def test_several_gpus_named(self):
-        """0.9.0: `--gpu B200 --gpu B300` tries those two only, in the order given. With neither in stock, nothing
+        """`--gpu B200 --gpu B300` tries those two only, in the order given. With neither in stock, nothing
         is created; with the B300 alone in stock, the B300 is. One --gpu holding two names is refused with a hint."""
         STATE["schedule"] = {"NVIDIA B300 SXM6 AC": [(0, ())]}
         self.run_pod("setup", "-y")

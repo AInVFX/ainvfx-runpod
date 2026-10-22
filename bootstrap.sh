@@ -1,99 +1,37 @@
 #!/usr/bin/env bash
-# ainvfx-runpod · bootstrap.sh · runs ON THE POD as the container start command.
+# ainvfx-runpod · bootstrap.sh · runs ON THE POD as the container start command (the Runpod template's
+# start command fetches it from this repository; pod.py sends the settings below as environment variables).
 #
-# What it does, in order (every line it prints starts with [AINVFX], so the log is easy to read):
-#   0. start Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
-#   1. health check: GPU and driver, disk speed (the download speed is measured in step 4, on real files)
-#   2. install: uv, Python 3.13, PyTorch stable for CUDA 13.0, ComfyUI at a pinned tag, the Manager
-#   3. start ComfyUI, listening for Runpod's proxy on port 8188, and check the proxy from here
-#   4. download the models of the profile (AINVFX_PROFILE: image, 3d, video, train, several joined by +, or all), resumable; every
-#      line says file k of n, GB done of GB planned, percent and the time left
-#   5. one test image with Z-Image Turbo (proves the GPU, the kernels and the models), then READY
+# Every line it prints starts with [AINVFX]. In order:
+#   0. Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
+#   1. health check: GPU and driver (580 or newer), disk write and read speed
+#   2. install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at a pinned tag, the Manager, custom nodes
+#   3. start ComfyUI for Runpod's proxy on port 8188           -> COMFYUI UP, PROXY OK
+#   4. the models of the profile, from models.json             -> MODELS DONE
+#   5. one Z-Image Turbo test image                            -> SELFTEST OK, then READY
+# A pod that cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints FAILED and stays up
+# so its log can be read; pod.py stops on that line.
 #
-# v4 (5 Oct 2026, after two real pods): the one-stream curl probe is gone (it read 21 to 39 MB/s on pods
-# that then downloaded at 100 to 1300 MB/s with hf, and warned for nothing); the download speed is now
-# judged on the first model file over 1 GB. The log lives in ComfyUI's input folder
-# (input/ainvfx/bootstrap.log, with /workspace/ainvfx-bootstrap.log pointing to it), so pod.py can
-# also read it through the proxy once ComfyUI answers. MODELS DONE reports the total time and the
-# average speed. The unresolved-secret message is plain information, not a warning.
-# v3 (4 Oct 2026): ComfyUI is fetched with git init + fetch, which tolerates a folder that already holds
-# files; the install marker is written only when main.py exists; each model download logs its speed;
-# the disk threshold is 300 MB/s (a healthy pod read 660 MB/s with dd and rendered in 2 s).
-# Measured: EUR-IS-2 pod, 63 GB in 10 minutes, READY at 15 minutes; EU-CZ-1 pod, 59 GB in 90 seconds,
-# READY at about 5 minutes. The self-test takes 16 to 106 s on the first load, 2 s once cached.
+# The log is written to ComfyUI/input/ainvfx/bootstrap.log, so the pod also serves it through its proxy: pod.py
+# reads it there when Runpod's log stream stays silent. The READY line carries JupyterLab's token: anyone with
+# the pod's address can read it, so the address stays private.
 #
-# v5 (5 Oct 2026): every choice is an environment variable with a default, listed in settings.env at
-# the root of the repository; pod.py sends that file's values with each pod, and a browser user sets
-# the same variables on the deploy page. New: AINVFX_PYTHON, AINVFX_TORCH, AINVFX_TORCH_INDEX,
-# AINVFX_MODELS_URL, AINVFX_CUSTOM_NODES, AINVFX_HEALTHCHECK, AINVFX_BOOTSTRAP_URL (a fork's own
-# bootstrap, fetched and run instead of this one).
+# Environment variables, all optional (settings.env documents them; the defaults are the course's):
+#   AINVFX_PROFILE        image · 3d · video · train, several joined by + (image+3d), or all. Default image
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.42.1
+#   AINVFX_PYTHON         default 3.13
+#   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted. Default: torch torchvision torchaudio
+#   AINVFX_TORCH_INDEX    default https://download.pytorch.org/whl/cu130
+#   AINVFX_MODELS_URL     where models.json comes from (a raw link, or a Drive, Dropbox or GitHub share link)
+#   AINVFX_CUSTOM_NODES   git URLs of custom nodes, separated by spaces. Default: none
+#   AINVFX_HEALTHCHECK    1 measures the disk (default); 0 skips it
+#   AINVFX_SELFTEST       1 renders the test image (default); 0 skips it
+#   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork), fetched and run in place of this one
+#   HF_TOKEN              a Hugging Face read token for the gated files; Runpod fills it from the secret
+#                         huggingface_token. An unresolved {{ RUNPOD_SECRET_... }} placeholder counts as absent.
 #
-# v5.10 (16 Oct 2026): default ComfyUI tag v0.41.2 (templates 0.11.86); the Klein prompt upsampler is the
-# w4a8 file of the 0.11.86 templates (6.72 GB, against 9.75 GB for int8): image profile about 105 GB.
-# v5.9 (16 Oct 2026): the gated repos are named from models.json, never hard-coded: the token lines no longer
-# say LTX; after the plan, one line per gated repo of the profile (files, how many wait, and how its licence
-# is approved, read from the Hugging Face API: at once, or by the authors); ACTION NEEDED says the same per page.
-# v5.8 (15 Oct 2026): default ComfyUI tag v0.41.1 (FLUX 3 Image Klein); the image profile gains its four
-# gated Klein files (models.json, 23 files, about 108 GB, the prompt upsampler included).
-# v5.7 (13 Oct 2026): default ComfyUI tag v0.40.0. A share link given as AINVFX_MODELS_URL (Google Drive,
-# Dropbox, a file page on GitHub) becomes a link to the file itself, and a list that is not a models.json
-# (a web page) is refused with one warning instead of an empty plan.
-# v5.6 (10 Oct 2026): AINVFX_PROFILE takes one profile or several joined by + (image+3d, image+video+train)
-# or all; models.json profiles are atomic (a new 3d profile; video is LTX only; train the bf16 files only),
-# so the video sessions ask for image+video and the training sessions for video+train.
-# v5.5 (7 Oct 2026, after the first pod on a B300 MIG slice): step 1 printed "[Insufficient Permissions]"
-# as the GPU's memory. A MIG slice (Multi-Instance GPU: one part of a bigger GPU, with its own memory,
-# here 1g.34gb of a B300) cannot read the whole card's memory from inside its container. Step 1 now reads
-# the slice's size from its profile name (`nvidia-smi -L`), and the PyTorch line of step 2 adds the VRAM
-# that PyTorch sees, on every GPU.
-# v5.4 (6 Oct 2026, night, after a console pod that failed): three changes.
-# (1) PyTorch. One host could not reach pypi.nvidia.com, where the PyTorch index sends its NVIDIA
-# libraries, and the install failed. uv now waits longer and retries more (UV_HTTP_TIMEOUT 120,
-# UV_HTTP_RETRIES 5). After a failure, PyPI is tried: it carries the same CUDA 13.0 build of the stable
-# release, with the NVIDIA libraries on its own servers. The other installs retry once. A pod that still
-# cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints a line starting with
-# FAILED, says what to do, and stays up so the log can be read; pod.py 0.5.1 stops on that line.
-# (2) Gated files. The token is checked once, and the log names its Hugging Face account. Each gated
-# file is checked before its download. A file whose licence that account has not accepted is listed,
-# just before the last line, with the link of its page and the command that fetches it once accepted:
-# `bash <this script> models` (step 4 only, then exit; works from JupyterLab's terminal or ssh).
-# (3) The last line gives JupyterLab's link with its token, so one click opens it (Adrien's choice for
-# temporary teaching pods), or says that JupyterLab is off.
-# v5.3 (6 Oct 2026): every download line says where it stands: file k of n, GB done of GB planned,
-# percent, and the time left at the average speed so far (the plan is computed before the loop).
-# v5.2 (6 Oct 2026): default ComfyUI tag v0.39.0 (tagged 5 Oct 22:49 UTC: Save EXR in 16-bit float by default,
-# Save Video quality defaults, --offline). First pod on it: Adrien's gate before session 2.
-# v5.1 (5 Oct 2026, comment only): the template image is runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404,
-# the image of Runpod's own "Runpod Pytorch 2.8.0" template, which Runpod keeps on its hosts: the
-# container starts within seconds. The 1.0.7-cu1300-torch291 tag tried on 5 Oct had to be fetched from
-# Docker Hub on every pod (19 layers, about 9 GB, over 5 minutes). This script does not use the image's
-# PyTorch or CUDA toolkit: the venv it builds takes the cu130 wheels, which carry their own CUDA 13
-# libraries. A custom node that compiles a kernel against CUDA 13 would need
-# `uv pip install nvidia-cuda-nvcc==13.0.88` in the venv first; no course step does.
-#
-# Environment variables, all optional (the defaults are the bootcamp's; settings.env documents them):
-#   AINVFX_PROFILE        image (default) · 3d · video · train, one or several joined by + (image+3d), or all:
-#                         which sets of models.json to download (v5.6, 10 Oct 2026: profiles are atomic, so
-#                         video no longer includes image: ask for image+video)
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch (default v0.41.2; master for the latest)
-#   AINVFX_PYTHON         the Python version of the environment (default 3.13)
-#   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted (default: torch torchvision torchaudio;
-#                         "--pre torch torchvision torchaudio" for nightlies)
-#   AINVFX_TORCH_INDEX    the PyTorch wheel index (default https://download.pytorch.org/whl/cu130)
-#   AINVFX_MODELS_URL     where models.json comes from (default: this repository on GitHub)
-#   AINVFX_CUSTOM_NODES   git URLs of custom nodes to install, separated by spaces (default: none)
-#   AINVFX_HEALTHCHECK    1 (default) measures the disk; 0 skips the measurement
-#   AINVFX_SELFTEST       1 (default) generates the test image at the end; 0 skips it
-#   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork): fetched and run in place of this one
-#   HF_TOKEN              a Hugging Face read token, for the gated files of models.json (FLUX 3 Image Klein in
-#                         image, LTX in video and train). Without it they are skipped.
-#                         Runpod fills it from the secret `huggingface_token` when the value is
-#                         {{ RUNPOD_SECRET_huggingface_token }}; an unresolved placeholder counts as absent.
-#
-# One argument is understood: `models` runs step 4 alone (the files still missing), then exits.
-#
-# Idempotent: a second run (pod restart) skips what is already installed and downloaded.
-# Nothing here depends on SSH: everything is visible in the pod's log in the Runpod console.
+# `bash bootstrap.sh models` runs step 4 alone (the files still missing), then exits. A second run (a pod
+# restart) skips what is already installed and downloaded.
 
 set -uo pipefail
 # A fork's bootstrap takes over here, once (AINVFX_BOOTSTRAP_RAN guards against a loop).
@@ -121,7 +59,7 @@ if [ "$MODE" = "models" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.41.2}"
+TAG="${AINVFX_COMFY_TAG:-v0.42.1}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
@@ -147,7 +85,8 @@ exec > >(tee -a "$LOG") 2>&1
 say()  { echo "[AINVFX] $*"; }
 warn() { echo "[AINVFX] WARNING: $*"; }
 now()  { date +%s.%N; }
-mbps() { python3 -c "import sys; b=float(sys.argv[1]); t=float(sys.argv[2]); print(int(b/1e6/max(t,0.001)))" "$1" "$2"; }
+secs() { awk -v a="$1" -v b="$2" 'BEGIN {printf "%.3f", b - a}'; }        # seconds from $1 to $2
+mbps() { awk -v b="$1" -v t="$2" 'BEGIN {if (t < 0.001) t = 0.001; printf "%d", b / 1e6 / t}'; }
 fail() { echo "[AINVFX] FAILED: $*"; }
 hold() {   # after FAILED: the pod stays up (SSH, JupyterLab, this log) until it is terminated
   say "the pod stays up so this log can be read, and it bills until you terminate it"
@@ -163,8 +102,8 @@ uvi() {    # uv pip install, once more after a pause if the first attempt fails
   sleep 10
   uv pip install --quiet "$@"
 }
-# PyTorch: its own index first. That index sends its NVIDIA libraries to pypi.nvidia.com, which a host
-# could not reach on 6 Oct 2026. PyPI carries the same CUDA 13.0 build of the stable release, with the
+# PyTorch: its own index first. That index sends its NVIDIA libraries to pypi.nvidia.com, which some hosts
+# cannot reach. PyPI carries the same CUDA 13.0 build of the stable release, with the
 # NVIDIA libraries on its own servers, so it is the second route (stable cu130 only: PyPI has no other
 # CUDA build and no nightlies). uv keeps finished downloads in its cache: a new attempt fetches only what failed.
 install_torch() {
@@ -210,7 +149,7 @@ print_links() {   # one page link per repo, each repo once, in the order met
     say "   https://huggingface.co/$r · $(mode_text "${m:-unknown}")"
   done
 }
-mode_text() {   # v5.9: what accepting the licence of a gated repo takes, from the Hugging Face API (gated: auto or manual)
+mode_text() {   # what accepting the licence of a gated repo takes, from the Hugging Face API (gated: auto or manual)
   case "$1" in
     auto)   echo "approved at once on « Agree and access repository »" ;;
     manual) echo "approved by the repo's authors after a request (this can take days)" ;;
@@ -279,9 +218,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   DRV_FULL=$(echo "$GPU_LINE" | awk -F', ' '{print $3}')
   case "$GPU_MEM" in
     [0-9]*) ;;
-    *)  # v5.5: a MIG slice cannot read the whole card's memory from its container ("[Insufficient
-        # Permissions]"). Its own size is in its profile name, as `nvidia-smi -L` lists it:
-        # "  MIG 1g.34gb     Device  0: (UUID: MIG-...)". PyTorch reports the exact VRAM in step 2.
+    *)  # a MIG slice cannot read the card's memory from its container: its size is in its profile
+        # name, as `nvidia-smi -L` lists it ("  MIG 1g.34gb  Device 0: ..."). PyTorch gives the exact VRAM in step 2.
         MIG=$(nvidia-smi -L 2>/dev/null | sed -n 's/^[[:space:]]*MIG \([^[:space:]]*\).*/\1/p' | head -1)
         MIG_GB=$(echo "$MIG" | grep -o '[0-9][0-9]*gb' | head -1 | sed 's/gb$//')
         if [ -n "$MIG_GB" ]; then
@@ -304,9 +242,9 @@ say "CPU: $(nproc) cores · RAM: $(free -g | awk '/Mem:/ {print $2}') GB · disk
 
 if [ "$HEALTHCHECK" = "1" ]; then
   T0=$(now); dd if=/dev/zero of=$ROOT/.probe bs=1M count=2048 oflag=direct status=none 2>/dev/null; T1=$(now)
-  WR=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
+  WR=$(mbps 2147483648 "$(secs "$T0" "$T1")")
   T0=$(now); dd if=$ROOT/.probe of=/dev/null bs=1M iflag=direct status=none 2>/dev/null; T1=$(now)
-  RD=$(mbps 2147483648 "$(python3 -c "print($T1-$T0)")")
+  RD=$(mbps 2147483648 "$(secs "$T0" "$T1")")
   rm -f $ROOT/.probe
   say "disk: write $WR MB/s · read $RD MB/s"
   [ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
@@ -353,8 +291,8 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
   for url in $CUSTOM_NODES; do
     name=$(basename "${url%.git}")
     if [ ! -d "$COMFY/custom_nodes/$name" ]; then
-      git clone --quiet --depth 1 "$url" "$COMFY/custom_nodes/$name" && say "custom node $name installed" \
-        || warn "custom node $url could not be cloned"
+      if git clone --quiet --depth 1 "$url" "$COMFY/custom_nodes/$name"; then say "custom node $name installed"
+      else warn "custom node $url could not be cloned"; fi
     fi
     [ -f "$COMFY/custom_nodes/$name/requirements.txt" ] && (uvi -r "$COMFY/custom_nodes/$name/requirements.txt" \
         || warn "the requirements of $name failed")
@@ -364,7 +302,7 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
 import torch, sys
 ok = torch.cuda.is_available()
 cu = torch.version.cuda or "0"
-try:      # v5.5: the VRAM as PyTorch sees it, exact on every GPU, a MIG slice included; never fatal
+try:      # the VRAM as PyTorch sees it, exact on every GPU, a MIG slice included; never fatal
     vram = " · {:.0f} MiB of VRAM".format(torch.cuda.get_device_properties(0).total_memory / 2**20) if ok else ""
 except Exception:
     vram = ""
@@ -440,17 +378,16 @@ if [ ! -s "$MODELS_JSON" ]; then
   warn "no models.json at $MODELS_URL (no file, or a web page instead of the file: give a raw link or a share link to the file): no model downloaded. Use the Manager's model library."
 else
   mkdir -p "$STAGE"
-  # The plan first (v5.3): which files are missing, their number and their size, so every
-  # download line says where it stands (k of n, GB done of GB total, percent, time left).
-  # v5.4: each missing gated file is checked first (one HEAD request with the token), so a licence not
-  # yet accepted is told with its page instead of failing a download. Every row ends with its state:
+  # The plan first: which files are missing, their number and their size, so every download line says
+  # where it stands. Each missing gated file is checked first (one HEAD request with the token), so a licence
+  # not yet accepted is told with its page instead of failing a download. Every row ends with its state:
   # todo, present, notoken (gated, no token), gated (licence not accepted) or missing (path gone).
   LIST=$ROOT/models.list
-  GATED_INFO=$ROOT/models.gated   # v5.9: repo|files|waiting|mode, one line per gated repo of the profile
-  python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "${HF_TOKEN:-}" "$GATED_INFO" > "$LIST" <<'PY'
-import json, os, sys, urllib.error, urllib.parse, urllib.request
+  GATED_INFO=$ROOT/models.gated   # repo|files|waiting|mode, one line per gated repo of the profile
+  python - "$MODELS_JSON" "$PROFILE" "$COMFY/models" "$GATED_INFO" > "$LIST" <<'PY'
+import json, os, re, sys, urllib.error, urllib.parse, urllib.request
 spec = json.load(open(sys.argv[1]))
-files, profiles, root, token = spec["files"], spec["profiles"], sys.argv[3], sys.argv[4]
+files, profiles, root, token = spec["files"], spec["profiles"], sys.argv[3], os.environ.get("HF_TOKEN", "")
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None                 # a redirect to the file's storage already means "allowed"
@@ -481,7 +418,6 @@ def resolve(name, seen=()):
         else:
             out.append(item)
     return out
-import re
 wanted = [p for p in re.split(r"[+,\s]+", sys.argv[2].strip()) if p]
 if "all" in wanted:
     wanted = list(profiles)
@@ -526,7 +462,7 @@ def approval(repo):
     except Exception:
         return "unknown"
     return "auto" if g == "auto" else "manual" if g == "manual" else "open" if g is False else "unknown"
-with open(sys.argv[5], "w") as out:
+with open(sys.argv[4], "w") as out:
     for repo, g in gated_repos.items():
         out.write("%s|%d|%d|%s\n" % (repo, g["n"], g["wait"], approval(repo) if g["wait"] else "accepted"))
 todo = [r for r in rows if r[5] == "todo"]
@@ -552,7 +488,7 @@ PY
     if (n["missing"]) s = s " · " n["missing"] " moved"
     print s}' "$LIST")
   say "models: $N_ALL files in profile $PROFILE · $N_TODO to download ($GB_TODO GB)$PLAN_REST"
-  if [ -s "$GATED_INFO" ]; then   # v5.9: the gated repos of this profile, by name, and what their licence takes
+  if [ -s "$GATED_INFO" ]; then   # the gated repos of this profile, by name, and what their licence takes
     while IFS='|' read -r grepo gn gwait gmode; do
       case "$gmode" in
         accepted) say "models: gated repo $grepo · $gn file(s) · licence accepted${HF_USER:+ by $HF_USER}" ;;
@@ -560,7 +496,7 @@ PY
       esac
     done < "$GATED_INFO"
   fi
-  TOTAL=0; DONE=0; SKIPPED=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
+  TOTAL=0; DONE=0; BYTES_ALL=0; T_ALL0=$(now); SPEED_JUDGED=0
   while IFS='|' read -r repo path dir _ gb k n_todo gb_before gb_todo state; do
     [ -z "$repo" ] && continue
     TOTAL=$((TOTAL+1))
@@ -586,10 +522,10 @@ PY
     if hf download "$repo" "$path" --local-dir "$STAGE" >/dev/null 2>&1 && [ -s "$STAGE/$path" ]; then
       T1=$(now)
       BYTES=$(stat -c %s "$STAGE/$path" 2>/dev/null || echo 0)
-      SECS=$(python3 -c "print(int($T1-$T0))")
+      SECS=$(secs "$T0" "$T1" | cut -d. -f1)
       mv -f "$STAGE/$path" "$dest/$name"
       DONE=$((DONE+1)); BYTES_ALL=$((BYTES_ALL+BYTES))
-      SPEED=$(mbps "$BYTES" "$(python3 -c "print($T1-$T0)")")
+      SPEED=$(mbps "$BYTES" "$(secs "$T0" "$T1")")
       # where we stand: GB done of the plan, percent, and the time left at the average speed so far
       PROGRESS=$(python3 - "$gb_before" "$gb" "$gb_todo" "$BYTES_ALL" "$T_ALL0" "$T1" <<'PY'
 import sys
@@ -624,7 +560,7 @@ PY
   rm -rf "$STAGE"
   T_ALL1=$(now)
   TOTALS=""
-  [ "$BYTES_ALL" -gt 0 ] && TOTALS=" · $((BYTES_ALL/1000000000)) GB downloaded in $(python3 -c "print(int($T_ALL1-$T_ALL0))") s ($(mbps "$BYTES_ALL" "$(python3 -c "print($T_ALL1-$T_ALL0)")") MB/s)"
+  [ "$BYTES_ALL" -gt 0 ] && TOTALS=" · $((BYTES_ALL/1000000000)) GB downloaded in $(secs "$T_ALL0" "$T_ALL1" | cut -d. -f1) s ($(mbps "$BYTES_ALL" "$(secs "$T_ALL0" "$T_ALL1")") MB/s)"
   SK=""; [ "$SKIPPED" -gt 0 ] 2>/dev/null && SK=" · $SKIPPED skipped (gated, no token)"
   [ "$WAITING" -gt 0 ] 2>/dev/null && SK="$SK · $WAITING waiting for a licence (the pages are listed at the end)"
   say "MODELS DONE $DONE/$TOTAL present$SK · $(du -sh $COMFY/models 2>/dev/null | cut -f1) on disk$TOTALS"
@@ -676,7 +612,7 @@ while time.time() - t0 < 300:
         h = None
     if h:
         st = h.get("status", {})
-        if st.get("status_str") == "error" or (st.get("completed") is False and st.get("status_str") == "error"):
+        if st.get("status_str") == "error":
             msgs = [m for m in st.get("messages", []) if m and m[0] == "execution_error"]
             detail = msgs[-1][1].get("exception_message", "?")[:300] if msgs else "?"
             print("[AINVFX] WARNING: SELFTEST FAILED:", detail); sys.exit(0)
@@ -692,10 +628,9 @@ else
 fi
 
 access_summary
-# JupyterLab runs only when the pod was created with "Start Jupyter notebook" on (pod.py always asks for it):
-# Runpod then sets JUPYTER_PASSWORD, the token the page asks for, and the link carries it, so one click
-# opens JupyterLab (Adrien's choice, 6 Oct 2026: temporary teaching pods). Like the ComfyUI address, the
-# line opens the pod to whoever reads it, and this log is served through the proxy: keep the address private.
+# JupyterLab runs only when the pod was created with "Start Jupyter notebook" on (pod.py always asks for it).
+# Runpod then sets JUPYTER_PASSWORD, the page's token; the link carries it, so one click opens JupyterLab, and
+# pod.py pull reads it from here. Like the ComfyUI address, the line opens the pod to whoever reads it.
 if pgrep -f "jupyter-lab|jupyter lab" >/dev/null 2>&1; then
   if [ -n "${JUPYTER_PASSWORD:-}" ]; then JL="JupyterLab $JUPYTER/lab?token=$JUPYTER_PASSWORD"; else JL="JupyterLab $JUPYTER"; fi
 else

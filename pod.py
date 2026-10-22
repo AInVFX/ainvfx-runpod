@@ -1,72 +1,27 @@
 #!/usr/bin/env python3
-"""ainvfx-runpod · pod.py : create, use and terminate a Runpod GPU pod running ComfyUI.
+"""ainvfx-runpod · pod.py: create, use and terminate a Runpod GPU pod running ComfyUI.
 
-One file, no dependency beyond Python 3.8 or newer. Works on Windows, macOS and Linux.
-Nothing but the Runpod API key is stored on this machine, in a file only your account can read.
+One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
 
-  python pod.py setup              once: your Runpod API key, your region, your SSH key (optional)
-  python pod.py setup --hf-token   optional: store your Hugging Face token as a Runpod Secret
-  python pod.py up image           create a pod for the image sessions (RTX 5090; the image models, 105 GB)
-  python pod.py up image+3d        the image models plus the 3D block (RTX 5090)
-  python pod.py up image+video     image plus LTX 2.5 for the video sessions (RTX PRO 6000)
-  python pod.py up video+train     LTX 2.5 plus the bf16 files of the training kit (RTX PRO 6000)
-  python pod.py up all             every profile (image, 3d, video, train), about 290 GB of models
-  python pod.py up image --gpu "RTX PRO 4500 SE"   another GPU from the list `up` shows
-  python pod.py up video --gpu B200 --gpu B300 --retry   wait until a B200 or a B300 is free, then create it
-  python pod.py up image --community       also consider Community Cloud (off by default since 0.8.0)
-  python pod.py up image --models-url URL  your own models.json for this pod (a raw link, or a Google
-                                           Drive, Dropbox or GitHub share link)
-  python pod.py up train --name jar-lora   a second training pod, known here as `jar-lora`
-  python pod.py status [pod]       status, GPU, data center, cost so far, ComfyUI address, last log lines
-  python pod.py logs [pod]         follow the pod's log until READY (or Ctrl+C)
+  python pod.py setup              once: Runpod API key, nearest data centers, SSH key (optional)
+  python pod.py setup --hf-token   store your Hugging Face token as a Runpod secret (gated models)
+  python pod.py up image           create a pod; profiles: image, 3d, video, train, joined by + (image+3d), or all
+  python pod.py status [pod]       GPU, data center, cost so far, ComfyUI address, last log lines
+  python pod.py logs [pod]         follow the pod's log until READY
   python pod.py open [pod]         open ComfyUI in your browser
-  python pod.py push [pod] FILES...   copy images or videos into the pod's input folder
-  python pod.py pull [pod]         download every file of the pod's output folder into outputs/<pod name>/
-  python pod.py down [pod]         pull, terminate (billing stops), then what it cost and the credit left; `--all`
+  python pod.py push [pod] FILES   copy files into the pod's input folder
+  python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
+  python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here
   python pod.py ssh [pod]          a terminal on the pod
-  python pod.py list               every pod of your account, with its hourly price
-  python pod.py doctor             check Python, ssh, the API key, the configuration
+  python pod.py list               every pod of your account
+  python pod.py doctor             check this machine and the configuration
 
-[pod] is the profile, the name given to `up --name`, the pod's name or its id; it can be left out
-when one pod is recorded. A pod created from the console or another machine is attached by its
-first command: `python pod.py status <name or id>`.
+Useful `up` options: --gpu NAME (repeatable, tried in order), --retry (wait until a GPU is free),
+--community (also Community Cloud), --name NAME (a second pod), --models-url URL, --set AINVFX_KEY=VALUE.
 
-The pod runs bootstrap.sh from this repository at start: SSH and JupyterLab first, a health check
-(driver, disk speed), then ComfyUI at a pinned tag, then the models of the profile (each line says
-file k of n, GB done, percent and the time left), then one test image. settings.env, next to this
-script, holds every choice the pod makes (the ComfyUI tag, Python, PyTorch, the models list,
-custom nodes, the checks): edit it, then `up`; its values travel with the pod as environment variables.
-Your own values go in settings.local.env, next to it (ignored by git, so `git pull` never touches it):
-each line there replaces the same line of settings.env. For one pod only, `up --set KEY=VALUE`
-(repeatable) and `up --models-url URL` replace a value on the command line.
-Its log lines start with [AINVFX]; `up`, `logs` and `status` read them for you, from the API
-log stream and from the copy the pod serves through its proxy. Before the first [AINVFX] line,
-Runpod's own system log tells what the host is doing (fetching the image, starting the container):
-`up` shows it as [RUNPOD] lines, with one summary of the image download (layers done, extracting,
-downloading) so a long pull never looks like a hang. Measured on two RTX 5090 pods (4 and 5 Oct 2026):
-READY 5 to 15 minutes after creation. A pod with no container 8 minutes after creation gets a warning:
-the usual answer is `down`, then `up` again, usually in another data center. A line starting with
-FAILED (bootstrap.sh 5.4: PyTorch out of reach, no GPU from PyTorch, no ComfyUI) ends the wait at
-once: that pod cannot work, and the answer is the same, `down` then `up`.
-
-Where the pod goes. `up` creates a pod only where Runpod's catalog shows stock, on Secure Cloud, and
-names the data center. When the profile's GPU has no stock, `up` shows every GPU in stock that fits
-the profile (32 GB of VRAM or more for image, 96 GB for video and train, a Blackwell chip or newer,
-not a 1g MIG slice), cheapest first, proposes the cheapest (never above 2.50 USD per hour on its own;
---max-price changes that), and prints the command to take another one. With --retry, `up` waits instead of
-stopping: it reads the catalog again every 15 seconds (AINVFX_RETRY_EVERY) and creates the first GPU free,
-by the same rules, then stops (one pod). Its question comes once, before the wait. Community Cloud (machines owned
-by third parties, cheaper, the host picked by Runpod) is left out unless `--community` is given: on
-9 October 2026 the first pod of the session, a Community RTX 5090, never started. Right after creation
-`up` reads the pod's host: a host with maintenance under way or starting within 24 hours is terminated
-at once and the next GPU is tried.
-Money: before its question, `up` shows your Runpod credit and the hours it buys on the card it proposes,
-and the question names the price. `down` says what each pod cost (its hours at its price, an estimate),
-lists any pod still running with its price per hour, and gives the credit left.
-
-Rule of the course: create at the start of the session, pull your results, terminate at the end.
-A terminated pod costs nothing. A stopped pod keeps a dead entry and, with a volume disk, keeps
-billing it.
+[pod] is the profile, the --name given to `up`, the pod's name or its id; it can be left out when one
+pod is recorded. Every pod choice lives in settings.env; your own values go in settings.local.env.
+Full guide: README.md, or https://github.com/AInVFX/ainvfx-runpod
 """
 import argparse
 import getpass
@@ -88,84 +43,50 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.9.3"
-API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")   # the test harness points this at a fake
+VERSION = "1.0.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
-# The image of Runpod's own "Runpod Pytorch 2.8.0" template (id runpod-torch-v280). Runpod keeps the images
-# of its own templates on its hosts, so a pod on it starts within seconds; any other tag has to be
-# fetched from Docker Hub first (about 9 GB, 19 layers, 5 to 15 minutes on 5 Oct 2026 with the
-# 1.0.7-cu1300 tag). The image's own PyTorch and CUDA toolkit are not used: bootstrap.sh builds its
-# environment with the cu130 PyTorch wheels, which carry their own CUDA 13 libraries.
-IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
-
-
-def read_env_file(path):
-    """The AINVFX_* variables of one KEY=value file: # comments, empty values dropped."""
-    values = {}
-    try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            if key.startswith("AINVFX_") and value:
-                values[key] = value
-    except OSError:
-        pass
-    return values
-
-
-def load_settings():
-    """settings.env (next to this script, versioned), then settings.local.env (yours, ignored by git):
-    a key in the local file replaces the same key of settings.env. The result is sent with every pod
-    and read by bootstrap.sh on the pod."""
-    values = read_env_file(SETTINGS)
-    values.update(read_env_file(SETTINGS_LOCAL))
-    return values
-
-
-def comfy_tag():
-    return load_settings().get("AINVFX_COMFY_TAG", "v0.41.2")
+DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
+TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
 MIN_CUDA = "13.0"            # host driver 580 or newer: the int8 kernels of the course models need it
-COMFY_PORT = 8188
-JUPYTER_PORT = 8888
-TEMPLATE_ID = "4i789znkrd"   # the public AInVFX template "AInVFX bootcamp ComfyUI"; `setup --template ID` overrides
-HF_SECRET = "huggingface_token"                   # the Runpod Secret holding your Hugging Face token
-HF_SECRET_REF = "{{ RUNPOD_SECRET_%s }}" % HF_SECRET   # Runpod substitutes the value when the pod boots
+COMFY_PORT, JUPYTER_PORT = 8188, 8888
+HF_SECRET = "huggingface_token"                        # the Runpod secret holding the Hugging Face token
+HF_SECRET_REF = "{{ RUNPOD_SECRET_%s }}" % HF_SECRET   # Runpod puts the value in when the pod boots
+FINAL = ("EXITED", "ERROR", "TERMINATED")
 WINDOWS = platform.system() == "Windows"
+
+HERE = Path(__file__).resolve().parent
 CONFIG_DIR = Path.home() / ".ainvfx-runpod"
 CONFIG = CONFIG_DIR / "config.json"
-HERE = Path(__file__).resolve().parent
-OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")   # where `pull` puts the files
-SETTINGS = Path(os.environ.get("AINVFX_SETTINGS") or HERE / "settings.env")   # the pod's choices, one per line
-SETTINGS_LOCAL = Path(os.environ.get("AINVFX_SETTINGS_LOCAL") or SETTINGS.with_name("settings.local.env"))  # yours, not versioned
-DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
-FINAL = ("EXITED", "ERROR", "TERMINATED")
-# The API log stream can stay open and silent while the pod writes lines that the stored log holds:
-# every STREAM_MAX_AGE seconds the stream is reopened a few seconds back, and every PROXY_POLL
-# seconds the copy of the log that the pod serves itself is read. Both overridable for the tests.
-STREAM_MAX_AGE = int(os.environ.get("AINVFX_STREAM_MAX_AGE", "60"))
-PROXY_POLL = int(os.environ.get("AINVFX_PROXY_POLL", "15"))
-# While the host fetches the image, the container has not started and nothing of ours is in the log:
-# `up` prints a summary of the download every PULL_SUMMARY seconds, a heartbeat after HEARTBEAT
-# seconds of silence, and a warning when no container has started STALL_MINUTES after creation.
-PULL_SUMMARY = int(os.environ.get("AINVFX_PULL_SUMMARY", "15"))
-HEARTBEAT = int(os.environ.get("AINVFX_HEARTBEAT", "60"))
-STALL_MINUTES = float(os.environ.get("AINVFX_STALL_MINUTES", "8"))
-STATUS_POLL = int(os.environ.get("AINVFX_STATUS_POLL", "45"))      # seconds between two reads of the pod's status
-STREAM_IDLE = int(os.environ.get("AINVFX_STREAM_IDLE", "30"))      # seconds without a byte before the stream is reopened
 
-# Each profile names its preferred GPU and the least VRAM it needs. When the preferred GPU has no stock
-# on Secure Cloud, `up` proposes the cheapest GPU in stock with at least that VRAM and a Blackwell chip
-# or newer (see "Choosing the GPU" below).
-# Since 0.8.0 (10 Oct 2026) the profiles are atomic and combine: `up image+3d`, `up image+video`,
-# `up video+train`, `up all`. Since 0.8.1 (13 Oct 2026) the size of the models comes from the list the
-# pod downloads (models.json next to this script, or your own list): the container disk is 115% of it
-# plus 30 GB for the environment, rounded up to 10, never under 100. The GPU is the one of the profile
-# that needs the most VRAM.
+
+def env_num(name, default, kind=int):
+    return kind(os.environ.get(name, default))
+
+
+# Overridable through the environment (the tests point them at a fake API and shorten every wait).
+API = os.environ.get("AINVFX_API_BASE", "https://api.runpod.io/v2")
+GRAPHQL = os.environ.get("AINVFX_GRAPHQL", "https://api.runpod.io/graphql")
+PROXY_FMT = os.environ.get("AINVFX_PROXY_FMT", "https://{id}-{port}.proxy.runpod.net")
+OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")
+SETTINGS = Path(os.environ.get("AINVFX_SETTINGS") or HERE / "settings.env")
+SETTINGS_LOCAL = Path(os.environ.get("AINVFX_SETTINGS_LOCAL") or SETTINGS.with_name("settings.local.env"))
+MAX_PRICE = env_num("AINVFX_MAX_PRICE", "2.5", float)      # USD per hour: the most `up` picks on its own
+MAINT_HOURS = env_num("AINVFX_MAINT_HOURS", "24", float)   # a host with maintenance this close is refused
+HOST_WAIT = env_num("AINVFX_HOST_WAIT", "40")              # seconds to wait for the API to name the host
+RETRY_EVERY = max(1, env_num("AINVFX_RETRY_EVERY", "15"))  # `up --retry`: seconds between catalog reads
+RETRY_NOTE = env_num("AINVFX_RETRY_NOTE", "60")            # seconds between two "still waiting" lines
+# Runpod's live log stream has been seen staying open and silent while the pod wrote its last lines, so
+# the stream is reopened every STREAM_MAX_AGE seconds and the pod's own copy of the log is read every PROXY_POLL.
+STREAM_MAX_AGE = env_num("AINVFX_STREAM_MAX_AGE", "60")
+STREAM_IDLE = env_num("AINVFX_STREAM_IDLE", "30")          # seconds without a byte before the stream is reopened
+PROXY_POLL = env_num("AINVFX_PROXY_POLL", "15")
+STATUS_POLL = env_num("AINVFX_STATUS_POLL", "45")          # seconds between two reads of the pod's status
+PULL_SUMMARY = env_num("AINVFX_PULL_SUMMARY", "15")        # seconds between two image-download summaries
+HEARTBEAT = env_num("AINVFX_HEARTBEAT", "60")              # seconds of silence before a "waiting" line
+STALL_MINUTES = env_num("AINVFX_STALL_MINUTES", "8", float)  # no container this long after creation: warn
+RATE_RETRIES = 5   # a 429 from the Runpod API is retried after Retry-After, or 2, 4, 8, 16, 32 s
+
+# Each profile names its preferred GPU and the least VRAM it needs; a combination takes the largest.
 PROFILES = {
     "image": dict(vram=32, gpu="NVIDIA GeForce RTX 5090"),
     "3d":    dict(vram=32, gpu="NVIDIA GeForce RTX 5090"),
@@ -173,6 +94,102 @@ PROFILES = {
     "train": dict(vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
 PROFILE_ORDER = ["image", "3d", "video", "train"]
+# `up` picks on its own only a Blackwell GPU or newer, and never a 1g MIG slice (the smallest share of a
+# bigger GPU: one ran the self-test in 111 s against 16 s on an RTX 5090). `--gpu` still takes any GPU.
+NEWER_GPU = re.compile(r"blackwell|rubin|\brtx [5-9]0[5-9]0\b|\bg?b[1-9]00\b|\bv?r[1-9]00\b", re.I)
+SMALL_SLICE = re.compile(r"\bMIG 1g\.", re.I)
+REGION_NAMES = {"EU": "Europe", "NA": "North America"}
+CANADA_ZONES = ("Toronto", "Montreal", "Vancouver", "Edmonton", "Winnipeg", "Halifax", "Regina", "St_Johns",
+                "Moncton", "Whitehorse", "Yellowknife", "Iqaluit", "Calgary")
+EUROPE_CITY_COUNTRY = {"Paris": "FR", "Prague": "CZ", "Bucharest": "RO", "Amsterdam": "NL", "Stockholm": "SE",
+                       "Reykjavik": "IS", "Oslo": "NO"}
+# bootstrap.sh writes its log inside ComfyUI's input folder, so the pod also serves it through its proxy.
+LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
+OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root
+SKIP_NAMES = {"_output_images_will_be_put_here"}               # the empty placeholder ComfyUI creates
+
+
+# ----------------------------------------------------------------------------- small helpers
+def die(msg, code=1):
+    print("\nERROR: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def confirm(question, yes=False):
+    return yes or input(question).strip().lower() in ("", "y", "yes")
+
+
+def fmt_money(x):
+    return "{:.2f} USD".format(x)
+
+
+def fmt_duration(hours):
+    minutes = int(round(hours * 60))
+    if minutes < 1:
+        return "under a minute"
+    h, m = divmod(minutes, 60)
+    return "{} h {:02d} min".format(h, m) if h else "{} min".format(m)
+
+
+def fmt_since(t):
+    """'3 min' or '40 s' from an aware datetime to now."""
+    if not t:
+        return "?"
+    secs = int((datetime.now(timezone.utc) - t).total_seconds())
+    return "{} min".format(secs // 60) if secs >= 60 else "{} s".format(secs)
+
+
+def parse_time(s):
+    """An RFC 3339 timestamp ('2026-10-07T14:50:00Z') as an aware datetime, or None."""
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def to_time(value):
+    """An API time (RFC 3339 text, or epoch seconds or milliseconds) as an aware datetime, or None."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) or re.fullmatch(r"\d{9,13}(\.\d+)?", str(value)):
+        x = float(value)
+        return datetime.fromtimestamp(x / 1000 if x > 1e11 else x, tz=timezone.utc)
+    return parse_time(str(value))
+
+
+def ainvfx_lines(lines):
+    return [l for l in lines if "[AINVFX]" in l]
+
+
+# ----------------------------------------------------------------------------- settings and models list
+def read_env_file(path):
+    """The AINVFX_* variables of one KEY=value file: # comments and empty values dropped, quotes removed."""
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for raw in lines:
+        key, sep, value = raw.strip().partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or key.startswith("#"):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key.startswith("AINVFX_") and value:
+            values[key] = value
+    return values
+
+
+def load_settings():
+    """settings.env, then settings.local.env: a key in the local file replaces the same key."""
+    values = read_env_file(SETTINGS)
+    values.update(read_env_file(SETTINGS_LOCAL))
+    return values
 
 
 def parse_profiles(text):
@@ -188,7 +205,8 @@ def parse_profiles(text):
 
 
 def direct_url(url):
-    """A share link turned into a link to the file itself: Google Drive, Dropbox, a file page on GitHub."""
+    """A share link turned into a link to the file itself: Google Drive, Dropbox, a file page on GitHub.
+    bootstrap.sh does the same conversion on the pod."""
     m = re.match(r"https?://drive\.google\.com/(?:file/d/|open\?id=)([\w-]+)", url)
     if m:
         return "https://drive.google.com/uc?export=download&id=" + m.group(1)
@@ -218,12 +236,14 @@ def read_models(url=DEFAULT_MODELS_URL):
 
 
 def profile_spec(profiles, models=None):
-    """disk, vram, gpu, the size of the models (GB) and the label (`image+3d`) for one or several profiles."""
+    """disk, vram, gpu, the size of the models (GB) and the label (`image+3d`) for one or several profiles.
+    The disk is 115% of the models plus 30 GB for the environment, rounded up to 10, never under 100."""
     models = models or read_models()
     missing = [p for p in profiles if p not in models["profiles"]]
     if missing:
         die("the models list has no profile {} (it has: {}).".format(", ".join(missing), ", ".join(models["profiles"])))
     keys = []
+
     def walk(name, seen=()):                  # `@image` inside a profile includes the image profile
         for item in models["profiles"].get(name, []):
             if item.startswith("@"):
@@ -241,48 +261,9 @@ def profile_spec(profiles, models=None):
     gpu = next(PROFILES[p]["gpu"] for p in profiles if PROFILES[p]["vram"] == vram)
     disk = max(100, int(-(-(gb * 1.15 + 30) // 10) * 10))
     return dict(disk=disk, vram=vram, gpu=gpu, gb=round(gb), label="+".join(profiles))
-# Choosing the GPU. Two rules, learned on 5 and 7 October 2026, when a pod created with no data center
-# named landed on a host scheduled for removal (console notice "This server will be removed from the
-# platform"; the container never started), although the catalog showed no stock for that GPU:
-# 1. `up` never creates a pod where the catalog shows no stock, and never leaves the Secure Cloud data
-#    center to Runpod. Community stock carries no data center in the catalog, so a Community pod is the
-#    one case where Runpod picks the host, and only when the catalog shows Community stock.
-# 2. After each creation, `up` reads the pod's host through the GraphQL API (the REST API v2 does not
-#    report it). A host with maintenance under way, or starting within MAINT_HOURS, is terminated at
-#    once (a few seconds billed) and the next candidate is tried.
-NEWER_GPU = re.compile(r"blackwell|rubin|\brtx [5-9]0[5-9]0\b|\bg?b[1-9]00\b|\bv?r[1-9]00\b", re.I)
-# A 1g MIG slice (Multi-Instance GPU: a fixed share of a bigger GPU, with its own memory) is the smallest
-# share: one seventh of a B300 (the catalog offers 56 on an 8-GPU machine). On 7 Oct 2026 the B300 MIG
-# 1g.34gb ran the image self-test in 111 s, against 16.1 s on an RTX 5090. `up` leaves 1g slices out of
-# its list and never picks one on its own; `--gpu "B300 MIG 34GB"` still takes one.
-SMALL_SLICE = re.compile(r"\bMIG 1g\.", re.I)
-MAX_PRICE = float(os.environ.get("AINVFX_MAX_PRICE", "2.5"))     # USD per hour: the most `up` picks on its own
-MAINT_HOURS = float(os.environ.get("AINVFX_MAINT_HOURS", "24"))  # maintenance starting sooner than this is refused
-HOST_WAIT = int(os.environ.get("AINVFX_HOST_WAIT", "40"))        # seconds to wait for the API to name the host
-# `up --retry` (0.9.0, 19 Oct 2026: each B200 and B300 freed on Secure Cloud was taken within seconds, before
-# a person could run `up` again). Instead of stopping when nothing is free, `up` reads the catalog again every
-# RETRY_EVERY seconds and creates the first GPU free, by the same rules as without --retry, then stops: one
-# pod, never more. One read is one request per cloud: 240 an hour at 15 s, against the 3,600 an hour that
-# Runpod allows from 27 Oct 2026; never under 1 s. A "still waiting" line comes every RETRY_NOTE seconds.
-RETRY_EVERY = max(1, int(os.environ.get("AINVFX_RETRY_EVERY", "15")))
-RETRY_NOTE = int(os.environ.get("AINVFX_RETRY_NOTE", "60"))
-GRAPHQL = os.environ.get("AINVFX_GRAPHQL", "https://api.runpod.io/graphql")   # the test harness points this at a fake
-# The same command as the public template. If GitHub cannot be reached, the pod falls back to
-# Runpod's own /start.sh (SSH and JupyterLab), so the error can be read instead of a restart loop.
-START_CMD = ('bash -c "curl -fsSL --retry 5 --retry-delay 3 {raw}/bootstrap.sh -o /tmp/ainvfx-bootstrap.sh '
-             '&& bash /tmp/ainvfx-bootstrap.sh || /start.sh"').format(raw=REPO_RAW)
 
 
-# ----------------------------------------------------------------------------- small helpers
-def die(msg, code=1):
-    print("\nERROR: " + msg, file=sys.stderr)
-    sys.exit(code)
-
-
-def say(msg=""):
-    print(msg, flush=True)
-
-
+# ----------------------------------------------------------------------------- configuration
 def load_config():
     if CONFIG.exists():
         try:
@@ -293,24 +274,18 @@ def load_config():
 
 
 def save_config(cfg):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    """Written to a private temporary file, then moved into place: never readable by others, never half written."""
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = CONFIG.with_name("{}.{}.tmp".format(CONFIG.name, os.getpid()))
+    try:
+        with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=2) + "\n")
+        os.replace(str(tmp), str(CONFIG))
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
     restrict(CONFIG)
-
-
-def remember_pod(cfg, tag, rec):
-    """Write one pod record, or remove it (rec None). The file is read again just before the write, so
-    two commands running at once (two terminals, two `up`) keep each other's records. Before 0.6.1 each
-    command wrote back the whole file it had read at its start, and the last one to finish erased the
-    other's pod (7 Oct 2026: `down test10` no longer knew test10)."""
-    fresh = load_config()
-    pods = fresh.setdefault("pods", {})
-    if rec is None:
-        pods.pop(tag, None)
-    else:
-        pods[tag] = rec
-    save_config(fresh)
-    cfg["pods"] = pods
 
 
 def restrict(path):
@@ -326,6 +301,19 @@ def restrict(path):
         pass
 
 
+def remember_pod(cfg, tag, rec):
+    """Write one pod record, or remove it (rec None). The file is read again just before the write, so two
+    commands running at once (two terminals, two `up`) keep each other's records."""
+    fresh = load_config()
+    pods = fresh.setdefault("pods", {})
+    if rec is None:
+        pods.pop(tag, None)
+    else:
+        pods[tag] = rec
+    save_config(fresh)
+    cfg["pods"] = pods
+
+
 def api_key(cfg):
     key = os.environ.get("RUNPOD_API_KEY") or cfg.get("api_key")
     if not key:
@@ -333,10 +321,11 @@ def api_key(cfg):
     return key
 
 
+# ----------------------------------------------------------------------------- HTTP
 class ApiError(Exception):
+    """Every HTTP or network failure. Code 0 means no HTTP answer (no network, refused, timed out)."""
     def __init__(self, code, text, url):
-        self.code, self.text, self.url = code, text, url
-        self.detail, self.errors, self.retry_after = text, None, None
+        self.code, self.detail, self.errors, self.retry_after = code, text, None, None
         try:                       # Runpod errors are application/problem+json: title, status, detail, errors
             prob = json.loads(text)
             self.detail = prob.get("detail") or prob.get("title") or text
@@ -344,6 +333,10 @@ class ApiError(Exception):
         except (ValueError, AttributeError):
             pass
         super().__init__("HTTP {} on {}: {}".format(code, url, self.detail))
+
+    @property
+    def timed_out(self):
+        return "timed out" in (self.detail or "").lower()
 
     def hint(self):
         if self.code == 401:
@@ -360,23 +353,11 @@ class ApiError(Exception):
             return "No network, or api.runpod.io unreachable from this machine."
         return ""
 
-    @property
-    def timed_out(self):
-        return "timed out" in (self.detail or "").lower()
-
-
-RATE_RETRIES = 5    # 0.8.2: on a 429 from api.runpod.io, wait Retry-After or 2, 4, 8, 16, 32 s, then give up
-
 
 def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
-    """One HTTP request with urllib. Returns parsed JSON, bytes (raw=True), or the open response (stream=True).
-    `body` is sent as JSON; `data` as given (bytes), with the Content-Type of `headers`.
-    Every network failure, including a timeout while the server prepares its answer, is an ApiError
-    with code 0: nothing here raises a bare socket error (a pod on a host that does not respond
-    once made `up` stop with a traceback).
-    Since 0.8.2: a 429 from the Runpod API (api.runpod.io: 180 requests a minute, 3,600 an hour,
-    43,200 a day from 27 Oct 2026) is retried RATE_RETRIES times, after the Retry-After the server gives
-    or an exponential wait; a pod's proxy and Hugging Face are not retried here."""
+    """One HTTP request. Returns parsed JSON, bytes (raw=True), or the open response (stream=True).
+    `body` is sent as JSON; `data` as given, with the Content-Type of `headers`. A 429 from the Runpod
+    API is retried RATE_RETRIES times; a pod's proxy and other hosts are not retried."""
     runpod_host = url.startswith(API) or url.startswith(GRAPHQL)
     for attempt in range(RATE_RETRIES + 1):
         try:
@@ -389,28 +370,25 @@ def request(method, url, key=None, body=None, timeout=60, raw=False, headers=Non
             time.sleep(wait)
 
 
-def _request_once(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
+def _request_once(method, url, key, body, timeout, raw, headers, stream, data):
     hdrs = {"Accept": "application/json", "User-Agent": "ainvfx-runpod/" + VERSION}
     if key:
         hdrs["Authorization"] = "Bearer " + key
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
-    if headers:
-        hdrs.update(headers)
+    hdrs.update(headers or {})
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         r = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
-        text = e.read().decode("utf-8", "replace")[:1000]
-        err = ApiError(e.code, text, url)
+        err = ApiError(e.code, e.read().decode("utf-8", "replace")[:1000], url)
         err.retry_after = e.headers.get("Retry-After")
         raise err
     except urllib.error.URLError as e:
-        reason = e.reason
-        if isinstance(reason, (socket.timeout, TimeoutError)):
+        if isinstance(e.reason, (socket.timeout, TimeoutError)):
             raise ApiError(0, "timed out after {} s (connecting)".format(timeout), url)
-        raise ApiError(0, str(reason), url)
+        raise ApiError(0, str(e.reason), url)
     except (socket.timeout, TimeoutError):
         raise ApiError(0, "timed out after {} s (no answer)".format(timeout), url)
     except (OSError, http.client.HTTPException) as e:
@@ -434,18 +412,25 @@ def _request_once(method, url, key=None, body=None, timeout=60, raw=False, heade
         return {"_text": payload.decode("utf-8", "replace")}
 
 
-def rp(method, path, cfg, body=None, timeout=60, raw=False, headers=None, stream=False):
-    return request(method, API + path, api_key(cfg), body, timeout, raw, headers, stream)
+def rp(method, path, cfg, body=None, timeout=60, headers=None, stream=False):
+    """A call to the Runpod REST API v2 (https://api.runpod.io/v2/openapi.json)."""
+    return request(method, API + path, api_key(cfg), body, timeout, headers=headers, stream=stream)
+
+
+def graphql(cfg, query):
+    """The `data` of a GraphQL answer, or None when it cannot be read. Used only for what REST v2 lacks:
+    the pod's host (maintenance) and the account's credit."""
+    try:
+        data = request("POST", GRAPHQL, api_key(cfg), body={"query": query}, timeout=20)
+    except ApiError:
+        return None
+    if not isinstance(data, dict) or data.get("errors") or "data" not in data:
+        return None
+    return data.get("data") or {}
 
 
 def pod_url(pod_id, port=COMFY_PORT):
-    fmt = os.environ.get("AINVFX_PROXY_FMT", "https://{id}-{port}.proxy.runpod.net")   # the test harness overrides it
-    return fmt.format(id=pod_id, port=port)
-
-
-# The bootstrap writes its log inside ComfyUI's input folder, so the log is also readable through the
-# proxy once ComfyUI answers: a second way to see READY when the API log stream misses it.
-LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
+    return PROXY_FMT.format(id=pod_id, port=port)
 
 
 def proxy_log(pod_id):
@@ -454,17 +439,18 @@ def proxy_log(pod_id):
         data = request("GET", pod_url(pod_id) + LOG_VIEW, timeout=10, raw=True)
     except ApiError:
         return []
-    return [l for l in data.decode("utf-8", "replace").splitlines() if "[AINVFX]" in l]
+    return ainvfx_lines(data.decode("utf-8", "replace").splitlines())
 
 
-REGION_NAMES = {"EU": "Europe", "NA": "North America"}
-# Runpod data center ids start with the country: CA-MTL-1, US-TX-3, EU-FR-1, EUR-IS-2, EU-CZ-1.
-CANADA_ZONES = ("Toronto", "Montreal", "Vancouver", "Edmonton", "Winnipeg", "Halifax", "Regina", "St_Johns",
-                "Moncton", "Whitehorse", "Yellowknife", "Iqaluit", "Calgary")
-EUROPE_CITY_COUNTRY = {"Paris": "FR", "Prague": "CZ", "Bucharest": "RO", "Amsterdam": "NL", "Stockholm": "SE",
-                       "Reykjavik": "IS", "Oslo": "NO"}
+def comfy_alive(pod_id):
+    try:
+        request("GET", pod_url(pod_id) + "/system_stats", timeout=8)
+        return True
+    except ApiError:
+        return False
 
 
+# ----------------------------------------------------------------------------- where the person is
 def region_of(dc_id):
     p = (dc_id or "").upper()
     if p.startswith(("EU", "EUR")):
@@ -495,11 +481,9 @@ def local_zone():
                 target = os.readlink(cand)
                 if "zoneinfo/" in target:
                     return target.split("zoneinfo/", 1)[1]
-        if os.path.exists("/etc/timezone"):
-            return open("/etc/timezone", encoding="utf-8").read().strip()
+        return Path("/etc/timezone").read_text(encoding="utf-8").strip()
     except Exception:
-        pass
-    return ""
+        return ""
 
 
 def local_place():
@@ -518,10 +502,6 @@ def local_place():
     return ("NA", "") if offset_h <= -2 else ("EU", "")
 
 
-def local_region():
-    return local_place()[0]
-
-
 def dc_order(dc_id, region, country):
     """Sort key: the person's country first, then the rest of their region, then the other main region."""
     same_region = region_of(dc_id) == region
@@ -529,12 +509,68 @@ def dc_order(dc_id, region, country):
             1 if same_region else 2 if region_of(dc_id) in REGION_NAMES else 3)
 
 
+# ----------------------------------------------------------------------------- pods
+def get_pod(cfg, pod_id):
+    return rp("GET", "/pods/" + pod_id, cfg)
+
+
+def list_pods(cfg):
+    pods, cursor = [], None
+    while True:
+        q = "?" + urllib.parse.urlencode({"cursor": cursor}) if cursor else ""
+        data = rp("GET", "/pods" + q, cfg)
+        pods += data.get("pods") or []
+        cursor = (data.get("pagination") or {}).get("nextCursor")
+        if not cursor:
+            return pods
+
+
+def pod_status(pod):
+    return str(pod.get("status") or "?").upper()
+
+
+def pod_price(pod):
+    try:
+        return float(pod.get("cost"))
+    except (TypeError, ValueError):
+        return None
+
+
+def pod_summary(pod):
+    """(GPU, data center, price per hour) of a pod, '?' when not reported."""
+    return str((pod.get("gpu") or {}).get("id") or "?"), str(pod.get("dataCenterId") or "?"), pod_price(pod)
+
+
+def pod_spent(pod, rec=None):
+    """(hours, USD, price per hour) since the pod was created: an estimate, since Runpod bills from creation.
+    None when the price or the creation time is unknown."""
+    price = pod_price(pod)
+    created = parse_time(pod.get("createdAt") or "") or parse_time((rec or {}).get("created", ""))
+    if not price or not created:
+        return None
+    hours = max(0.0, (datetime.now(timezone.utc) - created).total_seconds() / 3600)
+    return hours, hours * price, price
+
+
+def pod_ssh(pod):
+    """(kind, host, port, user): 'direct' (full ssh, scp, rsync) if 22/tcp got a public port, else 'proxy' (shell only)."""
+    ssh = pod.get("ssh") or {}
+    for kind in ("direct", "proxy"):
+        c = ssh.get(kind)
+        if c and c.get("host") and c.get("port") and c.get("username"):
+            return kind, c["host"], int(c["port"]), c["username"]
+    return None, None, None, None
+
+
+def outputs_of(rec):
+    """outputs/<pod name>/, the pod name made safe as a folder name."""
+    folder = re.sub(r"[\\/:]+", "-", rec.get("name") or "").strip(". ")
+    return OUTPUTS / (folder or rec["id"])
+
+
 def forget_gone(cfg, account):
-    """Remove the records of pods that are no longer in the account (terminated from the Runpod console,
-    from another machine, or by Runpod itself): only `down` removed a record before 0.9.3, so such pods
-    stayed recorded here and every command without a name asked which one (Adrien, 22 Oct 2026: seven
-    records, one pod). A stopped pod (EXITED) is still in the account and keeps its record. Returns the
-    names forgotten."""
+    """Remove the records of pods no longer in the account (terminated from the console, from another machine,
+    or by Runpod). A stopped pod is still in the account and keeps its record. Returns the names forgotten."""
     alive = {str(p.get("id")) for p in account}
     gone = [(t, r) for t, r in list((cfg.get("pods") or {}).items()) if str(r.get("id")) not in alive]
     for t, _ in gone:
@@ -543,17 +579,16 @@ def forget_gone(cfg, account):
 
 
 def which_pod(cfg, ref):
-    """The pod a command targets: (tag, record). `ref` is a tag (a profile name, or the `--name`
-    given to `up`), a pod name, a pod id, or nothing when one pod is recorded. A pod that exists in
-    the account but not here (created from the console, or from another machine) is attached: its
-    record is written to the configuration under its name, so the next commands can use it."""
+    """The pod a command targets: (tag, record). `ref` is a tag (a profile, or the --name given to `up`), a
+    pod name, a pod id, or nothing when one pod is recorded. A pod found in the account but not here
+    (created from the console or another machine) is attached: recorded here under its name."""
     pods = cfg.setdefault("pods", {})
     if ref:
         ref = ref.strip().replace("+", "-")   # `down image+3d` and `down image-3d` name the same pod
     if ref is None:
-        if len(pods) > 1:                   # 0.9.3: first forget the pods that no longer exist
+        if len(pods) > 1:                     # first forget the pods that no longer exist
             try:
-                gone = forget_gone(cfg, list_pods(cfg, quiet=True))
+                gone = forget_gone(cfg, list_pods(cfg))
             except ApiError:
                 gone = []
             if gone:
@@ -572,7 +607,7 @@ def which_pod(cfg, ref):
     for tag, rec in pods.items():
         if ref in (rec.get("id"), rec.get("name")):
             return tag, rec
-    account = list_pods(cfg, quiet=True)
+    account = list_pods(cfg)
     short = {"ainvfx-{}-{}".format(k, ref) for k in PROFILES}   # `up image --name test10` names its pod ainvfx-image-test10
 
     def attach(p, tag):
@@ -588,90 +623,41 @@ def which_pod(cfg, ref):
             return attach(p, ref)
         if ref in (pid, pname) or (pname and pname.startswith(ref)):
             return attach(p, pname or pid)
-    if ref in PROFILES:                     # `up image` names its pod ainvfx-image-<month><day>-<time>
+    if ref in PROFILES:                       # `up image` names its pod ainvfx-image-<month><day>-<time>
         hits = [p for p in account if str(p.get("name") or "").startswith("ainvfx-{}-".format(ref))
                 and pod_status(p) not in FINAL]
         if len(hits) == 1:
             return attach(hits[0], ref)
         if hits:
-            die("several {} pods in your account: {}. Name one: `python pod.py {} <name or id>`.".format(
-                ref, "  ".join("{} ({})".format(p.get("name"), p.get("id")) for p in hits), "status"))
+            die("several {} pods in your account: {}. Name one: `python pod.py status <name or id>`.".format(
+                ref, "  ".join("{} ({})".format(p.get("name"), p.get("id")) for p in hits)))
     die("no pod '{}' recorded here or in your account. `python pod.py list` shows them.".format(ref))
 
 
-def fmt_money(x):
-    return "{:.2f} USD".format(x)
-
-
-def parse_time(s):
-    """An RFC 3339 timestamp from the API ('2026-10-07T14:50:00Z') as an aware datetime."""
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
-        return None
-
-
-# ----------------------------------------------------------------------------- Runpod calls
-# Field names below are those of the Runpod REST API v2 (https://api.runpod.io/v2/openapi.json):
-# status, cost (USD per hour), gpu.id, dataCenterId, cudaVersion, ssh.direct and ssh.proxy,
-# runtime.ports, createdAt. The logs endpoint is a Server-Sent Events stream.
-def get_pod(cfg, pod_id):
-    return rp("GET", "/pods/" + pod_id, cfg)
-
-
-def pod_status(pod):
-    return str(pod.get("status") or "?").upper()
-
-
-def pod_price(pod):
-    try:
-        return float(pod.get("cost"))
-    except (TypeError, ValueError):
-        return None
-
-
-def pod_spent(pod, rec=None):
-    """(hours, USD, price per hour) since the pod was created, at its hourly price: an estimate, since Runpod
-    bills from creation. None when the price or the creation time is unknown."""
-    price = pod_price(pod)
-    created = parse_time(pod.get("createdAt") or "") or parse_time((rec or {}).get("created", ""))
-    if not price or not created:
-        return None
-    hours = max(0.0, (datetime.now(timezone.utc) - created).total_seconds() / 3600)
-    return hours, hours * price, price
-
-
-def fmt_duration(hours):
-    minutes = int(round(hours * 60))
-    if minutes < 1:
-        return "under a minute"
-    h, m = divmod(minutes, 60)
-    return "{} h {:02d} min".format(h, m) if h else "{} min".format(m)
-
-
-def pod_summary(pod):
-    gpu = (pod.get("gpu") or {}).get("id") or "?"
-    dc = pod.get("dataCenterId") or "?"
-    return str(gpu), str(dc), pod_price(pod)
-
-
-def pod_ssh(pod):
-    """(kind, host, port, user): 'direct' (full ssh, scp, rsync) if 22/tcp got a public port, else 'proxy' (shell only)."""
-    ssh = pod.get("ssh") or {}
-    for kind in ("direct", "proxy"):
-        c = ssh.get(kind)
-        if c and c.get("host") and c.get("port") and c.get("username"):
-            return kind, c["host"], int(c["port"]), c["username"]
-    return None, None, None, None
-
-
+# ----------------------------------------------------------------------------- the GPU catalog
 def read_catalog(cfg, cloud):
-    """Every GPU type with its pod stock on `cloud` (SECURE or COMMUNITY) for hosts on CUDA MIN_CUDA or
-    newer, in one call: id, name, memory (VRAM in GB), price per cloud, availability, and for Secure the
-    data centers with stock (GET /catalog/gpus, REST API v2)."""
+    """Every GPU type with its pod stock on `cloud` (SECURE or COMMUNITY) for hosts on CUDA MIN_CUDA or newer:
+    id, name, memory (GB), price per cloud, availability, and for Secure the data centers with stock."""
     q = urllib.parse.urlencode({"include": "AVAILABILITY", "product": "POD", "minCudaVersion": MIN_CUDA, "cloud": cloud})
     data = rp("GET", "/catalog/gpus?" + q, cfg)
     return [g for g in (data.get("gpus") or []) if isinstance(g, dict) and g.get("id")]
+
+
+def read_catalogs(cfg, community, fatal=True):
+    """{cloud: GPU types} for each cloud considered. When the Secure catalog cannot be read, `up` stops (fatal),
+    or the ApiError goes up to the --retry wait, which reads again at its next try."""
+    catalogs = {}
+    for cloud in (("SECURE", "COMMUNITY") if community else ("SECURE",)):
+        try:
+            catalogs[cloud] = read_catalog(cfg, cloud)
+        except ApiError as e:
+            if cloud == "SECURE":
+                if not fatal:
+                    raise
+                die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
+            if fatal:
+                say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
+    return catalogs
 
 
 def in_stock(level):
@@ -686,8 +672,8 @@ def newer_gpu(gpu):
 def make_offers(catalogs, region, country):
     """One offer per GPU type and cloud with stock, cheapest first (Secure first at the same price):
     dict(id, name, vram, cloud, price, dcs, newer, slice). A Secure offer lists its data centers with stock,
-    the person's country first, and a create names one of them: Secure stock with no data center named
-    is skipped. A Community offer has no data center (the catalog gives none for Community)."""
+    the person's country first; Secure stock with no data center named is skipped, so a Secure pod always
+    names its data center. A Community offer has none: Runpod picks the host."""
     offers = []
     for cloud, gpus in catalogs.items():
         for g in gpus:
@@ -706,124 +692,58 @@ def make_offers(catalogs, region, country):
 
 
 def fits_profile(offer, vram):
-    """True when `up` may pick the offer on its own for a profile needing `vram` GB: enough VRAM,
-    a Blackwell chip or newer, and not a 1g MIG slice."""
+    """True when `up` may pick the offer on its own: enough VRAM, Blackwell or newer, not a 1g MIG slice."""
     return offer["vram"] >= vram and offer["newer"] and not offer["slice"]
 
 
 def find_gpu(catalog, ref):
-    """The catalog entry that `ref` names: its full id or its short name ("RTX PRO 4500 SE"), in any case,
-    or a part of either that matches one GPU type only."""
+    """The catalog entry `ref` names: its full id or short name ("RTX PRO 4500 SE"), in any case, or a part of
+    either that matches one GPU type only."""
     r = ref.strip().lower()
     for key in ("id", "name"):
         hits = [g for g in catalog if str(g.get(key, "")).lower() == r]
         if hits:
             return hits[0]
-    hits, seen = [], set()                     # the same GPU type comes once per cloud: keep the first
+    hits = {}                                  # the same GPU type comes once per cloud: keep the first
     for g in catalog:
-        if (r in str(g.get("id", "")).lower() or r in str(g.get("name", "")).lower()) and g["id"] not in seen:
-            seen.add(g["id"])
-            hits.append(g)
+        if r in str(g.get("id", "")).lower() or r in str(g.get("name", "")).lower():
+            hits.setdefault(g["id"], g)
     if len(hits) == 1:
-        return hits[0]
+        return next(iter(hits.values()))
     if not hits:
         die("no GPU type named \"{}\" in the Runpod catalog. `python pod.py up` lists the GPUs in stock. "
             "For several GPUs, repeat --gpu: --gpu B200 --gpu B300.".format(ref))
     die("\"{}\" matches several GPU types: {}. Give one of these names to --gpu.".format(
-        ref, ", ".join('"{}"'.format(g.get("name") or g["id"]) for g in hits[:12])))
+        ref, ", ".join('"{}"'.format(g.get("name") or g["id"]) for g in list(hits.values())[:12])))
 
 
-MACHINE_QUERY = ("query {{ pod(input: {{podId: {} }}) {{ id machine {{ podHostId dataCenterId location "
-                 "maintenanceStart maintenanceEnd maintenanceNote }} }} }}")
+def pick_candidates(catalogs, wants, named, spec, region, country, max_price):
+    """What `up` may create now, in the order it tries them. With --gpu: the GPUs named, in the order given.
+    Without: the profile's GPU on Secure Cloud, then every GPU that fits the profile at max_price or less,
+    cheapest first. Returns (offers, fits, preferred, candidates)."""
+    offers = make_offers(catalogs, region, country)
+    fits = [o for o in offers if fits_profile(o, spec["vram"])]
+    if named:
+        return offers, fits, None, [o for w in wants for o in offers if o["id"] == w["id"]]
+    preferred = next((o for o in offers if o["id"] == wants[0]["id"] and o["cloud"] == "SECURE"), None)
+    rest = [o for o in fits if o is not preferred and o["price"] <= max_price]
+    return offers, fits, preferred, ([preferred] + rest) if preferred else rest
 
 
-def pod_machine(cfg, pod_id):
-    """The pod's host as the GraphQL API reports it (the REST API v2 has no maintenance field): a dict,
-    empty while no host is assigned; None when GraphQL cannot be read (the check is then skipped)."""
-    try:
-        data = request("POST", GRAPHQL, api_key(cfg), body={"query": MACHINE_QUERY.format(json.dumps(pod_id))}, timeout=20)
-    except ApiError:
-        return None
-    if not isinstance(data, dict) or data.get("errors") or "data" not in data:
-        return None
-    machine = ((data.get("data") or {}).get("pod") or {}).get("machine") or {}
-    return machine if any(machine.values()) else {}
-
-
-MONEY_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
-
-
-def account_money(cfg):
-    """(credit left in USD, what the account spends now in USD per hour), read through the GraphQL API (the
-    REST API v2 has no balance); (None, None) when it cannot be read, and the money lines are left out."""
-    try:
-        data = request("POST", GRAPHQL, api_key(cfg), body={"query": MONEY_QUERY}, timeout=20)
-    except ApiError:
-        return None, None
-    if not isinstance(data, dict) or data.get("errors"):
-        return None, None
-    me = (data.get("data") or {}).get("myself")
-    if not isinstance(me, dict):
-        return None, None
-
-    def num(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-    return num(me.get("clientBalance")), num(me.get("currentSpendPerHr"))
-
-
-def to_time(value):
-    """An API time (RFC 3339 text, or epoch seconds or milliseconds) as an aware datetime, or None."""
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)) or re.fullmatch(r"\d{9,13}(\.\d+)?", str(value)):
-        x = float(value)
-        return datetime.fromtimestamp(x / 1000 if x > 1e11 else x, tz=timezone.utc)
-    return parse_time(str(value))
-
-
-def maintenance_of(machine, now=None):
-    """A sentence when the host has maintenance under way or starting within MAINT_HOURS, else None.
-    A window that is over, or that starts later, does not matter for a pod that lives one session.
-    A time that cannot be read counts as under way: refusing a host costs less than a dead pod."""
-    machine = machine or {}
-    start_raw, end_raw = machine.get("maintenanceStart"), machine.get("maintenanceEnd")
-    if not start_raw and not end_raw:
-        return None
-    now = now or datetime.now(timezone.utc)
-    start, end = to_time(start_raw), to_time(end_raw)
-    if end and end <= now:
-        return None
-    if start and start > now + timedelta(hours=MAINT_HOURS):
-        return None
-
-    def when(t, raw):
-        return t.strftime("%d %b %Y %H:%M UTC") if t else str(raw)
-    if start_raw:
-        text = "maintenance {} {}".format("from" if start and start > now else "since", when(start, start_raw))
-    else:
-        text = "maintenance under way"
-    if end_raw:
-        text += ", until {}".format(when(end, end_raw))
-    note = " ".join(str(machine.get("maintenanceNote") or "").split())
-    if note:
-        text += ' ("{}")'.format(note if len(note) <= 140 else note[:140] + "...")
-    return text
-
-
-def host_check(cfg, pod_id):
-    """(machine, problem) for a pod just created. machine is None when GraphQL cannot be read, {} when
-    no host is reported within HOST_WAIT seconds; problem is the maintenance sentence, or None."""
-    deadline = time.time() + HOST_WAIT
-    while True:
-        machine = pod_machine(cfg, pod_id)
-        if machine is None or machine:
-            return machine, (maintenance_of(machine) if machine else None)
-        if time.time() >= deadline:
-            return {}, None
-        time.sleep(3)
+def retry_cap(wants, named, community, max_price):
+    """The highest price per hour a --retry wait may create at: the dearest GPU named with --gpu, on the clouds
+    considered; without --gpu, max_price or the profile's GPU, whichever costs more. None when unknown."""
+    keys = ("secure", "community") if community else ("secure",)
+    prices = []
+    for w in wants:
+        for k in keys:
+            try:
+                prices.append(float((w.get("price") or {}).get(k)))
+            except (TypeError, ValueError):
+                pass
+    if not named:
+        prices.append(max_price)
+    return max(prices) if prices else None
 
 
 def offer_where(o, limit=4):
@@ -848,31 +768,100 @@ def show_offers(offers, pick, max_price):
             offer_where(o), note))
 
 
-def list_pods(cfg, quiet=False):
-    pods, cursor = [], None
+def gpu_report(want, offers, region, community):
+    """Four lines on one GPU type: its availability on Secure Cloud, where it is in stock, its prices."""
+    secure = next((o for o in offers if o["id"] == want["id"] and o["cloud"] == "SECURE"), None)
+    dcs = secure["dcs"] if secure else []
+    price = want.get("price") or {}
+    p_secure, p_comm = price.get("secure"), price.get("community")
+    say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(
+        want.get("name") or want["id"], str(want.get("availability", "?")).upper(), MIN_CUDA))
+    say("   in stock in {}: {}".format(REGION_NAMES.get(region, region),
+                                       ", ".join(d for d in dcs if region_of(d) == region) or "none right now"))
+    say("   elsewhere: {}".format(", ".join(d for d in dcs if region_of(d) != region) or "none"))
+    say("   price per hour: {} Secure, {} Community{}".format(
+        fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?",
+        "" if community else " (not considered: add --community)"))
+
+
+# ----------------------------------------------------------------------------- host, money and secrets
+MACHINE_QUERY = ("query {{ pod(input: {{podId: {} }}) {{ id machine {{ podHostId dataCenterId location "
+                 "maintenanceStart maintenanceEnd maintenanceNote }} }} }}")
+MONEY_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
+
+
+def pod_machine(cfg, pod_id):
+    """The pod's host: a dict, empty while no host is assigned; None when GraphQL cannot be read."""
+    data = graphql(cfg, MACHINE_QUERY.format(json.dumps(pod_id)))
+    if data is None:
+        return None
+    machine = (data.get("pod") or {}).get("machine") or {}
+    return machine if any(machine.values()) else {}
+
+
+def maintenance_of(machine, now=None):
+    """A sentence when the host has maintenance under way or starting within MAINT_HOURS, else None.
+    A window that is over, or starts later, does not matter for a pod that lives one session. A time that
+    cannot be read counts as under way: refusing a host costs less than a dead pod."""
+    machine = machine or {}
+    start_raw, end_raw = machine.get("maintenanceStart"), machine.get("maintenanceEnd")
+    if not start_raw and not end_raw:
+        return None
+    now = now or datetime.now(timezone.utc)
+    start, end = to_time(start_raw), to_time(end_raw)
+    if (end and end <= now) or (start and start > now + timedelta(hours=MAINT_HOURS)):
+        return None
+
+    def when(t, raw):
+        return t.strftime("%d %b %Y %H:%M UTC") if t else str(raw)
+    if start_raw:
+        text = "maintenance {} {}".format("from" if start and start > now else "since", when(start, start_raw))
+    else:
+        text = "maintenance under way"
+    if end_raw:
+        text += ", until {}".format(when(end, end_raw))
+    note = " ".join(str(machine.get("maintenanceNote") or "").split())
+    if note:
+        text += ' ("{}")'.format(note if len(note) <= 140 else note[:140] + "...")
+    return text
+
+
+def host_check(cfg, pod_id):
+    """(machine, problem) for a pod just created. machine is None when GraphQL cannot be read, {} when no host
+    is reported within HOST_WAIT seconds; problem is the maintenance sentence, or None."""
+    deadline = time.time() + HOST_WAIT
     while True:
-        q = "?" + urllib.parse.urlencode({"cursor": cursor}) if cursor else ""
-        data = rp("GET", "/pods" + q, cfg)
-        pods += data.get("pods") or []
-        cursor = (data.get("pagination") or {}).get("nextCursor")
-        if not cursor:
-            break
-    if not quiet:
-        if not pods:
-            say("No pod in your account.")
-        tags = {r.get("id"): t for t, r in (cfg.get("pods") or {}).items()}
-        for p in pods:
-            gpu, dc, price = pod_summary(p)
-            say("{:<28} {:<12} {:<40} {:<10} {}".format(
-                str(p.get("name") or "?")[:28], pod_status(p)[:12], gpu[:40], dc[:10],
-                (fmt_money(price) + "/h") if price else ""))
-            tag = tags.get(p.get("id"))
-            say("    id {}   {}   ComfyUI {}".format(
-                p.get("id"), "here: `{}`".format(tag) if tag else "not recorded here", pod_url(str(p.get("id")))))
-        if pods:
-            say("Commands take the name in backquotes, the pod name or the id: `python pod.py status <that>`. "
-                "A pod not recorded here is attached by its first command.")
-    return pods
+        machine = pod_machine(cfg, pod_id)
+        if machine is None or machine:
+            return machine, (maintenance_of(machine) if machine else None)
+        if time.time() >= deadline:
+            return {}, None
+        time.sleep(3)
+
+
+def account_money(cfg):
+    """(credit left in USD, what the account spends now in USD per hour); (None, None) when unreadable."""
+    me = (graphql(cfg, MONEY_QUERY) or {}).get("myself")
+    if not isinstance(me, dict):
+        return None, None
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    return num(me.get("clientBalance")), num(me.get("currentSpendPerHr"))
+
+
+def say_credit(balance, spend, price, middle, tail=""):
+    """The credit line `up` prints before its question, and the warning under 3 hours."""
+    line = "   Your Runpod credit: {}, about {} hours {}{} per hour{}".format(
+        fmt_money(balance), int(balance // price), middle, fmt_money(price), tail)
+    if spend:
+        line += "; your account already spends {} per hour".format(fmt_money(spend))
+    say(line + ".")
+    if balance < 3 * price:
+        say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
 
 
 def secrets_named(cfg):
@@ -889,28 +878,21 @@ def secret_exists(cfg):
         return None
 
 
+# ----------------------------------------------------------------------------- logs
 def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20, max_age=None):
-    """Yield (event_id, source, line) from GET /pods/{id}/logs, a Server-Sent Events stream
-    (one `id:` line and one `data:` JSON line per event, with ts, source and line; the id is the ts).
-    `tail` lines are sent first, then live lines; with `since` (an RFC 3339 time) the stream resumes
-    from that time instead. Stops after `idle` seconds without any data, or after `max_age` seconds
-    in all cases. Yields (None, None, None) on keepalive lines, so the caller can do periodic work."""
-    q = {}
-    opened = time.time()
-    hdrs = {"Accept": "text/event-stream"}
-    if since:
-        q["since"] = since
-    else:
-        q["tail"] = tail
+    """Yield (event_id, source, line) from GET /pods/{id}/logs, a Server-Sent Events stream (an `id:` line, the
+    event's time, and a `data:` JSON line per event). `tail` lines come first, or with `since` (RFC 3339) the
+    stream resumes from that time. Stops after `idle` seconds without data, or `max_age` seconds in all cases.
+    Yields (None, None, None) on keepalive lines, so the caller can do periodic work."""
+    q = {"since": since} if since else {"tail": tail}
     if source:
         q["source"] = source
-    url = "/pods/{}/logs".format(pod_id) + ("?" + urllib.parse.urlencode(q) if q else "")
-    r = rp("GET", url, cfg, timeout=idle, headers=hdrs, stream=True)
+    opened = time.time()
+    r = rp("GET", "/pods/{}/logs?{}".format(pod_id, urllib.parse.urlencode(q)), cfg, timeout=idle,
+           headers={"Accept": "text/event-stream"}, stream=True)
     eid = None
     try:
-        while True:
-            if max_age and time.time() - opened > max_age:
-                return
+        while not (max_age and time.time() - opened > max_age):
             try:
                 raw = r.readline()
             except (socket.timeout, TimeoutError, OSError):
@@ -938,41 +920,23 @@ def log_stream(cfg, pod_id, tail=200, since=None, source=None, idle=20, max_age=
 
 
 def pod_logs(cfg, pod_id, tail=400, seconds=10, source="container"):
-    """The last `tail` log lines of one source (container, or system), as a list of strings (the
-    stream is left after `seconds`)."""
-    lines, t0 = [], time.time()
+    """(the last `tail` lines of one source, None) or (None, ApiError); the stream is left after `seconds`."""
     try:
-        for _, _, line in log_stream(cfg, pod_id, tail=tail, source=source, idle=3, max_age=seconds):
-            if line:
-                lines.append(line)
+        return [l for _, _, l in log_stream(cfg, pod_id, tail=tail, source=source, idle=3, max_age=seconds) if l], None
     except ApiError as e:
         return None, e
-    return lines, None
-
-
-def ainvfx_lines(lines):
-    return [l for l in lines if "[AINVFX]" in l]
-
-
-def comfy_alive(pod_id):
-    try:
-        request("GET", pod_url(pod_id) + "/system_stats", timeout=8)
-        return True
-    except ApiError:
-        return False
 
 
 def resume_point(event_id, seconds=5):
-    """An RFC 3339 time a few seconds before the given event id (itself a time), so that a reconnect
-    overlaps the lines already seen instead of skipping those written in the same second."""
+    """An RFC 3339 time a few seconds before the given event id (itself a time): a reconnect overlaps the lines
+    already seen instead of skipping those written in the same second."""
     t = parse_time(event_id or "")
     if not t:
         return None
     return (t - timedelta(seconds=seconds)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# Runpod's system log narrates the image download one Docker layer at a time ("38e4c3f3c358 Extracting",
-# "7f1a... Pull complete"), many lines per layer. They are counted into one summary line instead.
+# Runpod's system log narrates the image download one Docker layer at a time, many lines per layer.
 LAYER_DONE = ("Pull complete", "Already exists")
 LAYER_RE = re.compile(r"^([0-9a-f]{12})\s+(Pulling fs layer|Waiting|Downloading|Verifying Checksum|"
                       r"Download complete|Extracting|Pull complete|Already exists)\b")
@@ -1004,54 +968,40 @@ class ImagePull:
             n, done, extracting, downloading, elapsed // 60, elapsed % 60)
 
 
-def fmt_since(t):
-    """'3 min' from an aware datetime to now."""
-    if not t:
-        return "?"
-    secs = int((datetime.now(timezone.utc) - t).total_seconds())
-    return "{} min".format(secs // 60) if secs >= 60 else "{} s".format(secs)
-
-
 def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
-    """Print the pod's log as it appears, until READY, a dead pod, or the time runs out.
+    """Print the pod's log as it appears, until READY (True), FAILED, a dead pod or the time limit (False).
 
-    Two kinds of lines. [AINVFX] lines come from bootstrap.sh, through two sources, because the API
-    stream has been seen staying open and silent while the pod wrote lines that only the stored log
-    held: the stream is reopened every STREAM_MAX_AGE seconds a few seconds back (duplicates are
-    dropped), and every PROXY_POLL seconds the copy of the log that the pod serves through its own
-    ComfyUI is read. [RUNPOD] lines are Runpod's system log, what the host does before our script
-    runs (fetching the image, starting the container): the image download is one summary line every
-    PULL_SUMMARY seconds, the rest is printed once. A heartbeat shows after HEARTBEAT seconds without
-    anything to print, and a warning when no container has started STALL_MINUTES after creation.
-    Every API error, a timeout included, is a message, never a traceback: the pod exists and bills."""
+    [AINVFX] lines come from bootstrap.sh through two sources: the API stream, reopened every STREAM_MAX_AGE
+    seconds a few seconds back (duplicates dropped), and every PROXY_POLL seconds the copy of the log that the
+    pod serves through its own ComfyUI. [RUNPOD] lines are Runpod's system log (the image download, summarised
+    every PULL_SUMMARY seconds; the container start). A heartbeat follows HEARTBEAT seconds of silence, and a
+    warning when no container has started STALL_MINUTES after creation. An API error is a message, never a
+    traceback: the pod exists and bills."""
     deadline = time.time() + minutes * 60
     seen, printed, last_id = set(), set(), None
-    last_poll = time.time()
-    created = created or parse_time((pod or {}).get("createdAt") or "")   # when this machine saw the pod created
-    pull, pull_shown, pull_done = ImagePull(), 0.0, False
-    state = {"container": False, "stall_told": False, "stream_told": False, "status": pod_status(pod) if pod else "?"}
+    created = created or parse_time((pod or {}).get("createdAt") or "")
+    pull = ImagePull()
+    st = {"container": False, "failed": False, "stall_told": False, "stream_told": False,
+          "status": pod_status(pod) if pod else "?", "last_output": time.time(), "last_check": time.time(),
+          "last_poll": time.time(), "pull_shown": 0.0, "pull_done": False}
 
     def out(text):
         say("  " + text)
-        state["last_output"] = time.time()
-
-    state["last_output"] = time.time()
+        st["last_output"] = time.time()
 
     def show(line, key):
-        """An [AINVFX] line, once. True on READY, and on FAILED (state["failed"] then says which)."""
+        """An [AINVFX] line, once. True when it ends the wait: READY, or FAILED."""
         if key in seen or line in printed:
             return False
-        seen.add(key); printed.add(line)
-        state["container"] = True
+        seen.add(key)
+        printed.add(line)
+        st["container"] = True
         out(line[line.index("[AINVFX]"):])
-        if "[AINVFX] FAILED" in line:
-            state["failed"] = True
-            return True
-        return "READY" in line
+        st["failed"] = "[AINVFX] FAILED" in line
+        return st["failed"] or "READY" in line
 
     def done():
-        """The end of the wait: True on READY; False on FAILED, with what to do."""
-        if state.get("failed"):
+        if st["failed"]:
             say("\nThe pod reported FAILED (the line above): it cannot work on that machine, and it bills until "
                 "it is terminated. Terminate it and create another, which lands on another machine:\n"
                 "    python pod.py down    then    python pod.py up")
@@ -1059,82 +1009,77 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
         return True
 
     def system(line):
-        """A line of Runpod's system log."""
         text = line.strip()
         if not text:
             return
         if pull.feed(text):
             pull_summary(False)
-            return
-        if text in printed:
-            return
-        printed.add(text)
-        out("[RUNPOD] " + text[:200])
+        elif text not in printed:
+            printed.add(text)
+            out("[RUNPOD] " + text[:200])
 
     def pull_summary(final):
-        nonlocal pull_shown, pull_done
-        if not pull.layers or pull_done:
+        if not pull.layers or st["pull_done"]:
             return
-        if not pull_shown and not final and time.time() - pull.started < 3:
+        if not st["pull_shown"] and not final and time.time() - pull.started < 3:
             return                          # let the backlog of layer lines arrive before judging
-        n, done, extracting, downloading = pull.counts()
-        finished = n and done == n
-        if not (final or finished or time.time() - pull_shown >= PULL_SUMMARY):
+        n, finished_layers, _, _ = pull.counts()
+        finished = n and finished_layers == n
+        if not (final or finished or time.time() - st["pull_shown"] >= PULL_SUMMARY):
             return
-        if not pull_shown and finished:
+        if not st["pull_shown"] and finished:
             out("[RUNPOD] the image is already on the host ({} layers present): the container starts now".format(n))
-            pull_shown, pull_done = time.time(), True
+            st["pull_shown"], st["pull_done"] = time.time(), True
             return
-        if not pull_shown:
+        if not st["pull_shown"]:
             out("[RUNPOD] the host is fetching the pod's image from Docker Hub (several minutes; a host "
                 "that already has it starts the container within seconds)")
-        pull_shown = time.time()
+        st["pull_shown"] = time.time()
         out("[RUNPOD] " + pull.summary())
-        if finished:
-            pull_done = True
+        st["pull_done"] = bool(finished)
 
     def poll_proxy():
-        for line in proxy_log(pod_id):
-            if show(line, ("proxy", line)):
-                return True
-        return False
+        st["last_poll"] = time.time()
+        return any(show(line, ("proxy", line)) for line in proxy_log(pod_id))
 
-    def check_pod():
-        """Every 45 s: the pod's status, and the warning when the container has not started."""
-        if time.time() - last_check_box[0] < STATUS_POLL:
-            return None
-        last_check_box[0] = time.time()
+    def pod_gone():
+        """Every STATUS_POLL seconds: True when the pod has ended; warns once when no container has started."""
+        if time.time() - st["last_check"] < STATUS_POLL:
+            return False
+        st["last_check"] = time.time()
         try:
             current = get_pod(cfg, pod_id)
         except ApiError:
-            return None
-        st = pod_status(current)
-        state["status"] = st
-        if st in FINAL:
-            out("the pod is {}. Read its log in the console, then `python pod.py down` and `up` again.".format(st))
             return False
-        if not state["container"] and current.get("runtime") is None and created \
-                and (datetime.now(timezone.utc) - created).total_seconds() > STALL_MINUTES * 60 \
-                and not state["stall_told"]:
-            state["stall_told"] = True
-            gpu, dc, _ = pod_summary(current)
+        st["status"] = pod_status(current)
+        if st["status"] in FINAL:
+            out("the pod is {}. Read its log in the console, then `python pod.py down` and `up` again.".format(st["status"]))
+            return True
+        if (not st["container"] and current.get("runtime") is None and created and not st["stall_told"]
+                and (datetime.now(timezone.utc) - created).total_seconds() > STALL_MINUTES * 60):
+            st["stall_told"] = True
+            dc = pod_summary(current)[1]
             out("WARNING: NO CONTAINER {} AFTER CREATION (status {}, {}). The host is still fetching the image, or "
                 "does not respond; the console (Pods > your pod) shows its log and any maintenance notice. "
                 "The pod bills meanwhile. Usual answer:  python pod.py down <pod>  then  python pod.py up  again, "
-                "usually in another data center.".format(fmt_since(created), st, dc if dc != "?" else "data center not reported"))
-        return None
+                "usually in another data center.".format(fmt_since(created), st["status"],
+                                                         dc if dc != "?" else "data center not reported"))
+        return False
 
-    last_check_box = [time.time()]
-
-    def heartbeat():
-        if time.time() - state["last_output"] >= HEARTBEAT:
+    def tick():
+        """The periodic work between two lines. None to go on, else the result of the wait."""
+        if pod_gone():
+            return False
+        pull_summary(False)
+        if time.time() - st["last_output"] >= HEARTBEAT:
             out("[RUNPOD] waiting: pod {}, {}{} since creation".format(
-                state["status"], "no container yet, " if not state["container"] else "", fmt_since(created)))
+                st["status"], "" if st["container"] else "no container yet, ", fmt_since(created)))
+        return None
 
     while time.time() < deadline:
         try:
-            for eid, source, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id), idle=STREAM_IDLE,
-                                                max_age=STREAM_MAX_AGE):
+            for eid, source, line in log_stream(cfg, pod_id, tail=500, since=resume_point(last_id),
+                                                idle=STREAM_IDLE, max_age=STREAM_MAX_AGE):
                 if line and "[AINVFX]" in line:
                     if show(line, (eid, line)):
                         pull_summary(True)
@@ -1142,141 +1087,35 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
                 elif line and source == "system":
                     system(line)
                 last_id = eid or last_id
-                if time.time() - last_poll > PROXY_POLL:
-                    last_poll = time.time()
-                    if poll_proxy():
-                        return done()
-                if check_pod() is False:
-                    return False
-                pull_summary(False)
-                heartbeat()
+                if time.time() - st["last_poll"] > PROXY_POLL and poll_proxy():
+                    return done()
+                result = tick()
+                if result is not None:
+                    return result
                 if time.time() > deadline:
                     break
         except ApiError as e:
-            if e.code == 0 and e.timed_out:
-                if not state["stream_told"]:
-                    state["stream_told"] = True
+            if not st["stream_told"]:
+                st["stream_told"] = True
+                if e.code == 0 and e.timed_out:
                     out("[RUNPOD] the log stream did not answer ({}): the host may not be ready; retrying".format(e.detail))
-            elif not state["stream_told"]:
-                state["stream_told"] = True
-                out("(the log cannot be read through the API from here: {}. Follow it in the console, "
-                    "Pods > your pod > Logs, or wait: the pod's own copy is read as well.)".format(e.detail))
+                else:
+                    out("(the log cannot be read through the API from here: {}. Follow it in the console, "
+                        "Pods > your pod > Logs, or wait: the pod's own copy is read as well.)".format(e.detail))
             time.sleep(min(PROXY_POLL, 10))
-        last_poll = time.time()
         if poll_proxy():
             return done()
-        if check_pod() is False:
-            return False
-        pull_summary(False)
-        heartbeat()
+        result = tick()
+        if result is not None:
+            return result
     say("Still working after {} minutes: `python pod.py status` shows where it is.".format(minutes))
     return False
 
 
-# ----------------------------------------------------------------------------- commands
-def cmd_setup(args):
-    cfg = load_config()
-    say("ainvfx-runpod {} · setup".format(VERSION))
-    key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
-    if not key:
-        say("\n1. Your Runpod API key. Console > Account > Credentials > API Keys > Create API Key.")
-        say("   Name: ainvfx-runpod (any name works; this one says what the key is for).")
-        say("   Permission: Restricted. Then two lines appear:")
-        say("     api.runpod.io/graphql  ->  Read / Write   (the API this script uses: pods, catalog, secrets, SSH keys)")
-        say("     api.runpod.ai          ->  None           (Serverless endpoints, not used here)")
-        say("   Paste it below (nothing shows while you type), then Enter.")
-        key = getpass.getpass("   API key: ").strip()
-    if not key:
-        die("empty key")
-    cfg["api_key"] = key
-    say("   checking the key...")
-    try:
-        pods = list_pods(cfg, quiet=True)
-    except ApiError as e:
-        die("the key does not work: {}\n{}".format(e, e.hint()))
-    say("   ok ({} pod(s) in the account right now)".format(len(pods)))
-
-    guess_region, guess_country = local_place()
-    region = args.region or cfg.get("region") or guess_region
-    country = (args.country or cfg.get("country") or (guess_country if region == guess_region else "")).upper()
-    cfg["region"], cfg["country"] = region, country
-    zone = local_zone() or "UTC offset only"
-    say("\n2. Nearest data centers first: {}{} (from this computer's clock: {}).".format(
-        REGION_NAMES.get(region, region), ", " + country + " first" if country else "", zone))
-    say("   Runpod names them by country: CA-MTL-1, US-TX-3, EU-FR-1, EUR-IS-2... `up` tries yours first,")
-    say("   then the rest of the region, then the other region. Change with `setup --region EU --country FR`.")
-    if args.template:
-        cfg["template_id"] = args.template
-    elif not cfg.get("template_id"):
-        cfg["template_id"] = TEMPLATE_ID
-    say("   template: {}".format(cfg["template_id"] or "none (the pod is described by this script itself)"))
-
-    say("\n3. Hugging Face token (for the gated files of models.json: FLUX 3 Image Klein in the image profile, LTX in video and train).")
-    if args.hf_token:
-        say("   The token is stored on Runpod as the secret '{}' and never on this machine. Pods created".format(HF_SECRET))
-        say("   by `up` receive it as HF_TOKEN. A read token from https://huggingface.co/settings/tokens.")
-        token = getpass.getpass("   Hugging Face token: ").strip()
-        if token:
-            try:
-                rp("POST", "/account/secrets", cfg,
-                   body={"name": HF_SECRET, "value": token, "description": "Hugging Face read token (ainvfx-runpod)"})
-                say("   secret '{}' created".format(HF_SECRET))
-                cfg["hf_secret"] = True
-            except ApiError as e:
-                if e.code == 409:              # the name exists: rotate its value
-                    try:
-                        sid = secrets_named(cfg)[0]["id"]
-                        rp("PATCH", "/account/secrets/" + sid, cfg, body={"value": token})
-                        say("   secret '{}' updated".format(HF_SECRET))
-                        cfg["hf_secret"] = True
-                    except (ApiError, IndexError, KeyError) as e2:
-                        say("   could not update the secret: {}".format(e2))
-                else:
-                    say("   could not store the secret ({}): {}".format(e.code, e.hint() or e.detail))
-                    say("   Console > Account > Credentials > Secrets > name '{}', value: your token.".format(HF_SECRET))
-    else:
-        found = secret_exists(cfg)
-        cfg["hf_secret"] = bool(found)
-        say("   secret '{}': {}. To store a token:  python pod.py setup --hf-token".format(
-            HF_SECRET, "present" if found else "absent" if found is False else "unknown (the key cannot list secrets)"))
-
-    say("\n4. SSH key (optional: only for `pod.py ssh`; everything else goes through the browser).")
-    if shutil.which("ssh") and shutil.which("ssh-keygen"):
-        keyfile = Path(cfg.get("ssh_key") or Path.home() / ".ssh" / "id_ed25519")
-        pub = keyfile.with_name(keyfile.name + ".pub")
-        if not keyfile.exists():
-            ans = "y" if args.yes else input("   No SSH key found. Create one now? [Y/n] ").strip().lower()
-            if ans in ("", "y", "yes"):
-                keyfile.parent.mkdir(parents=True, exist_ok=True)
-                subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(keyfile), "-q",
-                                "-C", "ainvfx-runpod {}".format(getpass.getuser())])
-        if pub.exists():
-            pubkey = pub.read_text(encoding="utf-8").strip()
-            try:
-                keys = [k for k in (rp("GET", "/account/ssh-keys", cfg).get("keys") or []) if isinstance(k, str)]
-                if not any(pubkey.split()[1] in k for k in keys if len(k.split()) > 1):
-                    rp("PUT", "/account/ssh-keys", cfg, body={"keys": keys + [pubkey]})   # PUT replaces the full set
-                    say("   public key registered on your Runpod account")
-                else:
-                    say("   public key already registered")
-                cfg["ssh_key"] = str(keyfile)
-                if WINDOWS:
-                    restrict(keyfile)
-            except ApiError as e:
-                say("   could not register the key ({}): `pod.py ssh` will not work, the rest will. "
-                    "Console > Account > Credentials > SSH Public Keys.".format(e.code))
-    else:
-        say("   no `ssh` on this machine: skipped. JupyterLab's terminal replaces it on the pod.")
-    cfg.setdefault("pods", {})
-    save_config(cfg)
-    say("\nSaved in {} (readable by your account only).".format(CONFIG))
-    say("Next:  python pod.py up image")
-
-
+# ----------------------------------------------------------------------------- creating a pod
 def create_pod(cfg, body, where):
-    """POST /pods for one candidate. Returns the pod, or None to try the next candidate.
-    Retry rules from the API reference: 422 fix and stop, 402 stop, 400 next candidate,
-    403 skip, 429 wait then retry, 5xx retry once."""
+    """POST /pods for one candidate. Returns the pod, or None to try the next candidate: 401, 402, 404 and 422
+    stop, 403 and 400 move on, a 5xx is retried twice (a 429 is already retried by `request`)."""
     for attempt in range(3):
         try:
             return rp("POST", "/pods", cfg, body=body, timeout=120)
@@ -1284,106 +1123,34 @@ def create_pod(cfg, body, where):
             if e.code in (401, 402, 404, 422):
                 detail = e.detail if not e.errors else "{} {}".format(e.detail, json.dumps(e.errors)[:400])
                 die("{}: {}\n{}".format(e.code, detail, e.hint()))
-            if e.code == 429:
-                wait = int(e.retry_after or 10)
-                say("   rate limited: waiting {} s".format(wait)); time.sleep(wait); continue
             if e.code >= 500 and attempt < 2:
-                say("   {}: Runpod error {}, retrying".format(where, e.code)); time.sleep(5); continue
+                say("   {}: Runpod error {}, retrying".format(where, e.code))
+                time.sleep(5)
+                continue
             if e.code == 403:
-                say("   {}: not accessible with this account (403), skipped".format(where)); return None
-            say("   {}: no machine ({}: {})".format(where, e.code, e.detail[:160].replace("\n", " ")))
+                say("   {}: not accessible with this account (403), skipped".format(where))
+            else:
+                say("   {}: no machine ({}: {})".format(where, e.code, e.detail[:160].replace("\n", " ")))
             return None
-    return None
-
-
-def read_catalogs(cfg, community, fatal=True):
-    """The catalog of each cloud `up` considers, as {cloud: GPU types}. When the Secure catalog cannot be read,
-    `up` stops (fatal), or the ApiError goes up to the --retry wait, which reads again at its next try."""
-    catalogs = {}
-    for cloud in (("SECURE", "COMMUNITY") if community else ("SECURE",)):
-        try:
-            catalogs[cloud] = read_catalog(cfg, cloud)
-        except ApiError as e:
-            if cloud == "SECURE":
-                if not fatal:
-                    raise
-                die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
-            if fatal:
-                say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
-    return catalogs
-
-
-def pick_candidates(catalogs, wants, named, spec, region, country, max_price):
-    """What `up` may create now, in the order it tries them. With --gpu: the GPUs named, in the order given.
-    Without: the profile's GPU on Secure Cloud, then every GPU that fits the profile at max_price or less,
-    cheapest first. Returns (offers, fits, preferred, candidates)."""
-    offers = make_offers(catalogs, region, country)
-    fits = [o for o in offers if fits_profile(o, spec["vram"])]
-    if named:
-        return offers, fits, None, [o for w in wants for o in offers if o["id"] == w["id"]]
-    preferred = next((o for o in offers if o["id"] == wants[0]["id"] and o["cloud"] == "SECURE"), None)
-    rest = [o for o in fits if o is not preferred and o["price"] <= max_price]
-    return offers, fits, preferred, ([preferred] + rest) if preferred else rest
-
-
-def gpu_report(want, offers, region, community):
-    """Four lines on one GPU type: its availability on Secure Cloud, where it is in stock, its prices."""
-    wname = str(want.get("name") or want["id"])
-    secure = next((o for o in offers if o["id"] == want["id"] and o["cloud"] == "SECURE"), None)
-    dcs = secure["dcs"] if secure else []
-    price = want.get("price") or {}
-    p_secure, p_comm = price.get("secure"), price.get("community")
-    say("\n{}: availability {} on Secure Cloud with hosts on CUDA {} or newer".format(
-        wname, str(want.get("availability", "?")).upper(), MIN_CUDA))
-    say("   in stock in {}: {}".format(REGION_NAMES.get(region, region),
-                                       ", ".join(d for d in dcs if region_of(d) == region) or "none right now"))
-    say("   elsewhere: {}".format(", ".join(d for d in dcs if region_of(d) != region) or "none"))
-    say("   price per hour: {} Secure, {} Community{}".format(
-        fmt_money(p_secure) if p_secure else "?", fmt_money(p_comm) if p_comm else "?",
-        "" if community else " (not considered: add --community)"))
-
-
-def retry_cap(wants, named, community, max_price):
-    """The highest price per hour a --retry wait may create at: the dearest GPU named with --gpu, on the clouds
-    considered; without --gpu, max_price or the profile's GPU, whichever costs more. None when unknown."""
-    keys = ("secure", "community") if community else ("secure",)
-    prices = []
-    for w in wants:
-        for k in keys:
-            try:
-                prices.append(float((w.get("price") or {}).get(k)))
-            except (TypeError, ValueError):
-                pass
-    if not named:
-        prices.append(max_price)
-    return max(prices) if prices else None
 
 
 def try_create(cfg, candidates, name, disk, env):
-    """Create one pod from the candidates, in order: for a Secure offer, every data center the catalog lists
-    with stock; then the next offer. A pod whose host has maintenance under way, or starting within MAINT_HOURS,
-    is terminated at once and the next machine tried. Returns (pod, host, stray): pod is None when no pod could be created; stray
+    """Create one pod from the candidates, in order: for a Secure offer, every data center with stock; then the
+    next offer. A pod whose host has maintenance under way, or starting within MAINT_HOURS, is terminated at
+    once and the next machine tried. Returns (pod, host, stray): pod None when nothing could be created; stray
     lists the refused pods that could not be terminated."""
     stray = []
+    template = cfg.get("template_id") or TEMPLATE_ID   # image, start command and ports come from the template
     for n, offer in enumerate(candidates):
         if n:
             say("   Next: {}.".format(offer_line(offer)))
-        # every data center the catalog lists with stock for this GPU (0.6.0 stopped at 6: with ten pods
-        # created in the same minutes, the seventh data center can be the one with a free GPU)
-        attempts = [[dc] for dc in offer["dcs"]] if offer["cloud"] == "SECURE" else [[]]
-        for dc_list in attempts:
-            body = {"name": name, "cloud": offer["cloud"], "disk": disk, "env": env,
+        for dc in (offer["dcs"] if offer["cloud"] == "SECURE" else [None]):
+            body = {"name": name, "cloud": offer["cloud"], "disk": disk, "env": env, "templateId": template,
                     "startSsh": True, "startJupyter": True,
                     "gpu": {"id": offer["id"], "count": 1, "minCudaVersion": MIN_CUDA}}
-            if dc_list:
-                body["dataCenterIds"] = dc_list
-            if cfg.get("template_id") or TEMPLATE_ID:
-                body["templateId"] = cfg.get("template_id") or TEMPLATE_ID   # image, command, ports come from the template
-            else:
-                body["image"] = IMAGE
-                body["args"] = START_CMD
-                body["ports"] = ["{}/http".format(COMFY_PORT), "{}/http".format(JUPYTER_PORT), "22/tcp"]
-            where = "{} {}".format(offer["cloud"], dc_list[0] if dc_list else "(host picked by Runpod)")
+            if dc:
+                body["dataCenterIds"] = [dc]
+            where = "{} {}".format(offer["cloud"], dc or "(host picked by Runpod)")
             pod = create_pod(cfg, body, where)
             if not (pod and pod.get("id")):
                 continue
@@ -1419,9 +1186,8 @@ def stop_on_stray(stray):
 
 def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name, disk, env):
     """`up --retry`: read the catalog every RETRY_EVERY seconds until a candidate is free, then create it: one
-    pod, never more. Returns (pod, host, name). Ctrl+C ends the wait with a message, exit code 130.
-    A wait can last hours, so before each creation the record of `tag` is read again: if another `up` has
-    created a pod under the same name in the meantime, the wait stops instead of creating a second one."""
+    pod, never more. Returns (pod, host, name). Before each creation the record of `tag` is read again: if
+    another `up` has created a pod under that name meanwhile, the wait stops. Ctrl+C exits with code 130."""
     if named:
         what = " or ".join(str(w.get("name") or w["id"]) for w in wants)
     else:
@@ -1482,18 +1248,121 @@ def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_pric
         sys.exit(130)
 
 
+# ----------------------------------------------------------------------------- commands
+def cmd_setup(args):
+    cfg = load_config()
+    say("ainvfx-runpod {} · setup".format(VERSION))
+    key = args.key or os.environ.get("RUNPOD_API_KEY", "") or cfg.get("api_key", "")
+    if not key:
+        say("\n1. Your Runpod API key. Console > Account > Credentials > API Keys > Create API Key.")
+        say("   Name: ainvfx-runpod (any name works; this one says what the key is for).")
+        say("   Permission: Restricted. Then two lines appear:")
+        say("     api.runpod.io/graphql  ->  Read / Write   (the API this script uses: pods, catalog, secrets, SSH keys)")
+        say("     api.runpod.ai          ->  None           (Serverless endpoints, not used here)")
+        say("   Paste it below (nothing shows while you type), then Enter.")
+        key = getpass.getpass("   API key: ").strip()
+    if not key:
+        die("empty key")
+    cfg["api_key"] = key
+    say("   checking the key...")
+    try:
+        pods = list_pods(cfg)
+    except ApiError as e:
+        die("the key does not work: {}\n{}".format(e, e.hint()))
+    say("   ok ({} pod(s) in the account right now)".format(len(pods)))
+
+    guess_region, guess_country = local_place()
+    region = args.region or cfg.get("region") or guess_region
+    country = (args.country or cfg.get("country") or (guess_country if region == guess_region else "")).upper()
+    cfg["region"], cfg["country"] = region, country
+    say("\n2. Nearest data centers first: {}{} (from this computer's clock: {}).".format(
+        REGION_NAMES.get(region, region), ", " + country + " first" if country else "", local_zone() or "UTC offset only"))
+    say("   Runpod names them by country: CA-MTL-1, US-TX-3, EU-FR-1, EUR-IS-2... `up` tries yours first,")
+    say("   then the rest of the region, then the other region. Change with `setup --region EU --country FR`.")
+    cfg["template_id"] = args.template or cfg.get("template_id") or TEMPLATE_ID
+    say("   template: {}".format(cfg["template_id"]))
+
+    say("\n3. Hugging Face token (for the gated files of models.json: FLUX 3 Image Klein in the image profile, LTX in video and train).")
+    if args.hf_token:
+        say("   The token is stored on Runpod as the secret '{}' and never on this machine. Pods created".format(HF_SECRET))
+        say("   by `up` receive it as HF_TOKEN. A read token from https://huggingface.co/settings/tokens.")
+        token = getpass.getpass("   Hugging Face token: ").strip()
+        if token:
+            store_hf_secret(cfg, token)
+    else:
+        found = secret_exists(cfg)
+        cfg["hf_secret"] = bool(found)
+        say("   secret '{}': {}. To store a token:  python pod.py setup --hf-token".format(
+            HF_SECRET, "present" if found else "absent" if found is False else "unknown (the key cannot list secrets)"))
+
+    say("\n4. SSH key (optional: only for `pod.py ssh`; everything else goes through the browser).")
+    if shutil.which("ssh") and shutil.which("ssh-keygen"):
+        register_ssh_key(cfg, args.yes)
+    else:
+        say("   no `ssh` on this machine: skipped. JupyterLab's terminal replaces it on the pod.")
+    cfg.setdefault("pods", {})
+    save_config(cfg)
+    say("\nSaved in {} (readable by your account only).".format(CONFIG))
+    say("Next:  python pod.py up image")
+
+
+def store_hf_secret(cfg, token):
+    """Create the Runpod secret holding the Hugging Face token, or rotate its value when it exists."""
+    try:
+        rp("POST", "/account/secrets", cfg,
+           body={"name": HF_SECRET, "value": token, "description": "Hugging Face read token (ainvfx-runpod)"})
+        say("   secret '{}' created".format(HF_SECRET))
+        cfg["hf_secret"] = True
+    except ApiError as e:
+        if e.code != 409:
+            say("   could not store the secret ({}): {}".format(e.code, e.hint() or e.detail))
+            say("   Console > Account > Credentials > Secrets > name '{}', value: your token.".format(HF_SECRET))
+            return
+        try:                                  # 409: the name exists
+            rp("PATCH", "/account/secrets/" + secrets_named(cfg)[0]["id"], cfg, body={"value": token})
+            say("   secret '{}' updated".format(HF_SECRET))
+            cfg["hf_secret"] = True
+        except (ApiError, IndexError, KeyError) as e2:
+            say("   could not update the secret: {}".format(e2))
+
+
+def register_ssh_key(cfg, yes):
+    """Create ~/.ssh/id_ed25519 if asked, and add its public half to the Runpod account."""
+    keyfile = Path(cfg.get("ssh_key") or Path.home() / ".ssh" / "id_ed25519")
+    pub = keyfile.with_name(keyfile.name + ".pub")
+    if not keyfile.exists() and confirm("   No SSH key found. Create one now? [Y/n] ", yes):
+        keyfile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(keyfile), "-q",
+                        "-C", "ainvfx-runpod {}".format(getpass.getuser())])
+    if not pub.exists():
+        return
+    pubkey = pub.read_text(encoding="utf-8").strip()
+    try:
+        keys = [k for k in (rp("GET", "/account/ssh-keys", cfg).get("keys") or []) if isinstance(k, str)]
+        if not any(pubkey.split()[1] in k for k in keys if len(k.split()) > 1):
+            rp("PUT", "/account/ssh-keys", cfg, body={"keys": keys + [pubkey]})   # PUT replaces the full set
+            say("   public key registered on your Runpod account")
+        else:
+            say("   public key already registered")
+        cfg["ssh_key"] = str(keyfile)
+        if WINDOWS:
+            restrict(keyfile)
+    except ApiError as e:
+        say("   could not register the key ({}): `pod.py ssh` will not work, the rest will. "
+            "Console > Account > Credentials > SSH Public Keys.".format(e.code))
+
+
 def cmd_up(args):
     cfg = load_config()
     profiles = parse_profiles(args.profile)
     profile = "+".join(profiles)              # `image+3d`: the value AINVFX_PROFILE carries
+    slug = profile.replace("+", "-")
     api_key(cfg)
-    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or profile.replace("+", "-")
-    cfg.setdefault("pods", {})
-    old = cfg["pods"].get(tag)
+    tag = "".join(c if c.isalnum() or c in "-_" else "-" for c in (args.name or "")).strip("-") or slug
+    old = cfg.setdefault("pods", {}).get(tag)
     if old:
         try:
-            pod = get_pod(cfg, old["id"])
-            st = pod_status(pod)
+            st = pod_status(get_pod(cfg, old["id"]))
             if st not in FINAL and st != "?":
                 say("A pod already exists as `{}`: {} ({}). Address: {}".format(tag, old.get("name"), st, pod_url(old["id"])))
                 say("Use it, terminate it first (python pod.py down {}), or create another one with `up {} --name <name>`."
@@ -1504,29 +1373,30 @@ def cmd_up(args):
                 die("{}\n{}".format(e, e.hint()))
         remember_pod(cfg, tag, None)
 
-    region = args.region or cfg.get("region") or local_region()
+    region = args.region or cfg.get("region") or local_place()[0]
     country = (cfg.get("country") or "").upper() if not args.region or args.region == cfg.get("region") else ""
+
     def make_name():                          # called at creation: after a --retry wait, the name has the creation's time
-        return "ainvfx-{}-{}".format(profile.replace("+", "-"), tag if tag != profile.replace("+", "-")
-                                     else datetime.now().strftime("%m%d-%H%M"))
-    env = dict(load_settings())              # settings.env, then settings.local.env: tag, Python, PyTorch, models...
-    for item in (args.set or []):            # `--set KEY=VALUE`, for this pod only
+        return "ainvfx-{}-{}".format(slug, tag if tag != slug else datetime.now().strftime("%m%d-%H%M"))
+
+    env = load_settings()                     # settings.env, then settings.local.env
+    for item in args.set or []:               # `--set KEY=VALUE`, for this pod only
         key, sep, value = item.partition("=")
         key, value = key.strip(), value.strip()
         if not sep or not key.startswith("AINVFX_") or not value:
             die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
         env[key] = value
-    if args.models_url:                       # `--models-url URL`, the same as --set AINVFX_MODELS_URL=URL
+    if args.models_url:
         env["AINVFX_MODELS_URL"] = args.models_url.strip()
-    env["AINVFX_PROFILE"] = profile           # the profile named on the command line wins
+    env["AINVFX_PROFILE"] = profile
     if cfg.get("hf_secret") or secret_exists(cfg):
-        env["HF_TOKEN"] = HF_SECRET_REF          # the reference, never the token itself
+        env["HF_TOKEN"] = HF_SECRET_REF       # the reference, never the token itself
     if not args.selftest:
         env["AINVFX_SELFTEST"] = "0"
-    spec = profile_spec(profiles, read_models(env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)))  # before any spend
+    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
+    spec = profile_spec(profiles, read_models(models_url))   # before anything is spent
     disk = args.disk or spec["disk"]
 
-    # The catalog, read once per cloud: every GPU type with its stock for hosts on CUDA MIN_CUDA or newer.
     catalogs = read_catalogs(cfg, args.community)
     secure = catalogs.get("SECURE") or []
     max_price = MAX_PRICE if args.max_price is None else args.max_price
@@ -1544,11 +1414,11 @@ def cmd_up(args):
 
     for want in wants:
         gpu_report(want, offers, region, args.community)
-    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
     if models_url != DEFAULT_MODELS_URL:
         say("   models list: {} (your own, not the course's)".format(models_url))
-    for key in sorted(k for k in env if k.startswith("AINVFX_") and k not in ("AINVFX_PROFILE", "AINVFX_MODELS_URL", "AINVFX_SELFTEST")
-                      and read_env_file(SETTINGS).get(k) != env[k]):
+    course = read_env_file(SETTINGS)
+    for key in sorted(k for k in env if k.startswith("AINVFX_") and course.get(k) != env[k]
+                      and k not in ("AINVFX_PROFILE", "AINVFX_MODELS_URL", "AINVFX_SELFTEST")):
         say("   {}: {} (yours)".format(key, env[key]))
 
     profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
@@ -1590,32 +1460,25 @@ def cmd_up(args):
                     profile, other["name"]))
         if not args.community:
             say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
-                " picked by Runpod and can fail to start, as on 9 October 2026).")
+                " picked by Runpod and can fail to start).")
 
     balance, spend = account_money(cfg)
-    cap = retry_cap(wants, named, args.community, max_price) if args.retry else None
     created, host = None, None
     if candidates:
         first = candidates[0]
         if balance is not None:
-            line = "   Your Runpod credit: {}, about {} hours of {} at {} per hour".format(
-                fmt_money(balance), int(balance // first["price"]), first["name"], fmt_money(first["price"]))
-            if spend:
-                line += "; your account already spends {} per hour".format(fmt_money(spend))
-            say(line + ".")
-            if balance < 3 * first["price"]:
-                say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
+            say_credit(balance, spend, first["price"], "of {} at ".format(first["name"]))
         if not args.yes:
             if len(candidates) > 1:
                 say("   If it is taken in the meantime, `up` tries {}, up to {} per hour.".format(
                     "the next GPU named, in the order given" if len(wants) > 1 else "the next GPUs that fit, cheapest first",
                     fmt_money(max(o["price"] for o in candidates))))
             if args.retry:
+                cap = retry_cap(wants, named, args.community, max_price)
                 say("   With --retry: if none can be created now, `up` reads the catalog every {} s and creates the first "
                     "one free{}, without asking again.".format(RETRY_EVERY, ", at up to {} per hour".format(fmt_money(cap)) if cap else ""))
-            ans = input("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
-                first["name"], fmt_money(first["price"]), disk)).strip().lower()
-            if ans not in ("", "y", "yes"):
+            if not confirm("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
+                    first["name"], fmt_money(first["price"]), disk)):
                 say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
                 return
         name = make_name()
@@ -1627,21 +1490,14 @@ def cmd_up(args):
             stop_on_stray(stray)
             say("   None could be created now: waiting, as --retry asks.")
     else:                                     # --retry and nothing free: one question, before the wait
+        cap = retry_cap(wants, named, args.community, max_price)
         if balance is not None and cap:
-            line = "   Your Runpod credit: {}, about {} hours at {} per hour, the highest price this wait accepts".format(
-                fmt_money(balance), int(balance // cap), fmt_money(cap))
-            if spend:
-                line += "; your account already spends {} per hour".format(fmt_money(spend))
-            say(line + ".")
-            if balance < 3 * cap:
-                say("   That is under 3 hours: add credit in the Runpod console (Billing), or pick a cheaper card.")
-        if not args.yes:
-            ans = input("   Wait, then create the first {} free ({}a {} GB disk, billed from creation)? [Y/n] ".format(
-                wname if named else "GPU that fits", "up to {} per hour, ".format(fmt_money(cap)) if cap else "",
-                disk)).strip().lower()
-            if ans not in ("", "y", "yes"):
-                say("Nothing created.")
-                return
+            say_credit(balance, spend, cap, "at ", ", the highest price this wait accepts")
+        if not confirm("   Wait, then create the first {} free ({}a {} GB disk, billed from creation)? [Y/n] ".format(
+                wname if named else "GPU that fits", "up to {} per hour, ".format(fmt_money(cap)) if cap else "", disk),
+                args.yes):
+            say("Nothing created.")
+            return
     if not created:
         created, host, name = wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name,
                                              disk, env)
@@ -1650,28 +1506,7 @@ def cmd_up(args):
     created_at = datetime.now(timezone.utc)
     remember_pod(cfg, tag, {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()})
     say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
-    wait_until = time.time() + 15 * 60
-    pod = created
-    while time.time() < wait_until:
-        try:
-            pod = get_pod(cfg, pod_id)
-        except ApiError:
-            pass
-        st = pod_status(pod)
-        if st == "RUNNING":
-            break
-        if st in FINAL:
-            die("the pod is {} before it ran. Read its log in the console, then `python pod.py down {}` and try again.".format(st, profile))
-        time.sleep(8)
-    for _ in range(4):                     # the data center and the price arrive a few seconds after RUNNING
-        gpu, dc, price = pod_summary(pod)
-        if dc != "?" and price:
-            break
-        time.sleep(5)
-        try:
-            pod = get_pod(cfg, pod_id)
-        except ApiError:
-            pass
+    pod = wait_running(cfg, pod_id, created, profile)
     gpu, dc, price = pod_summary(pod)
     if dc == "?" and host.get("dataCenterId"):
         dc = host["dataCenterId"]
@@ -1694,6 +1529,31 @@ def cmd_up(args):
     say("\nWhen you are done:  python pod.py down {}".format(tag))
     if not ready:
         sys.exit(1)
+
+
+def wait_running(cfg, pod_id, pod, profile):
+    """The pod once RUNNING (15 minutes at most), with its data center and price when the API reports them."""
+    def reread(p):
+        try:
+            return get_pod(cfg, pod_id)
+        except ApiError:
+            return p
+    wait_until = time.time() + 15 * 60
+    while time.time() < wait_until:
+        pod = reread(pod)
+        st = pod_status(pod)
+        if st == "RUNNING":
+            break
+        if st in FINAL:
+            die("the pod is {} before it ran. Read its log in the console, then `python pod.py down {}` and try again.".format(st, profile))
+        time.sleep(8)
+    for _ in range(4):                        # the data center and the price arrive a few seconds after RUNNING
+        _, dc, price = pod_summary(pod)
+        if dc != "?" and price:
+            break
+        time.sleep(5)
+        pod = reread(pod)
+    return pod
 
 
 def cmd_logs(args):
@@ -1719,7 +1579,7 @@ def cmd_status(args):
         if e.code == 404:
             die("the pod no longer exists on Runpod (terminated from the console?). Run `up` for a new one.")
         die("{}\n{}".format(e, e.hint()))
-    gpu, dc, price = pod_summary(pod)
+    gpu, dc, _ = pod_summary(pod)
     st = pod_status(pod)
     say("`{}` · {} · {} · {} · CUDA {} · {}".format(tag, rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
     spent = pod_spent(pod, rec)
@@ -1739,7 +1599,7 @@ def cmd_status(args):
     kind, host, port, user = pod_ssh(pod)
     if kind:
         say("SSH ({}): ssh -p {} {}@{}".format(kind, port, user, host))
-    lines = proxy_log(rec["id"])              # the pod's own copy of the log is complete; the API stream is the fallback
+    lines = proxy_log(rec["id"])              # the pod's own copy is complete; the API stream is the fallback
     err = None
     if not lines:
         lines, err = pod_logs(cfg, rec["id"])
@@ -1747,7 +1607,7 @@ def cmd_status(args):
     if not lines:
         say("log: nothing from the pod's script yet{}; open it in the console, Pods > your pod > Logs".format(
             " (the API said: {})".format(err.detail) if err is not None else ""))
-        system, err2 = pod_logs(cfg, rec["id"], tail=40, source="system")
+        system, _ = pod_logs(cfg, rec["id"], tail=40, source="system")
         if system:
             pull = ImagePull()
             others = [l for l in system if not pull.feed(l)]
@@ -1760,8 +1620,7 @@ def cmd_status(args):
 
 
 def cmd_open(args):
-    cfg = load_config()
-    _, rec = which_pod(cfg, args.profile)
+    _, rec = which_pod(load_config(), args.profile)
     url = pod_url(rec["id"])
     say(url)
     webbrowser.open(url)
@@ -1780,9 +1639,7 @@ def multipart(fields, filefield, path):
 
 
 def cmd_push(args):
-    cfg = load_config()
-    _, rec = which_pod(cfg, args.profile)
-    base = pod_url(rec["id"])
+    _, rec = which_pod(load_config(), args.profile)
     files = [Path(f).expanduser() for f in args.files]
     for f in files:
         if not f.exists():
@@ -1792,7 +1649,7 @@ def cmd_push(args):
     for f in files:
         body, ctype = multipart({"overwrite": "true", "type": "input"}, "image", f)
         try:
-            request("POST", base + "/upload/image", data=body, headers={"Content-Type": ctype}, timeout=600, raw=True)
+            request("POST", pod_url(rec["id"]) + "/upload/image", data=body, headers={"Content-Type": ctype}, timeout=600, raw=True)
             say("  {}  ({:.1f} MB) -> input/".format(f.name, f.stat().st_size / 1e6))
         except ApiError as e:
             die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
@@ -1800,30 +1657,18 @@ def cmd_push(args):
 
 
 def cmd_pull(args):
-    cfg = load_config()
-    _, rec = which_pod(cfg, args.profile)
-    n = pull(cfg, rec)
-    say("{} file(s) new in {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
+    _, rec = which_pod(load_config(), args.profile)
+    n = pull(rec)
+    say("{} file(s) new in {}".format(n, outputs_of(rec)))
 
 
-# 0.9.2 (22 Oct 2026, after BTC2 session 6): `pull`, and so `down`, brought back only the files that ComfyUI's history
-# reports under five keys (images, gifs, videos, audio, files). ComfyUI reports every 3D save under "3d" (Save 3D
-# Model, Save 3D (Advanced), Save Splat, Save Point Cloud: comfy_api/latest/_ui.py, Saved3DModels, v0.42.1), so the
-# session's GLB files were terminated with their pods. Two sources now, joined:
-#  1. the whole output folder, walked through JupyterLab's contents API with the token of the bootstrap's READY line
-#     (Runpod starts JupyterLab with --ServerApp.root_dir=/ and JUPYTER_PASSWORD as its token: runpod/containers,
-#     container-template/start.sh, 4456421): it also finds what a node saves without reporting it (Save Checkpoint, a
-#     trained LoRA) and what was made before a ComfyUI restart, since the history lives in memory;
-#  2. ComfyUI's history, every key, through /view: the fallback when JupyterLab is off.
-# ComfyUI itself has no recursive listing: /internal/files/output lists the top folder only and is meant for its own
-# frontend (api_server/routes/internal/internal_routes.py).
-OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root (/, or /workspace)
-SKIP_NAMES = {"_output_images_will_be_put_here"}                # the empty placeholder ComfyUI creates
-
-
+# Pull reads two sources. (1) The whole output folder, walked through JupyterLab's contents API with the token
+# of the READY line: it also finds files a node saves without reporting them (a trained LoRA) and files made
+# before a ComfyUI restart. (2) ComfyUI's history, every key ("images", "3d"...), through /view: the fallback
+# when JupyterLab is off. ComfyUI itself has no recursive listing of its output folder.
 def history_files(history):
-    """(subfolder, filename) of every file ComfyUI's history reports in the output folder, whatever the key: images,
-    gifs, videos, audio, 3d, files, or a key a custom node invents. Entries of the temp and input folders are left out."""
+    """(subfolder, filename) of every output file ComfyUI's history reports, whatever the key; temp and input
+    entries left out; each file once."""
     found = []
 
     def walk(v):
@@ -1840,12 +1685,7 @@ def history_files(history):
     for entry in (history or {}).values():
         if isinstance(entry, dict):
             walk(entry.get("outputs") or {})
-    seen, out = set(), []
-    for item in found:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
+    return list(dict.fromkeys(found))
 
 
 def jupyter_token(lines):
@@ -1860,14 +1700,14 @@ def jupyter_token(lines):
 def safe_rel(rel):
     """A relative path inside the output folder, with / separators, or None for anything that could leave it."""
     parts = [x for x in (rel or "").replace("\\", "/").split("/") if x not in ("", ".")]
-    if not parts or any(x == ".." for x in parts) or rel.startswith("/") or ":" in parts[0]:
+    if not parts or ".." in parts or rel.startswith("/") or ":" in parts[0]:
         return None
     return "/".join(parts)
 
 
 def jupyter_files(pod_id, token):
-    """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab's contents
-    API; (None, []) when JupyterLab does not answer or has no output folder."""
+    """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab's
+    contents API; (None, []) when JupyterLab does not answer or has no output folder."""
     base = pod_url(pod_id, JUPYTER_PORT)
     hdrs = {"Authorization": "token " + token}
 
@@ -1883,8 +1723,7 @@ def jupyter_files(pod_id, token):
             continue
         files, todo = [], [top]
         while todo:
-            folder = todo.pop()
-            for e in folder.get("content") or []:
+            for e in todo.pop().get("content") or []:
                 name, path = e.get("name") or "", e.get("path") or ""
                 if name.startswith(".") or name in SKIP_NAMES or not path.startswith(root + "/"):
                     continue
@@ -1902,8 +1741,8 @@ def jupyter_files(pod_id, token):
 
 
 def fetch_to(url, target, headers=None, timeout=600):
-    """Download url into target through a .part file, so an interrupted download never leaves a half file. Returns
-    the size in bytes."""
+    """Download url into target through a .part file, so an interrupted download never leaves a half file.
+    Returns the size in bytes."""
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + ".part")
     hdrs = {"Accept": "*/*"}
@@ -1912,10 +1751,7 @@ def fetch_to(url, target, headers=None, timeout=600):
     size = 0
     try:
         with r, open(part, "wb") as f:
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
+            for chunk in iter(lambda: r.read(1 << 20), b""):
                 f.write(chunk)
                 size += len(chunk)
     except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as e:
@@ -1928,60 +1764,46 @@ def fetch_to(url, target, headers=None, timeout=600):
     return size
 
 
-def pull(cfg, rec):
-    """Every file of the pod's output folder that is not here yet, into outputs/<pod name>/, subfolders kept: the whole
-    folder through JupyterLab, then whatever ComfyUI's history lists that JupyterLab did not (JupyterLab off)."""
-    pod_id = rec["id"]
-    dest = OUTPUTS / rec.get("name", pod_id)
+def pull(rec):
+    """Every file of the pod's output folder not here yet, into outputs/<pod name>/, subfolders kept. Returns
+    the number of files downloaded."""
+    pod_id, dest = rec["id"], outputs_of(rec)
     comfy = comfy_alive(pod_id)
     token = jupyter_token(proxy_log(pod_id)) if comfy else None
-    count, listed = 0, set()
+    count, listed, root = 0, set(), None
 
-    def got(target, size):
-        say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), size / 1e6))
+    def get(rel, url, size=None, headers=None):
+        nonlocal count
+        target = dest.joinpath(*rel.split("/"))
+        if target.exists() and (size is None or target.stat().st_size == size):
+            return
+        try:
+            n = fetch_to(url, target, headers=headers)
+        except ApiError as e:
+            say("  skipped {} ({})".format(rel, e.code or e.detail[:60]))
+            return
+        count += 1
+        say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), n / 1e6))
 
-    root = None
     if token:
         root, files = jupyter_files(pod_id, token)
-        if root:
-            base = pod_url(pod_id, JUPYTER_PORT)
-            for rel, size in files:
-                listed.add(rel)
-                target = dest.joinpath(*rel.split("/"))
-                if target.exists() and (size is None or target.stat().st_size == size):
-                    continue
-                try:
-                    n = fetch_to(base + "/files/" + urllib.parse.quote(root + "/" + rel), target,
-                                 headers={"Authorization": "token " + token})
-                except ApiError as e:
-                    say("  skipped {} ({})".format(rel, e.code or e.detail[:60]))
-                    continue
-                count += 1
-                got(target, n)
+        for rel, size in files:
+            listed.add(rel)
+            get(rel, pod_url(pod_id, JUPYTER_PORT) + "/files/" + urllib.parse.quote(root + "/" + rel), size,
+                {"Authorization": "token " + token})
     if not comfy:
         say("ComfyUI does not answer on the pod: nothing to pull through it.")
         return count
-    base = pod_url(pod_id)
     try:
-        history = request("GET", base + "/history", timeout=60)
+        history = request("GET", pod_url(pod_id) + "/history", timeout=60)
     except ApiError as e:
         say("could not read the history: {}".format(e))
         history = None
     for sub, name in history_files(history):
         rel = safe_rel((sub + "/" + name) if sub else name)
-        if not rel or rel in listed:
-            continue
-        target = dest.joinpath(*rel.split("/"))
-        if target.exists():
-            continue
-        q = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": "output"})
-        try:
-            n = fetch_to(base + "/view?" + q, target)
-        except ApiError as e:
-            say("  skipped {} ({})".format(name, e.code))
-            continue
-        count += 1
-        got(target, n)
+        if rel and rel not in listed:
+            q = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": "output"})
+            get(rel, pod_url(pod_id) + "/view?" + q)
     if not root:
         say("JupyterLab did not answer: only the files in ComfyUI's history came back. A file saved before a ComfyUI "
             "restart, or by a node that reports nothing, stays on the pod: fetch it from JupyterLab's file browser.")
@@ -1996,49 +1818,43 @@ def cmd_down(args):
             die("no pod recorded here. `python pod.py list` shows the account's pods.")
     else:
         targets = [which_pod(cfg, args.profile)]
-    if not args.yes:
-        names = ", ".join(r.get("name") or r["id"] for _, r in targets)
-        ans = input("Terminate {} now? The disk is erased, billing stops. [Y/n] ".format(names)).strip().lower()
-        if ans not in ("", "y", "yes"):
-            say("Kept running. Remember: a pod bills until terminated.")
-            return
+    names = ", ".join(r.get("name") or r["id"] for _, r in targets)
+    if not confirm("Terminate {} now? The disk is erased, billing stops. [Y/n] ".format(names), args.yes):
+        say("Kept running. Remember: a pod bills until terminated.")
+        return
     for tag, rec in targets:
         if not args.no_pull:
-            n = pull(cfg, rec)
-            say("{} file(s) pulled into {}".format(n, OUTPUTS / rec.get("name", rec["id"])))
+            say("{} file(s) pulled into {}".format(pull(rec), outputs_of(rec)))
         try:
             spent = pod_spent(get_pod(cfg, rec["id"]), rec)
         except ApiError:
             spent = None
         try:
-            rp("DELETE", "/pods/" + rec["id"], cfg)          # DELETE /pods/{id}: terminate, 204 no body
+            rp("DELETE", "/pods/" + rec["id"], cfg)          # terminate: 204, no body
             if spent:
                 say("Terminated: {}. It ran {} at {} per hour: about {} spent.".format(
                     rec.get("name"), fmt_duration(spent[0]), fmt_money(spent[2]), fmt_money(spent[1])))
             else:
                 say("Terminated: {}".format(rec.get("name")))
         except ApiError as e:
-            if e.code == 404:
-                say("{}: already gone from Runpod.".format(rec.get("name")))
-            else:
+            if e.code != 404:
                 die("{}\n{}".format(e, e.hint()))
+            say("{}: already gone from Runpod.".format(rec.get("name")))
         remember_pod(cfg, tag, None)
     try:
-        remaining = list_pods(cfg, quiet=True)
+        running = [p for p in list_pods(cfg) if pod_status(p) not in FINAL]
     except ApiError:
-        remaining = None
-    if remaining is not None:
-        running = [p for p in remaining if pod_status(p) not in FINAL]
-        if running:
-            total = sum(pod_price(p) or 0 for p in running)
-            say("Attention: {} other pod(s) still running, {} per hour in total:".format(len(running), fmt_money(total)))
-            for p in running:
-                price = pod_price(p)
-                say("  - {} ({}{})".format(p.get("name") or p.get("id"), pod_status(p),
-                                           ", {} per hour".format(fmt_money(price)) if price else ""))
-            say("`python pod.py down <name>` terminates one of them.")
-        else:
-            say("No pod running in your account. Nothing bills.")
+        running = None
+    if running:
+        say("Attention: {} other pod(s) still running, {} per hour in total:".format(
+            len(running), fmt_money(sum(pod_price(p) or 0 for p in running))))
+        for p in running:
+            price = pod_price(p)
+            say("  - {} ({}{})".format(p.get("name") or p.get("id"), pod_status(p),
+                                       ", {} per hour".format(fmt_money(price)) if price else ""))
+        say("`python pod.py down <name>` terminates one of them.")
+    elif running is not None:
+        say("No pod running in your account. Nothing bills.")
     balance, _ = account_money(cfg)
     if balance is not None:
         say("Credit left on Runpod: {} (the last minutes may still be deducted).".format(fmt_money(balance)))
@@ -2046,7 +1862,22 @@ def cmd_down(args):
 
 def cmd_list(args):
     cfg = load_config()
-    gone = forget_gone(cfg, list_pods(cfg))
+    pods = list_pods(cfg)
+    if not pods:
+        say("No pod in your account.")
+    tags = {r.get("id"): t for t, r in (cfg.get("pods") or {}).items()}
+    for p in pods:
+        gpu, dc, price = pod_summary(p)
+        say("{:<28} {:<12} {:<40} {:<10} {}".format(
+            str(p.get("name") or "?")[:28], pod_status(p)[:12], gpu[:40], dc[:10],
+            (fmt_money(price) + "/h") if price else ""))
+        tag = tags.get(p.get("id"))
+        say("    id {}   {}   ComfyUI {}".format(
+            p.get("id"), "here: `{}`".format(tag) if tag else "not recorded here", pod_url(str(p.get("id")))))
+    if pods:
+        say("Commands take the name in backquotes, the pod name or the id: `python pod.py status <that>`. "
+            "A pod not recorded here is attached by its first command.")
+    gone = forget_gone(cfg, pods)
     if gone:
         say("Forgot {} record(s) of pods no longer on Runpod: {}.".format(len(gone), ", ".join(gone)))
 
@@ -2064,9 +1895,7 @@ def cmd_ssh(args):
     cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=accept-new"]
     if cfg.get("ssh_key"):
         cmd += ["-i", cfg["ssh_key"]]
-    cmd.append("{}@{}".format(user, host))
-    if args.command:
-        cmd += args.command
+    cmd += ["{}@{}".format(user, host)] + (args.command or [])
     say(" ".join(cmd))
     sys.exit(subprocess.call(cmd))
 
@@ -2076,20 +1905,18 @@ def cmd_doctor(args):
     say("ainvfx-runpod {} · Python {} on {}".format(VERSION, sys.version.split()[0], platform.platform()))
     say("  ssh          {}".format(shutil.which("ssh") or "absent (JupyterLab replaces it)"))
     say("  config       {} ({})".format(CONFIG, "present" if CONFIG.exists() else "absent: run `setup`"))
-    region, country = cfg.get("region") or local_region(), cfg.get("country") or ""
+    region, country = cfg.get("region") or local_place()[0], cfg.get("country") or ""
     say("  nearest      {}{}{}".format(REGION_NAMES.get(region, region), ", " + country + " first" if country else "",
                                         "" if cfg.get("region") else " (guessed from the clock: {})".format(local_zone() or "offset")))
-    say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID or "none: the script describes the pod itself"))
+    say("  template     {}".format(cfg.get("template_id") or TEMPLATE_ID))
     say("  settings     {}{}".format(SETTINGS, "" if SETTINGS.exists() else " (absent: the bootstrap's defaults apply)"))
     say("  yours        {}{}".format(SETTINGS_LOCAL, "" if SETTINGS_LOCAL.exists() else " (absent: nothing replaced)"))
     local = read_env_file(SETTINGS_LOCAL)
     for k, v in load_settings().items():
         say("    {:<22} {}{}".format(k, v, "   (settings.local.env)" if k in local else ""))
-    say("  image        {} (used when no template is set)".format(IMAGE))
     if cfg.get("api_key") or os.environ.get("RUNPOD_API_KEY"):
         try:
-            pods = list_pods(cfg, quiet=True)
-            say("  API          ok, {} pod(s) in the account".format(len(pods)))
+            say("  API          ok, {} pod(s) in the account".format(len(list_pods(cfg))))
         except ApiError as e:
             say("  API          FAILED: {} · {}".format(e, e.hint()))
         found = secret_exists(cfg)
@@ -2104,79 +1931,61 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    pod_ref = "which pod: the profile, the name given to `up --name`, the pod's name or its id (optional with one pod)"
 
-    p = sub.add_parser("setup", help="API key, region, Hugging Face secret, SSH key")
+    def command(name, func, hlp, pod=True):
+        p = sub.add_parser(name, help=hlp)
+        if pod:
+            p.add_argument("profile", nargs="?", metavar="pod", help=pod_ref)
+        p.set_defaults(func=func)
+        return p
+
+    p = command("setup", cmd_setup, "API key, region, Hugging Face secret, SSH key", pod=False)
     p.add_argument("--key", help="the Runpod API key (otherwise asked, hidden)")
     p.add_argument("--region", choices=["EU", "NA"], help="EU or NA: the data centers to try first")
     p.add_argument("--country", help="two letters (CA, US, FR, CZ, RO, NL, SE, IS, NO): tried before the rest of the region")
     p.add_argument("--template", help="a Runpod template id to create pods from")
     p.add_argument("--hf-token", action="store_true", help="store a Hugging Face token as the Runpod secret")
     p.add_argument("-y", "--yes", action="store_true")
-    p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("up", help="create a pod")
+    p = command("up", cmd_up, "create a pod", pod=False)
     p.add_argument("profile", nargs="?", default="image",
-                   help="which models the pod downloads: image, 3d, video, train, several joined by + (image+3d, "
-                        "image+video, video+train), or all (default image)")
-    p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`); "
-                                  "the other commands then take that name")
+                   help="which models the pod downloads: image, 3d, video, train, several joined by + (image+3d), "
+                        "or all (default image)")
+    p.add_argument("--name", help="a name for this pod, to run several pods of one profile (`up train --name jar-lora`)")
     p.add_argument("--gpu", action="append", metavar="NAME",
-                   help='a GPU from the list `up` shows, by its name ("RTX PRO 4500 SE") or its full id; only that GPU '
-                        "is tried. Repeat it to accept several, tried in the order given: --gpu B200 --gpu B300")
+                   help='a GPU by its name ("RTX PRO 4500 SE") or full id; only that GPU is tried. '
+                        "Repeat it to accept several, tried in the order given: --gpu B200 --gpu B300")
     p.add_argument("--max-price", type=float, help="the most per hour `up` takes on its own when the profile's GPU "
                                                    "has no stock (default {:.2f} USD)".format(MAX_PRICE))
-    p.add_argument("--disk", type=int, help="container disk in GB")
+    p.add_argument("--disk", type=int, help="container disk in GB (default: from the models list)")
     p.add_argument("--region", choices=["EU", "NA"])
     p.add_argument("--community", action="store_true",
-                   help="also consider Community Cloud (machines owned by third parties, cheaper, the host picked by "
-                        "Runpod); off by default since 0.8.0")
+                   help="also consider Community Cloud (third-party machines, cheaper, the host picked by Runpod)")
     p.add_argument("--set", action="append", metavar="AINVFX_KEY=VALUE",
-                   help="replace one settings.env value for this pod (repeatable), for example "
-                        "--set AINVFX_COMFY_TAG=master; lasting changes go in settings.local.env")
+                   help="replace one settings.env value for this pod (repeatable); lasting changes go in settings.local.env")
     p.add_argument("--models-url", metavar="URL",
-                   help="your own models.json for this pod: a raw link, or a Google Drive, Dropbox or GitHub share link "
-                        "(the same as --set AINVFX_MODELS_URL=URL)")
+                   help="your own models.json for this pod: a raw link, or a Google Drive, Dropbox or GitHub share link")
     p.add_argument("--no-selftest", dest="selftest", action="store_false", help="skip the test image at the end of the install")
     p.add_argument("--retry", action="store_true",
-                   help="when nothing is free, read the catalog again every {} s (AINVFX_RETRY_EVERY) and create the "
-                        "first GPU free, by the same rules: one pod. The question comes once, before the wait (-y skips "
-                        "it); Ctrl+C stops the wait".format(RETRY_EVERY))
+                   help="when nothing is free, read the catalog every {} s and create the first GPU free (one pod); "
+                        "Ctrl+C stops the wait".format(RETRY_EVERY))
     p.add_argument("--wait", type=int, default=25, help="minutes to follow the log (default 25)")
     p.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
-    p.set_defaults(func=cmd_up)
 
-    POD_REF = "which pod: the profile, the name given to `up --name`, the pod's name or its id (optional with one pod)"
-    p = sub.add_parser("logs", help="follow the log until READY")
-    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
-    p.add_argument("--wait", type=int, default=25, help="minutes (default 25)")
-    p.set_defaults(func=cmd_logs)
-
-    for name, fn, hlp in (("status", cmd_status, "status, GPU, cost, address, log"),
-                          ("open", cmd_open, "open ComfyUI in the browser"),
-                          ("pull", cmd_pull, "download the outputs")):
-        p = sub.add_parser(name, help=hlp)
-        p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
-        p.set_defaults(func=fn)
-
-    p = sub.add_parser("push", help="upload files into the pod's input folder")
-    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
-    p.add_argument("files", nargs="+")
-    p.set_defaults(func=cmd_push)
-
-    p = sub.add_parser("down", help="pull, then terminate")
-    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
+    command("logs", cmd_logs, "follow the log until READY").add_argument(
+        "--wait", type=int, default=25, help="minutes (default 25)")
+    command("status", cmd_status, "status, GPU, cost, address, log")
+    command("open", cmd_open, "open ComfyUI in the browser")
+    command("pull", cmd_pull, "download the outputs")
+    command("push", cmd_push, "upload files into the pod's input folder").add_argument("files", nargs="+")
+    p = command("down", cmd_down, "pull, then terminate")
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("-y", "--yes", action="store_true")
-    p.set_defaults(func=cmd_down)
-
-    p = sub.add_parser("ssh", help="a terminal on the pod")
-    p.add_argument("profile", nargs="?", metavar="pod", help=POD_REF)
-    p.add_argument("command", nargs="*")
-    p.set_defaults(func=cmd_ssh)
-
-    sub.add_parser("list", help="every pod of the account, and which ones are recorded here").set_defaults(func=cmd_list)
-    sub.add_parser("doctor", help="check this machine and the configuration").set_defaults(func=cmd_doctor)
+    command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
+    command("list", cmd_list, "every pod of the account, and which ones are recorded here", pod=False)
+    command("doctor", cmd_doctor, "check this machine and the configuration", pod=False)
 
     args = ap.parse_args()
     # `push image file.png` and `push file.png` both work: a first argument that is a file is a file
