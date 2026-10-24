@@ -688,6 +688,17 @@ class Helpers(unittest.TestCase):
     def test_profiles(self):
         self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
 
+    def test_names_match_exactly(self):
+        """`up` names a pod ainvfx-<profiles>-<MMDD-HHMM>, or ainvfx-<profiles>-<its --name>: only those match."""
+        self.assertTrue(pod.named_for("ainvfx-image-1024-1500", "image"))
+        self.assertTrue(pod.named_for("ainvfx-image-3d-video-1024-1400", "image-3d-video"))
+        self.assertFalse(pod.named_for("ainvfx-image-3d-video-1024-1400", "image"), "the partial match of 24 Oct 2026")
+        self.assertTrue(pod.named_for("ainvfx-train-jar-lora", "jar-lora"))
+        self.assertTrue(pod.named_for("ainvfx-image-3d-jar", "jar"))
+        self.assertFalse(pod.named_for("ainvfx-train-jar-lora", "train"))
+        self.assertFalse(pod.named_for("ainvfx-3d-image-1024-1500", "3d-image"), "an order `up` never writes")
+        self.assertFalse(pod.named_for("ainvfx-image-console", "image"))
+
 
 # ----------------------------------------------------------------------------- end to end
 class EndToEnd(unittest.TestCase):
@@ -1109,12 +1120,13 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(STATE["pods"]["fakepod2"]["deleted"], out)
         self.assertEqual(rc, 0, out)
 
-    def recorded(self, pods):
-        """Write pod records into this test's configuration, as `up` or an attach would."""
+    def recorded(self, pods, replace=False):
+        """Write pod records into this test's configuration, as `up` or an attach would (replace: only these)."""
         path = os.path.join(self.home, ".ainvfx-runpod", "config.json")
         with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
-        cfg.setdefault("pods", {}).update(pods)
+        cfg["pods"] = {} if replace else cfg.get("pods") or {}
+        cfg["pods"].update(pods)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
         return path
@@ -1160,37 +1172,64 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("several pods recorded, name one: image (ainvfx-image-1021-0900)  video (ainvfx-video-1021-0910)", out, out)
 
     def test_a_pod_is_recorded_once(self):
-        """`push image` on the pod of `up image+3d+video` (24 Oct 2026): the account search found that pod and
-        recorded it a second time as `image`, so `pull` then asked which one. A name that finds a pod already
-        recorded here uses that record, and a double record written by 1.1.0 is merged when the file is read."""
+        """One record per pod (24 Oct 2026: a second record of one pod made `pull` ask which one). A pod attached by
+        its id is recorded under its full name; naming it later by its profile uses that record, never a second
+        one. A double record written by 1.1.0 is merged when the file is read. A wrong path stops `push` first."""
         self.run_pod("setup", "-y")
-        live = Handler.new_pod("ainvfx-image-3d-video-1024-1135", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
+        live = Handler.new_pod("ainvfx-image-1024-1135", "NVIDIA GeForce RTX 5090", "CA-MTL-1")
         live["t0"] -= 60                                       # booted: its ComfyUI answers
-        rec = {"id": live["id"], "name": live["name"], "profile": "image+3d+video", "created": ""}
-        path = self.recorded({"image-3d-video": rec})
         img = os.path.join(self.home, "overlay.png")
         with open(img, "wb") as f:
             f.write(b"\x89PNG test")
         out, rc = self.run_pod("push", "image", os.path.join(self.home, "missing.png"))
         self.assertIn("file not found", out, out)
         self.assertNotIn("attached", out, "a wrong path stops the command before any pod lookup")
+        out, rc = self.run_pod("status", live["id"])
+        self.assertIn("attached to ainvfx-image-1024-1135 (fakepod1) as `ainvfx-image-1024-1135`", out, out)
         out, rc = self.run_pod("push", "image", img)
         self.assertEqual(rc, 0, out)
-        self.assertIn("using ainvfx-image-3d-video-1024-1135 (fakepod1), recorded here as `image-3d-video`", out, out)
-        self.assertNotIn("attached", out, out)
+        self.assertIn("using ainvfx-image-1024-1135 (fakepod1), recorded here as `ainvfx-image-1024-1135`", out, out)
+        path = self.recorded({})
         with open(path, encoding="utf-8") as f:
-            self.assertEqual(list(json.load(f)["pods"]), ["image-3d-video"])
+            rec = json.load(f)["pods"]["ainvfx-image-1024-1135"]
         self.recorded({"image": dict(rec)})                    # the double record 1.1.0 wrote
         out, rc = self.run_pod("pull")
         self.assertEqual(rc, 0, out)
         self.assertNotIn("several pods recorded", out, out)
         out, rc = self.run_pod("list")
-        self.assertIn("here: `image-3d-video`", out, out)
+        self.assertIn("here: `ainvfx-image-1024-1135`", out, out)
         out, rc = self.run_pod("down", "-y", "--no-pull")
         self.assertEqual(rc, 0, out)
         self.assertTrue(live["deleted"], out)
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["pods"], {}, "no record left behind")
+
+    def test_a_name_matches_exactly_and_a_gone_pod_is_forgotten(self):
+        """24 Oct 2026, on 1.1.1: `ssh image` stopped on HTTP 404, from the record of a pod terminated earlier; once
+        that record was forgotten, `image` reached the pod of `up image+3d+video` by a partial match. Records of
+        gone pods are forgotten before any lookup, and a name matches its own pod only, here or in the account."""
+        self.run_pod("setup", "-y")
+        combo = Handler.new_pod("ainvfx-image-3d-video-1024-1400", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
+        self.recorded({"image": {"id": "gone5", "name": "ainvfx-image-3d-video-1024-1135", "profile": "image", "created": ""},
+                       "image-3d-video": {"id": combo["id"], "name": combo["name"], "profile": "image+3d+video", "created": ""}})
+        out, rc = self.run_pod("status", "image")
+        self.assertNotEqual(rc, 0, out)
+        self.assertNotIn("HTTP 404", out, out)
+        self.assertIn("forgot 1 pod(s) no longer on Runpod: ainvfx-image-3d-video-1024-1135", out, out)
+        self.assertIn("no pod 'image' recorded here or in your account", out, out)
+        out, rc = self.run_pod("status", "image")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("no pod 'image' recorded here or in your account", out, "never the pod of image+3d+video")
+        out, rc = self.run_pod("status", "image+3d+video")
+        self.assertIn("`image-3d-video` · ainvfx-image-3d-video-1024-1400", out, out)
+        solo = Handler.new_pod("ainvfx-image-1024-1500", "NVIDIA GeForce RTX 5090", "CA-MTL-1")
+        named = Handler.new_pod("ainvfx-image-3d-jar", "NVIDIA GeForce RTX 5090", "CA-MTL-1")
+        self.recorded({}, replace=True)                        # another machine: nothing recorded
+        for ref, want, tag in (("image", solo, "image"), ("image+3d+video", combo, "image-3d-video"), ("jar", named, "jar")):
+            out, rc = self.run_pod("status", ref)
+            self.assertIn("attached to {} ({}) as `{}`".format(want["name"], want["id"], tag), out, out)
+        out, rc = self.run_pod("status", "image-3d")
+        self.assertIn("no pod 'image-3d' recorded here or in your account", out, "`jar` is not the default image+3d pod")
 
     def test_up_stops_on_a_failed_line(self):
         """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):

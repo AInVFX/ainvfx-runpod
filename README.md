@@ -66,9 +66,9 @@ The script uses Python's standard library only: nothing to install. On your mach
 | `list` | Every pod of your account, and which ones this machine knows |
 | `doctor` | Checks Python, ssh, the API key and the settings |
 
-`[pod]` is the profile, the name given to `up --name`, the pod's name or its id. You can leave it out when one pod is recorded. Ctrl+C while a log is followed stops the following only: the pod keeps running until `down`. `python pod.py --help` lists every option.
+`[pod]` is the profile, the name given to `up --name`, the pod's name or its id, matched exactly: `image` is the pod of `up image`, never the pod of `up image+3d`. You can leave it out when one pod is recorded. Ctrl+C while a log is followed stops the following only: the pod keeps running until `down`. `python pod.py --help` lists every option.
 
-**Several pods at once.** `up video+train --name jar-lora` creates a second pod, known here as `jar-lora`; every command then takes that name. A pod created from the console or another machine is attached by its first command (`python pod.py status <name or id>`). A pod terminated elsewhere is forgotten by the next `list`, or by the next command given without a name.
+**Several pods at once.** `up video+train --name jar-lora` creates a second pod, known here as `jar-lora`; every command then takes that name. A pod created from the console or another machine is attached by its first command (`python pod.py status <name or id>`). A pod terminated elsewhere is forgotten by the next command.
 
 ## Profiles
 

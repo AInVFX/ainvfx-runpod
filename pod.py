@@ -19,8 +19,9 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
 Useful `up` options: --gpu NAME (repeatable, tried in order), --retry (wait until a GPU is free),
 --community (also Community Cloud), --name NAME (a second pod), --models-url URL, --set AINVFX_KEY=VALUE.
 
-[pod] is the profile, the --name given to `up`, the pod's name or its id; it can be left out when one
-pod is recorded. Every pod choice lives in settings.env; your own values go in settings.local.env.
+[pod] is the profile, the --name given to `up`, the pod's name or its id, matched exactly (`image`
+never selects an `image+3d` pod); it can be left out when one pod is recorded. Every pod choice lives
+in settings.env; your own values go in settings.local.env.
 Full guide: README.md, or https://github.com/AInVFX/ainvfx-runpod
 """
 import argparse
@@ -43,7 +44,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -583,65 +584,72 @@ def forget_gone(cfg, account):
     return [r.get("name") or t for t, r in gone]
 
 
+def is_slug(text):
+    """True for the profiles part of a pod name, as `up` writes it: image, image-3d, image-3d-video..."""
+    parts = text.split("-")
+    return parts == [p for p in PROFILE_ORDER if p in parts]
+
+
+def named_for(name, tag):
+    """True when `up` names a pod `name` and records it as `tag`: ainvfx-<profiles>-<MMDD-HHMM> when the tag is
+    the profiles, ainvfx-<profiles>-<tag> for a --name. Exact: `image` never matches the pod of image+3d+video."""
+    if is_slug(tag) and re.fullmatch(r"ainvfx-{}-\d{{4}}-\d{{4}}".format(re.escape(tag)), name):
+        return True
+    head, tail = "ainvfx-", "-" + tag
+    return name.startswith(head) and name.endswith(tail) and is_slug(name[len(head):-len(tail)])
+
+
 def which_pod(cfg, ref):
-    """The pod a command targets: (tag, record). `ref` is a tag (a profile, or the --name given to `up`), a
-    pod name, a pod id, or nothing when one pod is recorded. A pod found in the account but not here
-    (created from the console or another machine) is attached: recorded here under its name. A pod already
-    recorded here is never recorded a second time: the name that found it resolves to its record."""
+    """The pod a command targets: (tag, record). `ref` names it exactly: its tag here (the profiles given to `up`,
+    or its --name), the pod's name or its id; nothing when one pod is recorded. Records of pods gone from the
+    account are forgotten first. A pod found in the account but not here (created from the console or another
+    machine) is attached: recorded here. A pod already recorded here is never recorded a second time."""
+    try:
+        account = list_pods(cfg)
+    except ApiError:
+        account = None                        # Runpod unreachable: the records as they are
+    if account is not None:                   # a record of a gone pod would end in an HTTP 404
+        gone = forget_gone(cfg, account)
+        if gone:
+            say("forgot {} pod(s) no longer on Runpod: {}".format(len(gone), ", ".join(gone)))
     pods = cfg.setdefault("pods", {})
-    if ref:
-        ref = ref.strip().replace("+", "-")   # `down image+3d` and `down image-3d` name the same pod
-    if ref is None:
-        if len(pods) > 1:                     # first forget the pods that no longer exist
-            try:
-                gone = forget_gone(cfg, list_pods(cfg))
-            except ApiError:
-                gone = []
-            if gone:
-                say("forgot {} pod(s) no longer on Runpod: {}".format(len(gone), ", ".join(gone)))
-            pods = cfg.setdefault("pods", {})
+    if not ref:
         if len(pods) == 1:
-            tag = next(iter(pods))
-            return tag, pods[tag]
+            return next(iter(pods.items()))
         if not pods:
             die("no pod recorded here. `python pod.py up image` creates one; "
                 "`python pod.py list` shows the account's pods, then `python pod.py status <name or id>` attaches to one.")
         die("several pods recorded, name one: {}".format(
             "  ".join("{} ({})".format(t, r.get("name")) for t, r in pods.items())))
+    ref = ref.strip().replace("+", "-")       # `down image+3d` and `down image-3d` name the same pod
     if ref in pods:
         return ref, pods[ref]
     for tag, rec in pods.items():
         if ref in (rec.get("id"), rec.get("name")):
             return tag, rec
-    account = list_pods(cfg)
-    short = {"ainvfx-{}-{}".format(k, ref) for k in PROFILES}   # `up image --name test10` names its pod ainvfx-image-test10
-
-    def attach(p, tag):
-        pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
-        for t, r in pods.items():             # already recorded under another tag: that record, never a second one
-            if str(r.get("id")) == pid:
-                say("using {} ({}), recorded here as `{}`".format(r.get("name") or pid, pid, t))
-                return t, r
-        rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
-               "created": p.get("createdAt") or ""}
-        remember_pod(cfg, tag, rec)
-        say("attached to {} ({}) as `{}`".format(rec["name"], pid, tag))
-        return tag, rec
+    if account is None:
+        account = list_pods(cfg)              # asked again: an error now is the command's error
+    hits = []
     for p in account:
         pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
-        if pname in short:
-            return attach(p, ref)
-        if ref in (pid, pname) or (pname and pname.startswith(ref)):
-            return attach(p, pname or pid)
-    if ref in PROFILES:                       # `up image` names its pod ainvfx-image-<month><day>-<time>
-        hits = [p for p in account if str(p.get("name") or "").startswith("ainvfx-{}-".format(ref))
-                and pod_status(p) not in FINAL]
-        if len(hits) == 1:
-            return attach(hits[0], ref)
-        if hits:
-            die("several {} pods in your account: {}. Name one: `python pod.py status <name or id>`.".format(
-                ref, "  ".join("{} ({})".format(p.get("name"), p.get("id")) for p in hits)))
-    die("no pod '{}' recorded here or in your account. `python pod.py list` shows them.".format(ref))
+        if ref in (pid, pname) or named_for(pname, ref):
+            hits.append((pid, pname, p))
+    if len(hits) > 1:
+        die("several pods in your account match '{}': {}. Name one: `python pod.py status <name or id>`.".format(
+            ref, "  ".join("{} ({})".format(pname, pid) for pid, pname, _ in hits)))
+    if not hits:
+        die("no pod '{}' recorded here or in your account. `python pod.py list` shows them.".format(ref))
+    pid, pname, p = hits[0]
+    for tag, rec in pods.items():             # already recorded under another tag: that record, never a second one
+        if str(rec.get("id")) == pid:
+            say("using {} ({}), recorded here as `{}`".format(rec.get("name") or pid, pid, tag))
+            return tag, rec
+    tag = ref if named_for(pname, ref) else (pname or pid)
+    rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
+           "created": p.get("createdAt") or ""}
+    remember_pod(cfg, tag, rec)
+    say("attached to {} ({}) as `{}`".format(rec["name"], pid, tag))
+    return tag, rec
 
 
 # ----------------------------------------------------------------------------- the GPU catalog
