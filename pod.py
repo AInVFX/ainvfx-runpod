@@ -43,7 +43,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -267,9 +267,14 @@ def profile_spec(profiles, models=None):
 def load_config():
     if CONFIG.exists():
         try:
-            return json.loads(CONFIG.read_text(encoding="utf-8"))
+            cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             die("{} is unreadable: delete it and run `setup` again".format(CONFIG))
+        first = {}                            # one record per pod: 1.1.0 could record a pod twice; the oldest stays
+        for tag, rec in (cfg.get("pods") or {}).items():
+            first.setdefault(str(rec.get("id")), (tag, rec))
+        cfg["pods"] = dict(first.values())
+        return cfg
     return {"api_key": "", "region": "", "template_id": "", "ssh_key": "", "hf_secret": False, "pods": {}}
 
 
@@ -581,7 +586,8 @@ def forget_gone(cfg, account):
 def which_pod(cfg, ref):
     """The pod a command targets: (tag, record). `ref` is a tag (a profile, or the --name given to `up`), a
     pod name, a pod id, or nothing when one pod is recorded. A pod found in the account but not here
-    (created from the console or another machine) is attached: recorded here under its name."""
+    (created from the console or another machine) is attached: recorded here under its name. A pod already
+    recorded here is never recorded a second time: the name that found it resolves to its record."""
     pods = cfg.setdefault("pods", {})
     if ref:
         ref = ref.strip().replace("+", "-")   # `down image+3d` and `down image-3d` name the same pod
@@ -612,6 +618,10 @@ def which_pod(cfg, ref):
 
     def attach(p, tag):
         pid, pname = str(p.get("id") or ""), str(p.get("name") or "")
+        for t, r in pods.items():             # already recorded under another tag: that record, never a second one
+            if str(r.get("id")) == pid:
+                say("using {} ({}), recorded here as `{}`".format(r.get("name") or pid, pid, t))
+                return t, r
         rec = {"id": pid, "name": pname or pid, "profile": next((k for k in PROFILES if "-{}-".format(k) in pname), ""),
                "created": p.get("createdAt") or ""}
         remember_pod(cfg, tag, rec)
@@ -1639,11 +1649,11 @@ def multipart(fields, filefield, path):
 
 
 def cmd_push(args):
-    _, rec = which_pod(load_config(), args.profile)
     files = [Path(f).expanduser() for f in args.files]
     for f in files:
         if not f.exists():
             die("file not found: {}".format(f))
+    _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
     if not comfy_alive(rec["id"]):
         die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
     for f in files:

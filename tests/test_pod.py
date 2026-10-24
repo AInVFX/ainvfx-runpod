@@ -1159,6 +1159,39 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("forgot 1 pod(s) no longer on Runpod: ainvfx-image-old", out, out)
         self.assertIn("several pods recorded, name one: image (ainvfx-image-1021-0900)  video (ainvfx-video-1021-0910)", out, out)
 
+    def test_a_pod_is_recorded_once(self):
+        """`push image` on the pod of `up image+3d+video` (24 Oct 2026): the account search found that pod and
+        recorded it a second time as `image`, so `pull` then asked which one. A name that finds a pod already
+        recorded here uses that record, and a double record written by 1.1.0 is merged when the file is read."""
+        self.run_pod("setup", "-y")
+        live = Handler.new_pod("ainvfx-image-3d-video-1024-1135", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "CA-MTL-3")
+        live["t0"] -= 60                                       # booted: its ComfyUI answers
+        rec = {"id": live["id"], "name": live["name"], "profile": "image+3d+video", "created": ""}
+        path = self.recorded({"image-3d-video": rec})
+        img = os.path.join(self.home, "overlay.png")
+        with open(img, "wb") as f:
+            f.write(b"\x89PNG test")
+        out, rc = self.run_pod("push", "image", os.path.join(self.home, "missing.png"))
+        self.assertIn("file not found", out, out)
+        self.assertNotIn("attached", out, "a wrong path stops the command before any pod lookup")
+        out, rc = self.run_pod("push", "image", img)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("using ainvfx-image-3d-video-1024-1135 (fakepod1), recorded here as `image-3d-video`", out, out)
+        self.assertNotIn("attached", out, out)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(list(json.load(f)["pods"]), ["image-3d-video"])
+        self.recorded({"image": dict(rec)})                    # the double record 1.1.0 wrote
+        out, rc = self.run_pod("pull")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("several pods recorded", out, out)
+        out, rc = self.run_pod("list")
+        self.assertIn("here: `image-3d-video`", out, out)
+        out, rc = self.run_pod("down", "-y", "--no-pull")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(live["deleted"], out)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["pods"], {}, "no record left behind")
+
     def test_up_stops_on_a_failed_line(self):
         """bootstrap.sh 5.4 prints FAILED when the pod cannot work (here PyTorch out of reach on every route):
         `up` must stop on that line, say what to do, and exit non-zero, instead of waiting for READY."""
