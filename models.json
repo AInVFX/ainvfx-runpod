@@ -1,5 +1,5 @@
 {
-  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15 and 20 October 2026.",
+  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15, 20 and 24 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -27,7 +27,9 @@
       "flux3_klein_prompt_upsampler",
       "moss_image_sft_int8",
       "moss_image_text_encoder_w4a8",
-      "moss_image_vae_small"
+      "moss_image_vae_small",
+      "birefnet",
+      "moss_image_color_depth_control"
     ],
     "3d": [
       "trellis_2_int8",
@@ -489,6 +491,12 @@
       "path": "geometry_estimation/moge_3_vitg_fp16.safetensors",
       "dir": "geometry_estimation",
       "gb": 2.5
+    },
+    "moss_image_color_depth_control": {
+      "repo": "Comfy-Org/MOSS-Image",
+      "path": "loras/moss_image_color_depth_control.safetensors",
+      "dir": "loras",
+      "gb": 0.31
     }
   }
 }

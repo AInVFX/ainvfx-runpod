@@ -76,15 +76,15 @@ Each profile is a set of models in [`models.json`](models.json). Join them with 
 
 | Profile | Contents | GPU `up` rents | Models | Container disk |
 |---|---|---|---|---|
-| `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image | RTX 5090 (32 GB) | 117 GB | 170 GB |
+| `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, BiRefNet, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image and its colour and depth control | RTX 5090 (32 GB) | 118 GB | 170 GB |
 | `3d` | TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet | RTX 5090 | 32 GB | 100 GB |
 | `video` | LTX 2.5, the LTX IC-LoRAs (ainvfx-fluid and LTX Ripple included), SeedVR2 7B, RIFE | RTX PRO 6000 (96 GB) | 85 GB | 130 GB |
 | `train` | the bf16 LTX 2.5 files of the training kit | RTX PRO 6000 | 68 GB | 110 GB |
 | `image+3d` | | RTX 5090 | 148 GB | 210 GB |
-| `image+video` | | RTX PRO 6000 | 202 GB | 270 GB |
+| `image+video` | | RTX PRO 6000 | 203 GB | 270 GB |
 | `all` | | RTX PRO 6000 | 301 GB | 380 GB |
 
-Sizes read from `models.json` on 21 October 2026. A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB, never under 100 GB. `up` computes it from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
+Sizes read from `models.json` on 24 October 2026. A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB, never under 100 GB. `up` computes it from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
 
 ## Your own settings
 
@@ -101,7 +101,7 @@ Three ways to change a value, from the most lasting to the most temporary:
 | Variable | Default | What it sets |
 |---|---|---|
 | `AINVFX_PROFILE` | `image` | The profiles to download. `up <profiles>` sets it for you |
-| `AINVFX_COMFY_TAG` | `v0.42.1` | The ComfyUI release: a git tag, or a branch (`master` for the latest commit) |
+| `AINVFX_COMFY_TAG` | `v0.42.5` | The ComfyUI release: a git tag, or a branch (`master` for the latest commit) |
 | `AINVFX_PYTHON` | `3.13` | The Python of the pod's environment, installed by uv |
 | `AINVFX_TORCH` | `torch torchvision torchaudio` | The PyTorch packages, with pip flags if wanted (`--pre ...` for nightlies) |
 | `AINVFX_TORCH_INDEX` | the CUDA 13.0 stable index | The wheel index PyTorch comes from (`.../whl/nightly/cu130` for nightlies) |
