@@ -18,7 +18,7 @@
 #
 # Environment variables, all optional (settings.env documents them; the defaults are the course's):
 #   AINVFX_PROFILE        image · 3d · video · train, several joined by + (image+3d), or all. Default image
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.42.5
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.43.0
 #   AINVFX_PYTHON         default 3.13
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted. Default: torch torchvision torchaudio
 #   AINVFX_TORCH_INDEX    default https://download.pytorch.org/whl/cu130
@@ -59,7 +59,7 @@ if [ "$MODE" = "models" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.42.5}"
+TAG="${AINVFX_COMFY_TAG:-v0.43.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"

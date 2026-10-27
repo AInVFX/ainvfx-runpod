@@ -101,7 +101,7 @@ Three ways to change a value, from the most lasting to the most temporary:
 | Variable | Default | What it sets |
 |---|---|---|
 | `AINVFX_PROFILE` | `image` | The profiles to download. `up <profiles>` sets it for you |
-| `AINVFX_COMFY_TAG` | `v0.42.5` | The ComfyUI release: a git tag, or a branch (`master` for the latest commit) |
+| `AINVFX_COMFY_TAG` | `v0.43.0` | The ComfyUI release: a git tag, or a branch (`master` for the latest commit) |
 | `AINVFX_PYTHON` | `3.13` | The Python of the pod's environment, installed by uv |
 | `AINVFX_TORCH` | `torch torchvision torchaudio` | The PyTorch packages, with pip flags if wanted (`--pre ...` for nightlies) |
 | `AINVFX_TORCH_INDEX` | the CUDA 13.0 stable index | The wheel index PyTorch comes from (`.../whl/nightly/cu130` for nightlies) |
