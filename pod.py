@@ -9,7 +9,7 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py status [pod]       GPU, data center, cost so far, ComfyUI address, last log lines
   python pod.py logs [pod]         follow the pod's log until READY
   python pod.py open [pod]         open ComfyUI in your browser
-  python pod.py push [pod] FILES   copy files into the pod's input folder
+  python pod.py push [pod] FILES   copy files into the pod's input folder; --dataset NAME for training
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
   python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here
   python pod.py ssh [pod]          a terminal on the pod
@@ -25,8 +25,10 @@ in settings.env; your own values go in settings.local.env.
 Full guide: README.md, or https://github.com/AInVFX/ainvfx-runpod
 """
 import argparse
+import base64
 import getpass
 import http.client
+import io
 import json
 import os
 import platform
@@ -44,7 +46,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.1.4"
+VERSION = "1.2.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main"
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -108,6 +110,13 @@ EUROPE_CITY_COUNTRY = {"Paris": "FR", "Prague": "CZ", "Bucharest": "RO", "Amster
 LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
 OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root
 SKIP_NAMES = {"_output_images_will_be_put_here"}               # the empty placeholder ComfyUI creates
+# Training: a pod with `train` also holds the trainers' environments, the caption model, caches and checkpoints.
+TRAIN_RESERVE_GB = 70
+UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per request through JupyterLab, far under the
+                                                              # proxy's limit
+TEXT_SUFFIXES = (".txt", ".toml", ".json", ".jsonl", ".md", ".csv")
+DATASET_SKIP = {"__MACOSX", "Thumbs.db", "desktop.ini"}       # left behind, as every hidden name
+DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -238,7 +247,9 @@ def read_models(url=DEFAULT_MODELS_URL):
 
 def profile_spec(profiles, models=None):
     """disk, vram, gpu, the size of the models (GB) and the label (`image+3d`) for one or several profiles.
-    The disk is 115% of the models plus 30 GB for the environment, rounded up to 10, never under 100."""
+    The disk is 115% of the models plus 30 GB for the environment, rounded up to 10, never under 100. With `train`,
+    the models include the largest family of training base files (a run downloads its own), and the disk
+    TRAIN_RESERVE_GB more."""
     models = models or read_models()
     missing = [p for p in profiles if p not in models["profiles"]]
     if missing:
@@ -254,13 +265,16 @@ def profile_spec(profiles, models=None):
                 keys.append(item)
     for p in profiles:
         walk(p)
-    unknown = [k for k in keys if k not in models["files"]]
+    training = (models.get("training") or {}) if "train" in profiles else {}
+    unknown = [k for k in keys + [k for fam in training.values() for k in fam.values()] if k not in models["files"]]
     if unknown:
         die("the models list names files that are not in its files list: {}.".format(", ".join(unknown)))
     gb = sum(models["files"][k].get("gb") or 0 for k in keys)
+    gb += max([sum(models["files"][k].get("gb") or 0 for k in set(fam.values()) - set(keys))
+               for fam in training.values()] or [0])
     vram = max(PROFILES[p]["vram"] for p in profiles)
     gpu = next(PROFILES[p]["gpu"] for p in profiles if PROFILES[p]["vram"] == vram)
-    disk = max(100, int(-(-(gb * 1.15 + 30) // 10) * 10))
+    disk = max(100, int(-(-(gb * 1.15 + 30 + (TRAIN_RESERVE_GB if "train" in profiles else 0)) // 10) * 10))
     return dict(disk=disk, vram=vram, gpu=gpu, gb=round(gb), label="+".join(profiles))
 
 
@@ -1300,7 +1314,7 @@ def cmd_setup(args):
     cfg["template_id"] = args.template or cfg.get("template_id") or TEMPLATE_ID
     say("   template: {}".format(cfg["template_id"]))
 
-    say("\n3. Hugging Face token (for the gated files of models.json: FLUX 3 Image Klein in the image profile, LTX in video and train).")
+    say("\n3. Hugging Face token (for the gated files of models.json: FLUX 3 Image Klein in the image profile, LTX in the video profile and its training recipes).")
     if args.hf_token:
         say("   The token is stored on Runpod as the secret '{}' and never on this machine. Pods created".format(HF_SECRET))
         say("   by `up` receive it as HF_TOKEN. A read token from https://huggingface.co/settings/tokens.")
@@ -1661,7 +1675,13 @@ def cmd_push(args):
     for f in files:
         if not f.exists():
             die("file not found: {}".format(f))
+        if f.is_dir() and not args.dataset:
+            die("{} is a folder: ComfyUI's input takes files; a training dataset goes with --dataset NAME".format(f))
+    if args.dataset and not DATASET_NAME.fullmatch(args.dataset):
+        die("--dataset takes a folder name: letters, digits, _ . or - (got \"{}\")".format(args.dataset))
     _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
+    if args.dataset:
+        return push_dataset(rec, args.dataset, files)
     if not comfy_alive(rec["id"]):
         die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
     for f in files:
@@ -1723,39 +1743,159 @@ def safe_rel(rel):
     return "/".join(parts)
 
 
-def jupyter_files(pod_id, token):
-    """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab's
-    contents API; (None, []) when JupyterLab does not answer or has no output folder."""
-    base = pod_url(pod_id, JUPYTER_PORT)
-    hdrs = {"Authorization": "token " + token}
-
+def jupyter_tree(base, hdrs, root):
+    """[(relative path, size)] of every file under `root`, through JupyterLab's contents API (one folder per
+    request), hidden names left out; None when `root` is not a folder there."""
     def listing(path):
         return request("GET", base + "/api/contents/" + urllib.parse.quote(path) + "?content=1", headers=hdrs, timeout=60)
 
+    try:
+        top = listing(root)
+    except ApiError:
+        return None
+    if top.get("type") != "directory":
+        return None
+    files, todo = [], [top]
+    while todo:
+        for e in todo.pop().get("content") or []:
+            name, path = e.get("name") or "", e.get("path") or ""
+            if name.startswith(".") or name in SKIP_NAMES or not path.startswith(root + "/"):
+                continue
+            if e.get("type") == "directory":
+                try:
+                    todo.append(listing(path))
+                except ApiError as err:
+                    say("  could not list {} ({})".format(path[len(root) + 1:], err.code or err.detail[:60]))
+            elif e.get("type") in ("file", "notebook"):
+                rel = safe_rel(path[len(root) + 1:])
+                if rel:
+                    files.append((rel, e.get("size")))
+    return sorted(files)
+
+
+def jupyter_files(pod_id, token):
+    """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab;
+    (None, []) when JupyterLab does not answer or has no output folder."""
+    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
     for root in OUTPUT_DIRS:
-        try:
-            top = listing(root)
-        except ApiError:
-            continue
-        if top.get("type") != "directory":
-            continue
-        files, todo = [], [top]
-        while todo:
-            for e in todo.pop().get("content") or []:
-                name, path = e.get("name") or "", e.get("path") or ""
-                if name.startswith(".") or name in SKIP_NAMES or not path.startswith(root + "/"):
-                    continue
-                if e.get("type") == "directory":
-                    try:
-                        todo.append(listing(path))
-                    except ApiError as err:
-                        say("  could not list {} ({})".format(path[len(root) + 1:], err.code or err.detail[:60]))
-                elif e.get("type") in ("file", "notebook"):
-                    rel = safe_rel(path[len(root) + 1:])
-                    if rel:
-                        files.append((rel, e.get("size")))
-        return root, sorted(files)
+        files = jupyter_tree(base, hdrs, root)
+        if files is not None:
+            return root, files
     return None, []
+
+
+def clean_text(raw):
+    """A caption or a config as the pod wants it: UTF-8 without the BOM that Notepad can add (it would stick to the
+    trigger word) and with LF line ends (a CR breaks bash and TOML)."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def dataset_plan(paths):
+    """(local file, path inside the dataset folder) for every file to send: a folder's contents keep their
+    subfolders, a file goes to the top; hidden files and system clutter stay behind."""
+    plan = []
+    for p in paths:
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                rel = f.relative_to(p)
+                if f.is_file() and not any(x.startswith(".") or x in DATASET_SKIP for x in rel.parts):
+                    plan.append((f, rel.as_posix()))
+        elif not p.name.startswith(".") and p.name not in DATASET_SKIP:
+            plan.append((p, p.name))
+    seen = set()
+    for _, rel in plan:
+        if rel in seen:
+            die("two files would land on {} in the dataset: send one of them".format(rel))
+        seen.add(rel)
+    return plan
+
+
+def jupyter_upload(base, hdrs, path, local, data=None):
+    """One file through JupyterLab's contents API. A file that fits one request is written by one PUT, which Jupyter
+    writes atomically; a larger one goes in chunks into <name>.part (chunk 1 starts it, -1 ends it), renamed over
+    the target at the end: an interrupted upload never leaves a half file under the real name, and the trainers
+    skip a .part file. Not a hidden name: JupyterLab refuses to create one."""
+    def put(target, chunk, number=None):
+        model = {"type": "file", "format": "base64", "name": target.rsplit("/", 1)[-1], "path": target,
+                 "content": base64.b64encode(chunk).decode("ascii")}
+        if number is not None:
+            model["chunk"] = number
+        request("PUT", base + "/api/contents/" + urllib.parse.quote(target), body=model, headers=hdrs, timeout=600)
+
+    size = len(data) if data is not None else local.stat().st_size
+    if size <= UPLOAD_CHUNK:
+        put(path, data if data is not None else local.read_bytes())
+        return
+    part = path + ".part"
+    with (io.BytesIO(data) if data is not None else open(str(local), "rb")) as f:
+        number = 1
+        while True:
+            chunk = f.read(UPLOAD_CHUNK)
+            last = f.tell() >= size
+            put(part, chunk, -1 if last else number)
+            if last:
+                break
+            number += 1
+    try:
+        request("DELETE", base + "/api/contents/" + urllib.parse.quote(path), headers=hdrs, timeout=60)
+    except ApiError as e:
+        if e.code != 404:
+            raise
+    request("PATCH", base + "/api/contents/" + urllib.parse.quote(part), body={"path": path}, headers=hdrs, timeout=60)
+
+
+def push_dataset(rec, name, paths):
+    """Files and folders into /workspace/dataset/<name>/, through the pod's JupyterLab with the token of the READY
+    line. Captions and configs go cleaned (clean_text); a file already there with the same size is skipped, except
+    text files, which always go (an edited caption can keep its size)."""
+    plan = dataset_plan(paths)
+    if not plan:
+        die("nothing to send: the folders hold no files (hidden ones stay behind)")
+    pod_id = rec["id"]
+    if not comfy_alive(pod_id):
+        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
+    token = jupyter_token(proxy_log(pod_id))
+    if not token:
+        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A training "
+            "dataset goes up through JupyterLab.")
+    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    try:      # JupyterLab's root is / on Runpod's current images, /workspace on older ones
+        top = "workspace/dataset" if request("GET", base + "/api/contents/workspace?content=0", headers=hdrs,
+                                             timeout=30).get("type") == "directory" else "dataset"
+    except ApiError:
+        top = "dataset"
+    dest = "{}/{}".format(top, name)
+    there = dict(jupyter_tree(base, hdrs, dest) or [])
+    folders = {top, dest}
+    for _, rel in plan:
+        parts = rel.split("/")[:-1]
+        folders.update("/".join([dest] + parts[:i]) for i in range(1, len(parts) + 1))
+    for d in sorted(folders, key=lambda x: x.count("/")):
+        request("PUT", base + "/api/contents/" + urllib.parse.quote(d), body={"type": "directory"}, headers=hdrs,
+                timeout=60)
+    total = sum(f.stat().st_size for f, _ in plan)
+    sent = kept = done = 0
+    t0 = last = time.time()
+    for k, (local, rel) in enumerate(plan, 1):
+        size = local.stat().st_size
+        text = local.suffix.lower() in TEXT_SUFFIXES
+        if not text and there.get(rel) == size:
+            kept += 1
+        else:
+            try:
+                jupyter_upload(base, hdrs, dest + "/" + rel, local, clean_text(local.read_bytes()) if text else None)
+            except ApiError as e:
+                die("upload of {} failed: {}\n{}".format(rel, e.detail[:200], e.hint()))
+            sent += 1
+        done += size
+        if time.time() - last >= 5:
+            last = time.time()
+            say("   {}/{} files · {:.0f} of {:.0f} MB".format(k, len(plan), done / 1e6, total / 1e6))
+    say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
+        sent, kept, total / 1e6, time.time() - t0, name))
+    say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(name))
 
 
 def fetch_to(url, target, headers=None, timeout=600):
@@ -1996,7 +2136,10 @@ def main():
     command("status", cmd_status, "status, GPU, cost, address, log")
     command("open", cmd_open, "open ComfyUI in the browser")
     command("pull", cmd_pull, "download the outputs")
-    command("push", cmd_push, "upload files into the pod's input folder").add_argument("files", nargs="+")
+    p = command("push", cmd_push, "upload files into the pod's input folder, or a training dataset")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--dataset", metavar="NAME", help="send these files and folders into /workspace/dataset/NAME, "
+                                                     "for training (through the pod's JupyterLab)")
     p = command("down", cmd_down, "pull, then terminate")
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")

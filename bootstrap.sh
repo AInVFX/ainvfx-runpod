@@ -8,6 +8,7 @@
 #   2. install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at a pinned tag, the Manager, custom nodes
 #   3. start ComfyUI for Runpod's proxy on port 8188           -> COMFYUI UP, PROXY OK
 #   4. the models of the profile, from models.json             -> MODELS DONE
+#      with the profile train: the trainers and the train command  -> TRAINERS OK
 #   5. one MOSS-Image test image (a thank-you poster)          -> SELFTEST OK, then READY
 # A pod that cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints FAILED and stays up
 # so its log can be read; pod.py stops on that line.
@@ -27,11 +28,14 @@
 #   AINVFX_HEALTHCHECK    1 measures the disk (default); 0 skips it
 #   AINVFX_SELFTEST       1 renders the test image (default); 0 skips it
 #   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork), fetched and run in place of this one
+#   AINVFX_REPO_RAW       where this repository's other files come from (models.json, train.py). Default: the
+#                         folder of AINVFX_BOOTSTRAP_URL when set, else this repository's main branch. A template
+#                         pinned to a release gives that release's folder
 #   HF_TOKEN              a Hugging Face read token for the gated files; Runpod fills it from the secret
 #                         huggingface_token. An unresolved {{ RUNPOD_SECRET_... }} placeholder counts as absent.
 #
-# `bash bootstrap.sh models` runs step 4 alone (the files still missing), then exits. A second run (a pod
-# restart) skips what is already installed and downloaded.
+# `bash bootstrap.sh models` runs step 4 alone (the files still missing), then exits; `bash bootstrap.sh trainer`
+# installs or repairs the trainers alone. A second run (a pod restart) skips what is already installed and downloaded.
 
 set -uo pipefail
 # A fork's bootstrap takes over here, once (AINVFX_BOOTSTRAP_RAN guards against a loop).
@@ -45,12 +49,12 @@ fi
 
 MODE="${1:-all}"
 case "$MODE" in
-  all|models) ;;
-  *) echo "usage: bash $0 [models]   (models: fetch the files still missing, then exit)"; exit 2 ;;
+  all|models|trainer) ;;
+  *) echo "usage: bash $0 [models|trainer]   (models: fetch the files still missing; trainer: install the trainers)"; exit 2 ;;
 esac
-if [ "$MODE" = "models" ]; then
+if [ "$MODE" != "all" ]; then
   # A terminal opened on the pod may lack the pod's variables: read them from the container's first process.
-  for v in AINVFX_PROFILE AINVFX_MODELS_URL AINVFX_REPO_RAW HF_TOKEN; do
+  for v in AINVFX_PROFILE AINVFX_MODELS_URL AINVFX_REPO_RAW AINVFX_BOOTSTRAP_URL HF_TOKEN; do
     if [ -z "${!v:-}" ] && [ -r /proc/1/environ ]; then
       val=$({ tr '\0' '\n' < /proc/1/environ; } 2>/dev/null | sed -n "s/^$v=//p" | head -1)
       [ -n "$val" ] && export "$v=$val"
@@ -63,7 +67,12 @@ TAG="${AINVFX_COMFY_TAG:-v0.43.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
-MODELS_URL="${AINVFX_MODELS_URL:-${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main}/models.json}"
+# This repository's other files (models.json, train.py) come from where this script came from: the folder of
+# AINVFX_BOOTSTRAP_URL (a fork, a branch), else main; a template pinned to a release sets AINVFX_REPO_RAW.
+if [ -n "${AINVFX_REPO_RAW:-}" ]; then REPO_RAW=$AINVFX_REPO_RAW
+elif [ -n "${AINVFX_BOOTSTRAP_URL:-}" ]; then REPO_RAW=${AINVFX_BOOTSTRAP_URL%/*}
+else REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main; fi
+MODELS_URL="${AINVFX_MODELS_URL:-$REPO_RAW/models.json}"
 CUSTOM_NODES="${AINVFX_CUSTOM_NODES:-}"
 HEALTHCHECK="${AINVFX_HEALTHCHECK:-1}"
 SELFTEST="${AINVFX_SELFTEST:-1}"
@@ -170,8 +179,95 @@ access_summary() {   # the gated files that did not come, with the page of each 
   fi
 }
 
+# The trainers, for the profile train, each at the commit the course tested and in its own environment, beside
+# ComfyUI's ($VENV: Python 3.13, CUDA 13.0) and never inside it: every uv call names its environment with --python.
+#   musubi-tuner in AkaneTendo25's fork (branch ltx-2-dev): LTX 2.5, Z-Image and Qwen-Image-Edit. Its pyproject accepts
+#   Python 3.10 to 3.12, and the course trained on PyTorch 2.8.0 for CUDA 12.8.
+#   sd-scripts: MOSS-Image, which musubi-tuner does not train. It pins its own transformers and accelerate; its README
+#   gives PyTorch 2.8.0 for CUDA 12.8 on Blackwell GPUs, the same build.
+MUSUBI=$ROOT/musubi-tuner
+MUSUBI_URL=https://github.com/AkaneTendo25/musubi-tuner
+MUSUBI_COMMIT=9dc9abc2eb9d9b1884f7bebc21864d018aa1a55f
+SDSCRIPTS=$ROOT/sd-scripts
+SDSCRIPTS_URL=https://github.com/kohya-ss/sd-scripts
+SDSCRIPTS_COMMIT=cb70b96858477e716a2096292ab8aab433277f38   # release v0.12.3
+TRAIN_TORCH="torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"
+TRAIN_TORCH_INDEX=https://download.pytorch.org/whl/cu128
+wants_trainer() { case "+$(printf '%s' "$PROFILE" | tr ', ' '++')+" in *+train+*|*+all+*) return 0 ;; esac; return 1; }
+install_repo() {   # install_repo <folder> <git url> <commit> <what uv installs, from that folder>...
+  local dir=$1 url=$2 commit=$3 py=$1/.venv/bin/python
+  shift 3
+  [ -f "$dir/.venv/.ainvfx_$commit" ] && return 0
+  if [ ! -d "$dir/.git" ]; then
+    mkdir -p "$dir" && (cd "$dir" && git init --quiet && git remote add origin "$url") || return 1
+  fi
+  (cd "$dir" && git fetch --quiet --depth 1 origin "$commit" && git checkout --quiet --force FETCH_HEAD) \
+    || { warn "trainer: $url could not be fetched at ${commit:0:7}"; return 1; }
+  [ -x "$py" ] || uv venv "$dir/.venv" --python 3.12 --quiet \
+    || { warn "trainer: Python 3.12 could not be installed in $dir"; return 1; }
+  # PyTorch first, from its own index; PyPI's Linux wheels of 2.8.0 are the same CUDA 12.8 build
+  # shellcheck disable=SC2086
+  uv pip install --quiet --python "$py" $TRAIN_TORCH --index-url "$TRAIN_TORCH_INDEX" \
+    || { sleep 10; uv pip install --quiet --python "$py" $TRAIN_TORCH; } \
+    || { warn "trainer: PyTorch 2.8.0 could not be installed in $dir"; return 1; }
+  (cd "$dir" && uv pip install --quiet --python "$py" "$@") \
+    || { warn "trainer: the requirements of $dir could not be installed"; return 1; }
+  # a requirement may have moved PyTorch: the tested build goes back
+  # shellcheck disable=SC2086
+  uv pip install --quiet --python "$py" $TRAIN_TORCH --index-url "$TRAIN_TORCH_INDEX" \
+    || { warn "trainer: PyTorch 2.8.0 could not be put back in $dir"; return 1; }
+  date -u +'%F %T' > "$dir/.venv/.ainvfx_$commit"
+}
+patch_fork() {   # the fork's known bug at that commit: a failed training sample left the transformer in eval mode, so
+                 # the next step ran without gradient checkpointing and out of memory (three times on 6 Sept 2026)
+  "$MUSUBI/.venv/bin/python" - "$MUSUBI/src/musubi_tuner/ltx2_sampling.py" <<'PY'
+import py_compile, sys
+path, mark = sys.argv[1], "# ainvfx-runpod"
+anchor = 'logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)'
+src = open(path, encoding="utf-8").read()
+if mark not in src:
+    lines = src.split("\n")
+    hits = [i for i, line in enumerate(lines) if line.strip() == anchor]
+    if not hits:
+        sys.exit("[AINVFX] WARNING: trainer: the sampling fix found nothing to change: the fork's code differs")
+    for i in reversed(hits):
+        pad = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+        lines[i + 1:i + 1] = [pad + 'if getattr(args, "gradient_checkpointing", False):  ' + mark,
+                              pad + "    transformer.train()  " + mark]
+    open(path, "w", encoding="utf-8").write("\n".join(lines))
+    py_compile.compile(path, doraise=True)
+PY
+}
+install_trainers() {   # both trainers, train.py and the train command; returns 1 when training cannot work here
+  local t0 py
+  t0=$(now)
+  command -v uv >/dev/null 2>&1 || { warn "trainer: uv is missing (the install of step 2 did not finish)"; return 1; }
+  mkdir -p "$ROOT/ainvfx"
+  if curl -fsSL --retry 3 "$REPO_RAW/train.py" -o "$ROOT/ainvfx/train.py.new"; then
+    mv -f "$ROOT/ainvfx/train.py.new" "$ROOT/ainvfx/train.py"
+  else
+    rm -f "$ROOT/ainvfx/train.py.new"
+    [ -s "$ROOT/ainvfx/train.py" ] || { warn "trainer: train.py could not be fetched from $REPO_RAW"; return 1; }
+  fi
+  say "trainer: musubi-tuner ${MUSUBI_COMMIT:0:7} (LTX 2.5, Z-Image, Qwen-Image-Edit) and sd-scripts ${SDSCRIPTS_COMMIT:0:7} (MOSS-Image), each in its own environment"
+  install_repo "$MUSUBI" "$MUSUBI_URL" "$MUSUBI_COMMIT" -e . tensorboard qwen-vl-utils || return 1
+  patch_fork || return 1
+  install_repo "$SDSCRIPTS" "$SDSCRIPTS_URL" "$SDSCRIPTS_COMMIT" -r requirements.txt || return 1
+  for py in "$MUSUBI/.venv/bin/python" "$SDSCRIPTS/.venv/bin/python"; do
+    "$py" -c 'import sys, torch; ok = torch.cuda.is_available(); print("[AINVFX] trainer:", sys.argv[1], "· torch", torch.__version__, "· GPU", torch.cuda.get_device_name(0) if ok else "NOT VISIBLE"); sys.exit(0 if ok else 1)' "${py%/.venv/bin/python}" \
+      || { warn "trainer: PyTorch does not see the GPU from ${py%/.venv/bin/python}"; return 1; }
+  done
+  printf '#!/usr/bin/env bash\n# ainvfx-runpod: the training command of this pod (README.md, "Training a LoRA")\nexec %q %q "$@"\n' \
+    "$MUSUBI/.venv/bin/python" "$ROOT/ainvfx/train.py" > /usr/local/bin/train && chmod +x /usr/local/bin/train
+  say "TRAINERS OK in $(secs "$t0" "$(now)" | cut -d. -f1) s · in a terminal on this pod: train recipes"
+}
+
 if [ "$MODE" = "models" ]; then
   say "models only (bash $SELF models) · profile $PROFILE · $(date -u +'%F %T') UTC"
+elif [ "$MODE" = "trainer" ]; then
+  say "trainers only (bash $SELF trainer) · $(date -u +'%F %T') UTC"
+  install_trainers || exit 1
+  exit 0
 else
   say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
   say "settings: torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
@@ -570,6 +666,9 @@ if [ "$MODE" = "models" ]; then
   access_summary
   sleep 1   # lets the log copy catch up before the prompt returns
   exit 0
+fi
+if wants_trainer; then
+  install_trainers || warn "THE TRAINERS ARE NOT INSTALLED (the lines above say why). ComfyUI works; bash $SELF trainer tries again"
 fi
 
 # ---------------------------------------------------------------- 5. self-test, then READY

@@ -11,7 +11,7 @@ carry their time as id, a `since` cursor is exclusive at one-second resolution, 
 keepalives, and the lines after SELFTEST OK never arrive on a live connection (only a fresh request serves
 them). Each test's docstring names the incident it reproduces.
 """
-import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
+import base64, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -311,10 +311,17 @@ class Handler(BaseHTTPRequestHandler):
         return v
 
     def do_PUT(self):
+        if self.path.startswith("/proxy/") and "/8888/" in self.path:
+            return self.jupyter_write("PUT")
         self.body()
         return self.send_json(200, {"keys": []})
 
+    def do_PATCH(self):
+        return self.jupyter_write("PATCH")
+
     def do_DELETE(self):
+        if self.path.startswith("/proxy/") and "/8888/" in self.path:
+            return self.jupyter_write("DELETE")
         if self.headers.get("Authorization") != "Bearer fake-key":
             return self.problem(401, "bad key")
         pid, pod = pod_of(self.path)
@@ -409,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
         rest = urllib.parse.unquote(p.split("/8888/", 1)[1])
         if rest.startswith("api/contents/"):
             path = rest[len("api/contents/"):].strip("/")
+            if path in STATE["jdirs"] or path in STATE["jfs"] or path.startswith("workspace/dataset"):
+                return self.jfs_get(path)
             if not (path == root or path.startswith(root + "/")):
                 return self.problem(404, "No such file or directory: " + path)
             sub = path[len(root):].strip("/")
@@ -436,6 +445,59 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data); return
         return self.problem(404, "no route")
 
+    def jupyter_write(self, method):
+        """The writes of JupyterLab's contents API that a dataset upload makes: PUT a folder, or a file (in chunks: 1
+        starts it, -1 ends it), PATCH a new path (a rename, refused over an existing file), DELETE a file."""
+        if self.headers.get("Authorization") != "token faketoken":
+            return self.problem(403, "Forbidden")
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path.split("/8888/", 1)[1])
+        path = path[len("api/contents/"):].strip("/")
+        jfs, jdirs = STATE["jfs"], STATE["jdirs"]
+        if method == "DELETE":
+            if path not in jfs:
+                return self.problem(404, "No such file: " + path)
+            del jfs[path]
+            self.send_response(204)
+            self.end_headers()
+            return
+        model = json.loads(self.body() or b"{}")
+        if method == "PATCH":
+            new = model["path"].strip("/")
+            if path not in jfs:
+                return self.problem(404, "No such file: " + path)
+            if new in jfs:
+                return self.problem(409, "File already exists: " + new)
+            jfs[new] = jfs.pop(path)
+            return self.send_json(200, {"path": new, "type": "file"})
+        if any(x.startswith(".") for x in path.split("/")):     # as JupyterLab: no hidden file or folder
+            return self.problem(400, "Cannot create file or directory " + path)
+        if (path.rsplit("/", 1)[0] if "/" in path else "") not in jdirs:
+            return self.problem(404, "No such directory for " + path)
+        if model.get("type") == "directory":
+            jdirs.add(path)
+            return self.send_json(201, {"path": path, "type": "directory"})
+        data = base64.b64decode(model["content"])
+        if model.get("chunk") in (None, 1):
+            jfs[path] = bytearray(data)
+        elif path in jfs:
+            jfs[path] += data
+        else:
+            return self.problem(400, "a chunk without its start: " + path)
+        return self.send_json(201, {"path": path, "type": "file"})
+
+    def jfs_get(self, path):
+        jfs, jdirs = STATE["jfs"], STATE["jdirs"]
+        if path in jfs:
+            return self.send_json(200, {"name": path.rsplit("/", 1)[-1], "path": path, "type": "file",
+                                        "size": len(jfs[path])})
+        if path not in jdirs:
+            return self.problem(404, "No such file or directory: " + path)
+        pre = path + "/" if path else ""
+        kids = [{"name": d[len(pre):], "path": d, "type": "directory", "size": None} for d in sorted(jdirs)
+                if d.startswith(pre) and d != path and "/" not in d[len(pre):]]
+        kids += [{"name": f[len(pre):], "path": f, "type": "file", "size": len(b)} for f, b in sorted(jfs.items())
+                 if f.startswith(pre) and "/" not in f[len(pre):]]
+        return self.send_json(200, {"name": path.rsplit("/", 1)[-1], "path": path, "type": "directory", "content": kids})
 
 
 # ----------------------------------------------------------------------------- unit tests
@@ -655,9 +717,9 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.profile_spec(["image", "video"])["gpu"], "NVIDIA RTX PRO 6000 Blackwell Server Edition")
         self.assertEqual(pod.profile_spec(["image", "video"])["vram"], 96)
-        self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 210)
+        self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 280)   # the LTX VAEs counted once
         spec = pod.profile_spec(["image", "3d", "video", "train"])
-        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 380))   # and MoGe 3 joins 3d
+        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 450))
         with self.assertRaises(SystemExit):
             pod.parse_profiles("nope+3d")
 
@@ -684,6 +746,26 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.safe_rel("a\\b.png"), "a/b.png")
         for bad in ("../x.png", "BTC2/../../x", "/etc/passwd", "C:/x.png", ""):
             self.assertIsNone(pod.safe_rel(bad), bad)
+
+    def test_dataset_plan_and_text(self):
+        """A dataset folder's files keep their subfolders; hidden files and system clutter stay behind; captions
+        lose a BOM and their CRs."""
+        d = tempfile.mkdtemp(prefix="ainvfx-plan-")
+        try:
+            for rel in ("targets/a.png", "targets/a.txt", "control/a.png", ".DS_Store", "__MACOSX/x.png", ".git/c"):
+                os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True)
+                open(os.path.join(d, rel), "wb").close()
+            plan = [rel for _, rel in pod.dataset_plan([pod.Path(d)])]
+            self.assertEqual(plan, ["control/a.png", "targets/a.png", "targets/a.txt"])
+        finally:
+            shutil.rmtree(d)
+        self.assertEqual(pod.clean_text(b"\xef\xbb\xbfword, a\r\nb\rc"), b"word, a\nb\nc")
+
+    def test_training_room_on_the_disk(self):
+        """`train` downloads nothing at start; its disk holds the largest family of training files and the reserve."""
+        spec = pod.profile_spec(["train"])
+        self.assertEqual((spec["gb"], spec["disk"], spec["vram"]), (70, 190, 96))
+        self.assertEqual(pod.profile_spec(["image"])["disk"], 170, "the other profiles do not change")
 
     def test_profiles(self):
         self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
@@ -717,7 +799,7 @@ class EndToEnd(unittest.TestCase):
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
                       "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
-                      "history_3d": False, "outfiles": None})
+                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -806,6 +888,43 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("D6_E2_mesh_00001_.glb", out, out)
         self.assertNotIn("ComfyUI_temp", out, out)
         self.assertIn("JupyterLab did not answer", out, out)
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
+    def test_push_dataset_through_jupyterlab(self):
+        """A training dataset goes up through JupyterLab: subfolders kept, captions without BOM nor CR, a large file
+        in chunks then renamed over its name (no .part left), hidden files left behind; a second push sends the
+        captions again and skips the unchanged images; a folder without --dataset is refused."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        ds = os.path.join(self.home, "mychar")
+        for sub in ("targets", "control", ".git"):
+            os.makedirs(os.path.join(ds, sub))
+        files = {"targets/a.png": b"\x89PNG" + b"t" * 40, "targets/a.txt": b"\xef\xbb\xbfmychr, a test\r\nline two\r\n",
+                 "control/a.png": b"\x89PNG" + b"c" * 300, ".DS_Store": b"x", ".git/config": b"x"}
+        for rel, data in files.items():
+            with open(os.path.join(ds, rel), "wb") as f:
+                f.write(data)
+        self.env["AINVFX_UPLOAD_CHUNK"] = "64"
+        out, rc = self.run_pod("push", ds)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("--dataset NAME", out, out)
+        out, rc = self.run_pod("push", "--dataset", "mychar", ds)
+        self.assertEqual(rc, 0, out)
+        jfs, top = STATE["jfs"], "workspace/dataset/mychar/"
+        self.assertEqual(sorted(jfs), [top + "control/a.png", top + "targets/a.png", top + "targets/a.txt"], out)
+        self.assertEqual(bytes(jfs[top + "targets/a.txt"]), b"mychr, a test\nline two\n")
+        self.assertEqual(bytes(jfs[top + "control/a.png"]), files["control/a.png"], "the chunks join in order")
+        self.assertIn("3 file(s) sent, 0 unchanged", out, out)
+        self.assertIn("train caption mychar --trigger", out, out)
+        out, rc = self.run_pod("push", "--dataset", "mychar", ds)
+        self.assertIn("1 file(s) sent, 2 unchanged", out, out)
+        out, rc = self.run_pod("push", "--dataset", "../up", ds)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("folder name", out, out)
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 

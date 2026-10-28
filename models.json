@@ -1,5 +1,5 @@
 {
-  "_about": "Model files downloaded by bootstrap.sh, by profile. AINVFX_PROFILE names one profile or several joined by + (image+3d, image+video+train) or all. A profile lists entries of files; @name includes another profile. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15, 20, 23 and 24 October 2026.",
+  "_about": "Model files: a profile's are downloaded by bootstrap.sh at start (AINVFX_PROFILE names one profile or several joined by +, as image+train, or all), a training family's by train.py at its first run. A profile lists entries of files; @name includes another profile. A training family names its files by role. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15, 20, 23, 24 and 28 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -75,10 +75,30 @@
       "seedvr2_7b_int8",
       "rife"
     ],
-    "train": [
-      "ltx25_dev_bf16",
-      "ltx25_text_encoder_bf16"
-    ]
+    "train": []
+  },
+  "training": {
+    "zimage": {
+      "dit": "z_image_bf16",
+      "vae": "z_image_vae",
+      "text_encoder": "qwen_3_4b_bf16"
+    },
+    "qwen_edit": {
+      "dit": "qwen_image_edit_2511_bf16",
+      "vae": "qwen_image_vae",
+      "text_encoder": "qwen_2_5_vl_7b_bf16"
+    },
+    "moss": {
+      "dit": "moss_image_base_bf16",
+      "text_encoder": "moss_image_text_encoder_int8",
+      "vae": "moss_image_vae"
+    },
+    "ltx": {
+      "checkpoint": "ltx25_dev_bf16",
+      "text_encoder": "ltx25_text_encoder_bf16",
+      "vae": "ltx25_video_vae",
+      "audio_vae": "ltx25_audio_vae"
+    }
   },
   "files": {
     "z_image_turbo": {
@@ -513,6 +533,48 @@
       "dir": "loras",
       "gb": 1.7,
       "gated": true
+    },
+    "z_image_bf16": {
+      "repo": "Comfy-Org/z_image",
+      "path": "split_files/diffusion_models/z_image_bf16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 12.31
+    },
+    "qwen_3_4b_bf16": {
+      "repo": "Comfy-Org/z_image",
+      "path": "split_files/text_encoders/qwen_3_4b.safetensors",
+      "dir": "text_encoders",
+      "gb": 8.04
+    },
+    "qwen_image_edit_2511_bf16": {
+      "repo": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+      "path": "split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 40.86
+    },
+    "qwen_2_5_vl_7b_bf16": {
+      "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+      "path": "split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+      "dir": "text_encoders",
+      "gb": 16.58
+    },
+    "moss_image_base_bf16": {
+      "repo": "Comfy-Org/MOSS-Image",
+      "path": "diffusion_models/moss_image_base_bf16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 10.16
+    },
+    "moss_image_text_encoder_int8": {
+      "repo": "Comfy-Org/MOSS-Image",
+      "path": "text_encoders/qwen3.5_9b_int8_convrot.safetensors",
+      "dir": "text_encoders",
+      "gb": 9.75
+    },
+    "moss_image_vae": {
+      "repo": "Comfy-Org/MOSS-Image",
+      "path": "vae/flux2-vae.safetensors",
+      "dir": "vae",
+      "gb": 0.34
     }
   }
 }

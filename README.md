@@ -6,7 +6,7 @@
 
 # ainvfx-runpod
 
-Rent a GPU on [Runpod](https://www.runpod.io/), get [ComfyUI](https://github.com/Comfy-Org/ComfyUI) running on it with the right models, work, download your results, terminate. From the browser or from one script, on Windows, macOS or Linux.
+Rent a GPU on [Runpod](https://www.runpod.io/), get [ComfyUI](https://github.com/Comfy-Org/ComfyUI) running on it with the right models, work, download your results, terminate. From the browser or from one script, on Windows, macOS or Linux. The same pod can also train LoRAs: see [Training a LoRA](#training-a-lora).
 
 Built by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/), with Runpod as the bootcamp's GPU infrastructure partner. Anyone may use it: the ComfyUI version and the list of models are plain files you can change.
 
@@ -59,7 +59,7 @@ The script uses Python's standard library only: nothing to install. On your mach
 | `status [pod]` | GPU, data center, cost so far, credit left, addresses, last log lines |
 | `logs [pod]` | Follows the log again until `READY` |
 | `open [pod]` | Opens ComfyUI in your browser |
-| `push [pod] FILES` | Copies files into the pod's input folder |
+| `push [pod] FILES` | Copies files into the pod's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training |
 | `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/` |
 | `down [pod]` | Pulls, terminates, then says what the pod cost and the credit left. `--all` for every pod recorded here, `--no-pull` to skip the download |
 | `ssh [pod]` | A terminal on the pod |
@@ -79,12 +79,12 @@ Each profile is a set of models in [`models.json`](models.json). Join them with 
 | `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, BiRefNet, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image and its colour and depth control | RTX 5090 (32 GB) | 118 GB | 170 GB |
 | `3d` | TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet | RTX 5090 | 32 GB | 100 GB |
 | `video` | LTX 2.5, the LTX IC-LoRAs (ainvfx-fluid and LTX Ripple included), SeedVR2 7B, RIFE | RTX PRO 6000 (96 GB) | 85 GB | 130 GB |
-| `train` | the bf16 LTX 2.5 files of the training kit | RTX PRO 6000 | 68 GB | 110 GB |
+| `train` | the trainers; each training run downloads its own base files ([Training a LoRA](#training-a-lora)) | RTX PRO 6000 | none at start, up to 70 GB per run | 190 GB |
 | `image+3d` | | RTX 5090 | 148 GB | 210 GB |
 | `image+video` | | RTX PRO 6000 | 203 GB | 270 GB |
-| `all` | | RTX PRO 6000 | 301 GB | 380 GB |
+| `all` | | RTX PRO 6000 | 304 GB | 450 GB |
 
-Sizes read from `models.json` on 24 October 2026. A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB, never under 100 GB. `up` computes it from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
+Sizes read from `models.json` on 28 October 2026. A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB, never under 100 GB. With `train`, the models include the largest recipe's base files, and the disk 70 GB more for the trainers, the caption model, caches and checkpoints. `up` computes it from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
 
 ## Your own settings
 
@@ -105,7 +105,7 @@ Three ways to change a value, from the most lasting to the most temporary:
 | `AINVFX_PYTHON` | `3.13` | The Python of the pod's environment, installed by uv |
 | `AINVFX_TORCH` | `torch torchvision torchaudio` | The PyTorch packages, with pip flags if wanted (`--pre ...` for nightlies) |
 | `AINVFX_TORCH_INDEX` | the CUDA 13.0 stable index | The wheel index PyTorch comes from (`.../whl/nightly/cu130` for nightlies) |
-| `AINVFX_MODELS_URL` | this repository's `models.json` | Your own list of models (below) |
+| `AINVFX_MODELS_URL` | this repository's `models.json`, at the version of the `bootstrap.sh` that runs | Your own list of models (below) |
 | `AINVFX_CUSTOM_NODES` | none | Git URLs separated by spaces; each is cloned into `custom_nodes` and its `requirements.txt` installed |
 | `AINVFX_HEALTHCHECK` | `1` | `0` skips the disk speed test at start |
 | `AINVFX_SELFTEST` | `1` | `0` skips the test image at the end (`up --no-selftest` does the same). It needs the `image` profile |
@@ -117,7 +117,7 @@ Values with spaces need no quotes; lines starting with `#` are comments.
 
 ## The Hugging Face token
 
-Some repositories are **gated**: Hugging Face serves their files only to an account that has accepted their licence. Here: FLUX 3 Image Klein in `image`, LTX 2.5 in `video` and `train` (`gated: true` in `models.json`). They need a free Hugging Face account, the licence accepted on each model's page ("Agree and access repository"), and a token of type Read (Settings, Access Tokens).
+Some repositories are **gated**: Hugging Face serves their files only to an account that has accepted their licence. Here: FLUX 3 Image Klein in `image`, LTX 2.5 in `video` and in the LTX training recipes (`gated: true` in `models.json`). They need a free Hugging Face account, the licence accepted on each model's page ("Agree and access repository"), and a token of type Read (Settings, Access Tokens).
 
 - `python pod.py setup --hf-token` stores the token on Runpod as the secret `huggingface_token`, never on your machine. From the console: Account, Credentials, Secrets, same name.
 - Each pod receives `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}`, which Runpod replaces with the value when the pod boots. Without that secret, the pod ignores the placeholder and skips the gated files. Nothing else breaks.
@@ -127,8 +127,69 @@ Some repositories are **gated**: Hugging Face serves their files only to an acco
 
 - **Workflows** (`.json`): drag them onto the ComfyUI canvas, as at home.
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
+- **A training dataset in**: `python pod.py push --dataset NAME FOLDER` ([Training a LoRA](#training-a-lora)).
 - **Results out**: the Assets panel in ComfyUI, or `python pod.py pull`. It downloads every file of the pod's output folder that you do not have yet, subfolders kept: images, videos, 3D files, and files a node saves without showing them, such as a trained LoRA. It walks the folder through the pod's JupyterLab, with the token of the `READY` line. When JupyterLab is off, it falls back to the files ComfyUI's history lists. Results go to `outputs/<pod name>/` next to the script, or to the folder named in `AINVFX_OUTPUTS`. `down` runs the same pull first.
 - **Many files at once**: JupyterLab, from the link on the `READY` line. Its terminal is under File, New, Terminal.
+
+## Training a LoRA
+
+The `train` profile makes the pod a training machine too. After ComfyUI, it installs two trainers, each at one tested commit and in its own environment: [musubi-tuner](https://github.com/kohya-ss/musubi-tuner) in [AkaneTendo25's fork](https://github.com/AkaneTendo25/musubi-tuner), the one that trains LTX 2.5, and [sd-scripts](https://github.com/kohya-ss/sd-scripts) for MOSS-Image. Then it puts the `train` command on the pod. No base model comes at start: the first run of a recipe downloads that recipe's files, once.
+
+| Recipe | It learns | Dataset | Base files | Steps · learning rate · rank |
+|---|---|---|---|---|
+| `zimage` | a style, a character or an object, on Z-Image Base | images | 21 GB | 1,500 · 1e-4 · 32 |
+| `qwen_edit` | one edit, on Qwen-Image-Edit-2511 | image pairs | 58 GB | 1,250 · 5e-5 · 16 |
+| `moss` | a style, a character or an object, on MOSS-Image Base | images | 20 GB | 1,500 · 1e-4 · 16 |
+| `ltx` | a style or a motion, on LTX 2.5 | clips | 70 GB | 1,500 · 1e-4 · 32 |
+| `ltx_images` | a look, on LTX 2.5, from still images | images | 70 GB | 1,500 · 1e-4 · 32 |
+| `ltx_iclora` | a control video turned into a result (an IC-LoRA) | clip pairs | 70 GB | 2,000 · 1e-4 · 32 |
+| `ltx_av` | the picture and the sound together, on LTX 2.5 | clips with sound | 70 GB | 1,500 · 1e-4 · 32 |
+
+A dataset is one folder. **Images**: each image with its caption, a `.txt` of the same name. **Clips**: each clip of 121 frames or more with its caption; the trainer reads its first 121 frames at 25 fps. **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names.
+
+### A first run
+
+On your computer:
+
+```bash
+python pod.py up train                          # or image+train, to test the LoRA with the course's image models
+python pod.py push --dataset mychar mychar/     # the folder's files go to /workspace/dataset/mychar on the pod
+```
+
+Then in a terminal on the pod (JupyterLab, from the link of the `READY` line: File, New, Terminal):
+
+```bash
+train caption mychar --trigger mychr            # a caption for every image that has none
+train zimage mychar_v1 --dataset mychar         # trains in the background; its log follows on screen
+```
+
+- **Read every caption before training.** JupyterLab opens the `.txt` files under `workspace/dataset/mychar`. The captioner makes mistakes, and a wrong word is learned like the others. `train caption` ends with the words found in most captions: one that describes the style goes in `--avoid`, then `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`.
+- **During the run**, Ctrl+C stops the display, never the run. `train log` shows it again, `train status` says where it stands, `train stop` stops it. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
+- **Every 250 steps**, a checkpoint and test images (samples) land in `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI). The samples decide, not the loss curve: stop when they stop improving.
+- **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats.
+
+### Options of a run
+
+| Option | What it does |
+|---|---|
+| `--dataset NAME` | a folder of `/workspace/dataset`; or `--dataset FILE.toml`, a dataset config for several folders or other settings |
+| `--steps N` | the number of training steps |
+| `--lr X` | the learning rate: the setting for learning faster or slower |
+| `--rank N` | the LoRA's rank; alpha changes by the same factor, so the learning speed stays the same |
+| `--from RUN` | start from the final LoRA of an earlier run, or from one of its checkpoints by file name; with `--steps` |
+| `--prompts FILE` | your own sample prompts (by default: two of your captions, then the recipe's own subject with your trigger) |
+| `--trigger WORD` | the trigger of the third sample prompt, when the captions do not start with it |
+| `--then RUN [options]` | another stage after this one, in the same background run |
+
+Each run writes the dataset config it used (`dataset.toml`) into its folder: copy it to change a setting. A chain, here the three resolutions of an IC-LoRA, each stage starting from the one before:
+
+```bash
+train ltx_iclora fx_s1 --dataset fx/low.toml \
+  --then fx_s2 --from fx_s1 --steps 1000 --lr 5e-5 --dataset fx/mid.toml \
+  --then fx --from fx_s2 --steps 500 --lr 2e-5 --dataset fx/high.toml
+```
+
+The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods. `moss` follows the MOSS-Image guide of sd-scripts and is newer. FLUX 3 Image Klein is not here yet: neither trainer supports it.
 
 ## How `up` picks a GPU
 
@@ -157,6 +218,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh) from this repos
 | 2 | Install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at the tag of `AINVFX_COMFY_TAG`, the Manager, your custom nodes. A failed download is retried; PyTorch then comes from PyPI, the same CUDA 13.0 build | `FAILED` when the pod cannot work on that machine |
 | 3 | ComfyUI starts for Runpod's proxy | `COMFYUI UP`, then `PROXY OK` |
 | 4 | The models of the profile, one by one. Each line gives file k of n, GB done, percent and time left. Files already present are skipped | `MODELS DONE` with the total time and speed |
+| 4b | With the profile `train`: the two trainers, each in its own environment, and the `train` command | `TRAINERS OK` |
 | 5 | A test image by MOSS-Image, 1024 x 1024 in 25 steps: a thank-you poster with this repository's address over eight VFX stills. It needs the `image` profile; without it, the step is skipped with a note | `SELFTEST OK`, then `READY` with the ComfyUI and JupyterLab links |
 
 The image is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the one of Runpod's own "Runpod Pytorch 2.8.0" template. Runpod keeps it on its hosts, so the container starts within seconds. Its own PyTorch and CUDA toolkit are not used: `bootstrap.sh` installs PyTorch built for CUDA 13.0, which carries its own CUDA libraries.
@@ -190,8 +252,10 @@ A pod created after the update uses the new values; a running pod keeps its own.
 
 ## For contributors
 
-`python -m unittest discover tests` runs [`tests/test_pod.py`](tests/test_pod.py): unit tests of the helpers, then every command end to end against a fake Runpod API, a fake ComfyUI and a fake JupyterLab on your own machine. Nothing is billed and your configuration is untouched. Standard library only, in the script and in the tests: keep it that way.
+`python -m unittest discover tests` runs [`tests/test_pod.py`](tests/test_pod.py): unit tests of the helpers, then every command end to end against a fake Runpod API, a fake ComfyUI and a fake JupyterLab on your own machine. Nothing is billed and your configuration is untouched. Standard library only, in the script and in the tests: keep it that way. [`tests/test_train.py`](tests/test_train.py) runs `train.py` (Python 3.11 or newer, as on the pod) against fake trainers in a temporary folder.
+
+The template runs the `bootstrap.sh` of a release, so a change on `main` reaches no new pod before the template moves. To try a branch on a pod: `python pod.py up train --set AINVFX_BOOTSTRAP_URL=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/<branch>/bootstrap.sh`; its `models.json` and `train.py` then come from the same branch.
 
 ## Credits and licence
 
-Maintained by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/) and open to everyone, in partnership with [Runpod](https://www.runpod.io/). Not affiliated with [Comfy Org](https://www.comfy.org/): [ComfyUI](https://github.com/Comfy-Org/ComfyUI) is theirs, under the [GPL-3.0 licence](https://github.com/Comfy-Org/ComfyUI/blob/master/LICENSE). The models come from their authors on [Hugging Face](https://huggingface.co/), each under its own licence (see the repository named in [`models.json`](models.json)). The Runpod logo belongs to Runpod and the AInVFX logo to AInVFX. This code is released under the [Apache License 2.0](LICENSE). Questions and bugs: [the issues page](https://github.com/AInVFX/ainvfx-runpod/issues), or [the AInVFX Discord](https://discord.gg/6CKSa3b5ks).
+Maintained by [AInVFX](https://www.ainvfx.com/) for its [Generative AI Bootcamp for Film and TV](https://www.ainvfx.com/bootcamp/) and open to everyone, in partnership with [Runpod](https://www.runpod.io/). Not affiliated with [Comfy Org](https://www.comfy.org/): [ComfyUI](https://github.com/Comfy-Org/ComfyUI) is theirs, under the [GPL-3.0 licence](https://github.com/Comfy-Org/ComfyUI/blob/master/LICENSE). The models come from their authors on [Hugging Face](https://huggingface.co/), each under its own licence (see the repository named in [`models.json`](models.json)). The trainers keep their own licences: musubi-tuner and sd-scripts are Apache 2.0. The Runpod logo belongs to Runpod and the AInVFX logo to AInVFX. This code is released under the [Apache License 2.0](LICENSE). Questions and bugs: [the issues page](https://github.com/AInVFX/ainvfx-runpod/issues), or [the AInVFX Discord](https://discord.gg/6CKSa3b5ks).
