@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint (pyflakes, shellcheck, Python 3.8 syntax of pod.py)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install pyflakes shellcheck-py vermin
+      - run: python -m pyflakes pod.py train.py tests
+      - run: shellcheck bootstrap.sh
+      - run: vermin --no-tips --violations -t=3.8- pod.py tests/test_pod.py tests/test_repo.py
+
+  tests:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  pod-py38:
+    name: pod.py on Python 3.8 (the oldest Python a participant may have)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install uv
+      - run: uv run --no-project --python 3.8 python -m unittest -v test_pod test_repo
+        working-directory: tests

@@ -42,7 +42,7 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (7, "[AINVFX] READY · ComfyUI https://fakepod1-8188.proxy.runpod.net · JupyterLab https://fakepod1-8888.proxy.runpod.net/lab?token=faketoken · log /workspace/ComfyUI/input/ainvfx/bootstrap.log"),
     (7, "[AINVFX] remember: terminate the pod when you are done"),
 ]
-# bootstrap.sh 5.4 on a host whose network times out on every PyTorch route (seen on 6 Oct 2026, before 5.4):
+# bootstrap.sh on a host whose network times out on every PyTorch route (seen on 6 Oct 2026):
 # the log stops at a FAILED line and the pod stays up; READY never comes.
 BOOT_FAILED = BOOT[:7] + [
     (3, "[AINVFX] WARNING: PyTorch download from https://download.pytorch.org/whl/cu130 failed (the lines above name the file)"),

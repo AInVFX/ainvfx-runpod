@@ -1,5 +1,5 @@
 {
-  "_about": "Model files: a profile's are downloaded by bootstrap.sh at start (AINVFX_PROFILE names one profile or several joined by +, as image+train, or all), a training family's by train.py at its first run. A profile lists entries of files; @name includes another profile. A training family names its files by role. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15, 20, 23, 24 and 28 October 2026.",
+  "_about": "Model files: a profile's are downloaded by bootstrap.sh at start (AINVFX_PROFILE names one profile or several joined by +, as image+train, or all), a training family's by train.py at its first run. A profile lists entries of files; @name includes another profile. A training family names its files by role. dir is the subfolder of ComfyUI/models. gated repos need HF_TOKEN. Sizes in GB, read on Hugging Face on 4, 10, 11, 15, 20, 23, 24, 28 and 29 October 2026.",
   "profiles": {
     "image": [
       "z_image_turbo",
@@ -224,7 +224,7 @@
       "repo": "Lightricks/LTX-2.5",
       "path": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
       "dir": "model_patches",
-      "gb": 0.0,
+      "gb": 0.004,
       "gated": true
     },
     "gemma4_e2b_int8": {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ainvfx-runpod · train.py: LoRA training ON THE POD, with musubi-tuner.
+"""ainvfx-runpod · train.py: LoRA training ON THE POD, with musubi-tuner and sd-scripts.
 
-The `train` profile installs it (bootstrap.sh): musubi-tuner in its own environment, and the `train` command, which
-runs this file there. In a terminal on the pod (JupyterLab: File, New, Terminal; or `python pod.py ssh <pod>`):
+The `train` profile installs it (bootstrap.sh): the two trainers, each in its own environment, and the `train`
+command, which runs this file with musubi-tuner's Python. In a terminal on the pod (JupyterLab: File, New, Terminal; or `python pod.py ssh <pod>`):
 
   train recipes                                 every recipe: what it learns, its dataset, its base files
   train caption <dataset> --trigger WORD        writes a caption (.txt) next to every image or clip that has none
@@ -59,9 +59,9 @@ STABLE_SECONDS = 15       # a checkpoint untouched this long is complete: it is 
 # ----------------------------------------------------------------------------- recipes
 # A recipe is one kind of LoRA: its family of base files (the `training` part of models.json names them), the data it
 # reads, its trainer (musubi-tuner unless named), the settings of the dataset config written for a folder, the
-# trainer's caching steps, the training script
-# and its arguments, how its checkpoints load in ComfyUI, and its sample prompts. {name} placeholders are filled per
-# run: the base files by role, and config, prompts, run (the run's folder) and name.
+# trainer's caching steps, the training script and its arguments, how its checkpoints load in ComfyUI, and its
+# sample prompts. {name} placeholders are filled per run: the base files by role, and config, prompts, run (the
+# run's folder) and name.
 COMMON = ["--dataset_config", "{config}", "--max_data_loader_n_workers", "2", "--persistent_data_loader_workers",
           "--save_every_n_steps", str(SAVE_EVERY), "--sample_at_first", "--sample_every_n_steps", str(SAVE_EVERY),
           "--sample_prompts", "{prompts}", "--seed", "42", "--log_with", "tensorboard", "--logging_dir", "{run}/logs",
@@ -325,6 +325,7 @@ def hf_token():
             for item in Path("/proc/1/environ").read_bytes().split(b"\0"):
                 if item.startswith(b"HF_TOKEN="):
                     token = item[len(b"HF_TOKEN="):].decode("utf-8", "replace")
+                    break
         except OSError:
             pass
     return "" if "{{" in token else token
@@ -667,7 +668,7 @@ def stage_commands(recipe, stage, values):
 
 def publish(recipe, run, name, final=False):
     """Every checkpoint of a run, usable in ComfyUI: Z-Image's converted (musubi-tuner's own format does not load
-    there), LTX's as the fork writes them (.comfy.safetensors), Qwen's as they are; each linked into ComfyUI's LoRA
+    there), LTX's as the fork writes them (.comfy.safetensors), Qwen-Image-Edit's and MOSS-Image's as they are; each linked into ComfyUI's LoRA
     list, under train/<run>/."""
     kind, now = RECIPES[recipe]["comfy"], time.time()
     weights = [f for f in sorted(run.glob(name + "*.safetensors"))
@@ -678,8 +679,9 @@ def publish(recipe, run, name, final=False):
             if out.exists() or (not final and now - f.stat().st_mtime < STABLE_SECONDS):
                 continue
             tmp = out.with_name("." + out.name)
-            r = subprocess.run([str(MUSUBI / ".venv" / "bin" / "python"), "src/musubi_tuner/convert_lora.py", "--input", str(f), "--output", str(tmp),
-                                "--target", "other"], cwd=str(MUSUBI), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            r = subprocess.run([str(MUSUBI / ".venv" / "bin" / "python"), "src/musubi_tuner/convert_lora.py",
+                                "--input", str(f), "--output", str(tmp), "--target", "other"],
+                               cwd=str(MUSUBI), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if r.returncode == 0 and tmp.is_file():
                 os.replace(tmp, out)
             else:

@@ -178,6 +178,23 @@ class Units(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=bad):
                 train.parse_stages("ltx_iclora", bad)
 
+    def test_the_readme_recipe_table_matches_the_recipes(self):
+        """README.md's recipe table gives each recipe's base files, steps, learning rate and rank as they are here."""
+        rows = []
+        for line in (REPO / "README.md").read_text(encoding="utf-8").split("\n## Training a LoRA\n", 1)[1].splitlines():
+            if line.startswith("|"):
+                rows.append([c.strip() for c in line.strip().strip("|").split("|")])
+            elif rows:
+                break
+        table = {r[0].strip("`"): r for r in rows[2:]}
+        self.assertEqual(sorted(table), sorted(train.RECIPES))
+        for name, r in train.RECIPES.items():
+            size = sum(f["gb"] for f in train.family_files(r["family"]).values())
+            steps, lr, rank = (train.arg_value(r["args"], k) for k in ("--max_train_steps", "--learning_rate",
+                                                                       "--network_dim"))
+            self.assertEqual(table[name][-2], "{} GB".format(round(size)), name)
+            self.assertEqual(table[name][-1], "{:,} · {} · {}".format(int(steps), lr, rank), name)
+
 
 @unittest.skipIf(train is None, "train.py runs on the pod, with Python 3.11 or newer")
 class Runs(unittest.TestCase):

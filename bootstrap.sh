@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ainvfx-runpod · bootstrap.sh · runs ON THE POD as the container start command (the Runpod template's
-# start command fetches it from this repository; pod.py sends the settings below as environment variables).
+# start command fetches it from AINVFX_REPO_RAW; pod.py sends the settings below as environment variables).
 #
 # Every line it prints starts with [AINVFX]. In order:
 #   0. Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
@@ -27,10 +27,9 @@
 #   AINVFX_CUSTOM_NODES   git URLs of custom nodes, separated by spaces. Default: none
 #   AINVFX_HEALTHCHECK    1 measures the disk (default); 0 skips it
 #   AINVFX_SELFTEST       1 renders the test image (default); 0 skips it
-#   AINVFX_BOOTSTRAP_URL  the raw URL of another bootstrap.sh (a fork), fetched and run in place of this one
-#   AINVFX_REPO_RAW       where this repository's other files come from (models.json, train.py). Default: the
-#                         folder of AINVFX_BOOTSTRAP_URL when set, else this repository's main branch. A template
-#                         pinned to a release gives that release's folder
+#   AINVFX_REPO_RAW       the raw address of the repository folder this script comes from, without a trailing
+#                         slash: a release, a branch or a fork. models.json and train.py come from there too.
+#                         The template names a release; default: this repository's main branch
 #   HF_TOKEN              a Hugging Face read token for the gated files; Runpod fills it from the secret
 #                         huggingface_token. An unresolved {{ RUNPOD_SECRET_... }} placeholder counts as absent.
 #
@@ -38,14 +37,6 @@
 # installs or repairs the trainers alone. A second run (a pod restart) skips what is already installed and downloaded.
 
 set -uo pipefail
-# A fork's bootstrap takes over here, once (AINVFX_BOOTSTRAP_RAN guards against a loop).
-if [ -n "${AINVFX_BOOTSTRAP_URL:-}" ] && [ -z "${AINVFX_BOOTSTRAP_RAN:-}" ]; then
-  echo "[AINVFX] fetching the bootstrap named in AINVFX_BOOTSTRAP_URL: $AINVFX_BOOTSTRAP_URL"
-  if curl -fsSL --retry 3 "$AINVFX_BOOTSTRAP_URL" -o /tmp/ainvfx-bootstrap-fork.sh; then
-    AINVFX_BOOTSTRAP_RAN=1 exec bash /tmp/ainvfx-bootstrap-fork.sh "$@"
-  fi
-  echo "[AINVFX] WARNING: that bootstrap could not be fetched; continuing with this one"
-fi
 
 MODE="${1:-all}"
 case "$MODE" in
@@ -54,7 +45,7 @@ case "$MODE" in
 esac
 if [ "$MODE" != "all" ]; then
   # A terminal opened on the pod may lack the pod's variables: read them from the container's first process.
-  for v in AINVFX_PROFILE AINVFX_MODELS_URL AINVFX_REPO_RAW AINVFX_BOOTSTRAP_URL HF_TOKEN; do
+  for v in AINVFX_PROFILE AINVFX_MODELS_URL AINVFX_REPO_RAW HF_TOKEN; do
     if [ -z "${!v:-}" ] && [ -r /proc/1/environ ]; then
       val=$({ tr '\0' '\n' < /proc/1/environ; } 2>/dev/null | sed -n "s/^$v=//p" | head -1)
       [ -n "$val" ] && export "$v=$val"
@@ -67,11 +58,10 @@ TAG="${AINVFX_COMFY_TAG:-v0.43.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
-# This repository's other files (models.json, train.py) come from where this script came from: the folder of
-# AINVFX_BOOTSTRAP_URL (a fork, a branch), else main; a template pinned to a release sets AINVFX_REPO_RAW.
-if [ -n "${AINVFX_REPO_RAW:-}" ]; then REPO_RAW=$AINVFX_REPO_RAW
-elif [ -n "${AINVFX_BOOTSTRAP_URL:-}" ]; then REPO_RAW=${AINVFX_BOOTSTRAP_URL%/*}
-else REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main; fi
+# models.json and train.py come from the folder this script came from: the release the template names, or the
+# branch or fork given in AINVFX_REPO_RAW.
+REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main}"
+REPO_RAW="${REPO_RAW%/}"
 MODELS_URL="${AINVFX_MODELS_URL:-$REPO_RAW/models.json}"
 CUSTOM_NODES="${AINVFX_CUSTOM_NODES:-}"
 HEALTHCHECK="${AINVFX_HEALTHCHECK:-1}"
@@ -270,7 +260,7 @@ elif [ "$MODE" = "trainer" ]; then
   exit 0
 else
   say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
-  say "settings: torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
+  say "settings: repository $REPO_RAW · torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
 fi
 
 # A placeholder Runpod did not substitute (no secret in the account) must not reach Hugging Face:
@@ -364,7 +354,9 @@ if [ ! -x $VENV/bin/python ]; then
 fi
 # shellcheck disable=SC1091
 source $VENV/bin/activate
-MARK=$VENV/.ainvfx_install_${TAG}_py${PY}
+# One marker per set of install settings. Runpod restarts a pod whose settings are edited: another ComfyUI tag,
+# PyTorch or list of custom nodes then installs again, and the same settings skip the install.
+MARK=$VENV/.ainvfx_install_${TAG}_py${PY}_$(printf '%s|%s|%s' "$TORCH" "$TORCH_INDEX" "$CUSTOM_NODES" | cksum | cut -d' ' -f1)
 if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
   install_torch || {
     fail "PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above). Your settings are not the cause. Terminate this pod and create a new one, which lands on another machine: python pod.py down, then python pod.py up $PROFILE; or Terminate in the console, then deploy again from the template."
