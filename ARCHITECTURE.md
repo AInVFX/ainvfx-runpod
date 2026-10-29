@@ -164,7 +164,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 |---|---|---|
 | `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and disks, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
 | `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
-| `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile | Python 3.8 or newer |
+| `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py` | Python 3.8 or newer (`sed` for the last test) |
 
 **CI** (`.github/workflows/tests.yml`) runs on every push and pull request: pyflakes, shellcheck and vermin; the whole suite on Python 3.12 and 3.14; the pod and repository tests on Python 3.8.
 
@@ -223,7 +223,7 @@ The variable appears once, so the command works whether Runpod runs it directly 
 
 ## 13. Known limits and planned work
 
-- **GraphQL.** `pod.py` still reads two things through Runpod's GraphQL API: the pod's host and its maintenance window (`MACHINE_QUERY`), and the account's credit (`MONEY_QUERY`). `setup` therefore asks for a key with GraphQL access. Runpod deprecates GraphQL for integrators in early 2027: move both reads to REST v2 before then.
+- **GraphQL, for two reads.** `pod.py` reads the pod's host with its maintenance window (`MACHINE_QUERY`) and the account's credit (`MONEY_QUERY`) through Runpod's GraphQL API, because REST v2 offers neither: its specification (`https://api.runpod.io/v2/openapi.json`, version 2.0.0, read on 29 October 2026) has no maintenance window, no balance and no spend rate. Runpod's own CLI shows the same GraphQL fields (`clientBalance`, `currentSpendPerHr` in `runpodctl user`). Runpod deprecates GraphQL for integrators in early 2027. When GraphQL stops answering, `pod.py` keeps working: `up` skips the host check and the credit line, and `test_up_and_down_work_without_graphql` proves it. Move both reads to REST v2 once Runpod adds them there.
 - **The `moss` recipe** follows sd-scripts' MOSS-Image guide and has not yet run on a pod.
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
 - **Custom nodes are not pinned.** `AINVFX_CUSTOM_NODES` clones each node's default branch at its latest commit.

@@ -817,6 +817,9 @@ def gpu_report(want, offers, region, community):
 
 
 # ----------------------------------------------------------------------------- host, money and secrets
+# Two reads stay on GraphQL: REST v2 has no host maintenance window, no balance and no spend rate (its specification,
+# https://api.runpod.io/v2/openapi.json 2.0.0, read on 29 Oct 2026). pod.py works without them: graphql() then
+# returns None, `up` skips the host check and the credit line (test_up_and_down_work_without_graphql).
 MACHINE_QUERY = ("query {{ pod(input: {{podId: {} }}) {{ id machine {{ podHostId dataCenterId location "
                  "maintenanceStart maintenanceEnd maintenanceNote }} }} }}")
 MONEY_QUERY = "query { myself { clientBalance currentSpendPerHr } }"

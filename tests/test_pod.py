@@ -1184,6 +1184,26 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("That is under 3 hours", out, out)
 
+    def test_up_and_down_work_without_graphql(self):
+        """GraphQL gone, as Runpod plans for integrators in early 2027 (REST v2 has no host maintenance window and
+        no credit): `up` creates the pod, says the host check was skipped, prints no credit line and reaches
+        READY; `status` and `down` still work."""
+        STATE["graphql_down"] = True
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("host check skipped: the GraphQL API did not answer", out, out)
+        self.assertNotIn("Your Runpod credit", out, out)
+        self.assertIn("READY", out, out)
+        out, rc = self.run_pod("status")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("credit left", out.lower(), out)
+        out, rc = self.run_pod("down", "-y", "--no-pull")
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"Terminated: ainvfx-image-\S+\.")
+        self.assertNotIn("credit left", out.lower(), out)
+        self.assertNotIn("Traceback", out, out)
+
     def test_every_data_center_with_stock_is_tried(self):
         """Ten pods created in the same minutes: the first seven data centers listed for the RTX PRO 6000
         are full by the time this one asks, the eighth has a GPU. An earlier version stopped after six."""

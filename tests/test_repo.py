@@ -4,12 +4,15 @@
     python -m unittest discover -s tests      # from the repository root
 
 A value written in two files drifts when only one of them changes: a default in settings.env and in bootstrap.sh, a
-size in models.json and in README.md, a model file in models.json and in the self-test. Each test names one such pair,
-so a change that forgets the other file fails here, before any pod is created.
+size in models.json and in README.md, a model file in models.json and in the self-test, the share-link rule in pod.py
+and in bootstrap.sh. Each test names one such pair, so a change that forgets the other file fails here, before any pod
+is created.
 """
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 
@@ -120,6 +123,25 @@ class Repo(unittest.TestCase):
                  for k in keys_of(["image"])}
         for name in names:
             self.assertIn(name, image)
+
+
+    @unittest.skipUnless(shutil.which("sed"), "needs sed, as on the pod")
+    def test_bootstrap_sh_reads_a_share_link_as_pod_py_does(self):
+        """A models list on Google Drive, Dropbox or GitHub: pod.py reads it to size the disk, then the pod downloads
+        it. Both turn the share link into the same link to the file itself."""
+        block = BOOTSTRAP.split("MODELS_SRC=", 1)[1].split("a share link becomes the file itself", 1)[0]
+        exprs = re.findall(r"-e '([^']*)'", block)
+        self.assertEqual(len(exprs), 3, block)
+        args = ["sed", "-E"] + [part for e in exprs for part in ("-e", e)]
+        for url in ("https://drive.google.com/file/d/1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh/view?usp=sharing",
+                    "https://drive.google.com/open?id=1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh",
+                    "https://drive.google.com/uc?export=download&id=1DUMJh6QWX3P2ZF60qHHcb1DkY5sf4jsh",
+                    "https://github.com/me/ainvfx-runpod/blob/main/models.json",
+                    "https://www.dropbox.com/scl/fi/abc/models.json?rlkey=x&dl=0",
+                    "https://gist.githubusercontent.com/me/abc/raw/models.json",
+                    pod.DEFAULT_MODELS_URL):
+            out = subprocess.run(args, input=url, stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+            self.assertEqual(out.strip(), pod.direct_url(url), url)
 
 
 if __name__ == "__main__":
