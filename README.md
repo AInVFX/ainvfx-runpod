@@ -90,7 +90,7 @@ A combination rents the GPU of its largest profile. The disk is 115% of the mode
 
 ## Your own settings
 
-Every choice the pod makes is one line of [`settings.env`](settings.env). The values travel with the pod as environment variables, and `bootstrap.sh` reads them on the pod. From the browser, set the same variables in the Environment variables section of the deploy page. Change nothing and you get the course's pod.
+Every choice the pod makes is one line of [`settings.env`](settings.env). The values are sent to the pod as environment variables, and `bootstrap.sh` reads them there. From the browser, set the same variables in the Environment variables section of the deploy page. Change nothing and you get the course's pod.
 
 Three ways to change a value, from the most lasting to the most temporary:
 
@@ -111,11 +111,11 @@ Three ways to change a value, from the most lasting to the most temporary:
 | `AINVFX_CUSTOM_NODES` | none | Git URLs separated by spaces; each is cloned into `custom_nodes` and its `requirements.txt` installed |
 | `AINVFX_HEALTHCHECK` | `1` | `0` skips the disk speed test at start |
 | `AINVFX_SELFTEST` | `1` | `0` skips the test image at the end (`up --no-selftest` does the same). It needs the `image` profile |
-| `AINVFX_REPO_RAW` | the release the template names | The version of this repository the pod runs (below) |
+| `AINVFX_REPO_RAW` | the release path the template names | Repository release path: the raw GitHub URL of the release the pod runs, such as `.../ainvfx-runpod/v1.2.0`; a branch or a fork works too (below) |
 
 **Your own list of models.** Copy [`models.json`](models.json) and keep its shape. In `profiles`, each profile names its entries (`@image` inside a profile means "everything of image, plus"). In `files`, each entry gives the Hugging Face `repo`, the `path` of the file in it, the `dir` under `ComfyUI/models` where it goes, its size in `gb`, and `gated: true` when the repository needs a token. Put the file where the pod can download it: a fork of this repository, a GitHub Gist (its Raw button gives the address), or a Google Drive, Dropbox or GitHub share link open to anyone with the link. Then set `AINVFX_MODELS_URL` in `settings.local.env`, or give `--models-url` for one pod. `up` reads your list before it creates the pod, and stops if the link gives a web page instead of the file. For a file needed once, the pod's terminal is enough: `cd /workspace/ComfyUI/models/<folder> && hf download <repo> <path> --local-dir .`
 
-**The version the pod runs.** The template names a release of this repository in `AINVFX_REPO_RAW`, for example `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/v1.2.0`. The pod takes `bootstrap.sh`, `models.json` and `train.py` from that folder, so a change on `main` reaches no pod before the next release. To run a branch or a fork, give the raw address of its folder: `--set AINVFX_REPO_RAW=https://raw.githubusercontent.com/<owner>/ainvfx-runpod/<branch>`.
+**The repository release path.** `AINVFX_REPO_RAW` is the raw GitHub URL of this repository at the release the pod runs, for example `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/v1.2.0`. The template sets it, so you never need to. The pod takes `bootstrap.sh`, `models.json` and `train.py` from that path, so a change on `main` reaches no pod before the next release. A models list of your own needs only `AINVFX_MODELS_URL`. To run a branch or a fork, give its path: `--set AINVFX_REPO_RAW=https://raw.githubusercontent.com/<owner>/ainvfx-runpod/<branch>`.
 
 ## The Hugging Face token
 

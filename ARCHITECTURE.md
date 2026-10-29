@@ -4,7 +4,7 @@ This document explains how ainvfx-runpod is built and where each part lives, for
 
 ## 1. What ainvfx-runpod does
 
-ainvfx-runpod turns a rented Runpod GPU into a ready ComfyUI machine, then back into nothing. Three programs share the work:
+ainvfx-runpod sets up ComfyUI and its models on a rented Runpod GPU, then terminates the pod when the work is done, so nothing stays on Runpod and nothing more is billed. Three programs share the work:
 
 - **`pod.py`** runs on the user's computer. It creates the pod through Runpod's API, follows its log until the pod is ready, moves files in and out, and terminates the pod.
 - **`bootstrap.sh`** runs on the pod, as the container's start command. It installs ComfyUI, downloads the models, installs the trainers and renders a test image.
@@ -18,7 +18,8 @@ Two data files drive them: **`settings.env`** holds every choice the pod makes, 
 |---|---|
 | Pod | A Runpod container with a GPU, rented by the second. Its container disk holds everything and is erased when the pod is terminated. |
 | Template | The public Runpod template `4i789znkrd` ("AInVFX bootcamp ComfyUI"): the container image, the ports, the environment variables and the start command. Every pod is created from it, in the browser or by `pod.py`. |
-| Release | A git tag `vX.Y.Z` of this repository. The template names one in `AINVFX_REPO_RAW`. |
+| Release | A git tag `vX.Y.Z` of this repository. |
+| Release path | `AINVFX_REPO_RAW`: the raw GitHub URL of this repository at a release, such as `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/v1.2.0`. The template sets it, and a pod takes `bootstrap.sh`, `models.json` and `train.py` from it. |
 | Profile | A named set of model files in `models.json`: `image`, `3d`, `video`, `train`. `AINVFX_PROFILE` joins several with `+`. |
 | Training family | The base files of one kind of training (`zimage`, `qwen_edit`, `moss`, `ltx`), named by role in the `training` part of `models.json`. The first run that needs them downloads them. |
 | Recipe | One kind of LoRA in `train.py`: its training family, its data, its trainer and its settings. |
@@ -49,8 +50,8 @@ pod.py                               api.runpod.io                      start co
 - **`bootstrap.sh` is one file.** Its Python helpers are inline heredocs, so a pod needs one download to start.
 - **An optional step never stops a pod.** A slow disk, a gated file without a licence, a failed custom node, failed trainers or a failed test image give a `WARNING`, and the pod still reaches `READY`. Only a pod that cannot work (no Python, no PyTorch, no GPU from PyTorch, no ComfyUI) prints `FAILED` and holds: it stays up, so its log can be read.
 - **Every step can run again.** An install marker per set of install settings (ComfyUI tag, Python, PyTorch, custom nodes), files already present, one marker per trainer commit: a restarted pod skips what it has. `bash bootstrap.sh models` and `bash bootstrap.sh trainer` repeat one step on a live pod.
-- **The log is the interface.** Every bootstrap line starts with `[AINVFX]`. The log words are fixed, because `pod.py` and the tests react to them: a changed word changes `bootstrap.sh`, `pod.py` and `tests/test_pod.py` in the same commit. The trainers end on `TRAINERS OK`, never on a line containing `READY`, because `pod.py` stops following on that word.
-- **One home per value.** A setting lives in `settings.env`, a model in `models.json`, a recipe in `train.py`, a trainer pin in `bootstrap.sh`. Where a copy must exist (the defaults in `bootstrap.sh`, the tables of README.md), `tests/test_repo.py` checks that it agrees.
+- **`pod.py` reads the log.** Every bootstrap line starts with `[AINVFX]`. The log words are fixed, because `pod.py` and the tests react to them: a changed word changes `bootstrap.sh`, `pod.py` and `tests/test_pod.py` in the same commit. The trainers end on `TRAINERS OK`, never on a line containing `READY`, because `pod.py` stops following on that word.
+- **One place per value.** A setting lives in `settings.env`, a model in `models.json`, a recipe in `train.py`, a trainer pin in `bootstrap.sh`. Where a copy must exist (the defaults in `bootstrap.sh`, the tables of README.md), `tests/test_repo.py` checks that it agrees.
 - **Secrets stay out of files and logs.** The API key lives in `~/.ainvfx-runpod/config.json` (readable by its owner only) or in `RUNPOD_API_KEY`. The Hugging Face token is a Runpod secret: the pod receives a reference, which Runpod resolves when the pod starts. One deliberate exception: the `READY` line carries JupyterLab's token, so that `pull` and `push --dataset` can use JupyterLab. The pod's address therefore stays private.
 - **Messages, never tracebacks.** A user error ends in one sentence that says what to do. `AINVFX_DEBUG=1` shows the trace.
 - **Plain words.** Messages and documents use short sentences, one idea each: many users read English as a second language.
@@ -198,7 +199,7 @@ A release is a tag, and pods run the release the template names. A change on `ma
    gh release create vX.Y.Z --verify-tag --latest --title 'ainvfx-runpod X.Y.Z' --notes-file <notes>
    ```
 
-3. Move the template: set its `AINVFX_REPO_RAW` to `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/vX.Y.Z`. Update its README field when the profiles, sizes or defaults changed (the console holds that field; the REST API does not).
+3. Move the template: set its release path, `AINVFX_REPO_RAW`, to `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/vX.Y.Z`. Update its README field when the profiles, sizes or defaults changed (the console holds that field; the REST API does not).
 
 A published tag never moves: a fix is the next patch release.
 
@@ -211,7 +212,7 @@ A published tag never moves: a fix is the next patch release.
 | Container disk | 200 GB: any single profile fits; `up` sizes the disk for a combination |
 | Ports | `8188/http` (ComfyUI), `8888/http` (JupyterLab), `22/tcp` (SSH) |
 | CUDA versions | 13.0 and newer (extend the list when Runpod adds one) |
-| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.43.0`, `AINVFX_REPO_RAW=<the release folder>`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
+| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.43.0`, `AINVFX_REPO_RAW=<the release path>`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
 
 The start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW`, and falls back to Runpod's `/start.sh` when GitHub cannot be reached:
 
