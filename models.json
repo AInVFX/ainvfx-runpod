@@ -72,7 +72,14 @@
       "ltx23_iclora_in_outpainting",
       "ainvfx_fluid",
       "ltx_ripple",
-      "seedvr2_7b_int8",
+      "ltx25_iclora_decompression",
+      "ltx25_iclora_colorization",
+      "ltx25_iclora_day_to_night",
+      "ltx23_iclora_relight",
+      "ltx25_iclora_sdr_to_hdr",
+      "ltx25_sdr_to_hdr_scene_embedding",
+      "ltx23_iclora_dubit",
+      "seedvr2_7b_fp16",
       "rife"
     ],
     "train": []
@@ -322,11 +329,60 @@
       "dir": "loras",
       "gb": 0.65
     },
-    "seedvr2_7b_int8": {
+    "seedvr2_7b_fp16": {
       "repo": "Comfy-Org/SeedVR2",
-      "path": "diffusion_models/seedvr2_7b_int8_convrot.safetensors",
+      "path": "diffusion_models/seedvr2_7b_fp16.safetensors",
       "dir": "diffusion_models",
-      "gb": 8.3
+      "gb": 16.5
+    },
+    "ltx25_iclora_decompression": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Decompression",
+      "path": "ltx-2.5-22b-ic-lora-decompression-0.9.safetensors",
+      "dir": "loras",
+      "gb": 0.91,
+      "gated": true
+    },
+    "ltx25_iclora_colorization": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Colorization",
+      "path": "ltx-2.5-22b-ic-lora-colorization-0.9.safetensors",
+      "dir": "loras",
+      "gb": 0.91,
+      "gated": true
+    },
+    "ltx25_iclora_day_to_night": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-Day-To-Night",
+      "path": "ltx-2.5-22b-ic-lora-day-to-night-0.9.safetensors",
+      "dir": "loras",
+      "gb": 0.33,
+      "gated": true
+    },
+    "ltx23_iclora_relight": {
+      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-Relight",
+      "path": "ltx-2.3-22b-ic-lora-relight-1.0.safetensors",
+      "dir": "loras",
+      "gb": 0.33,
+      "gated": true
+    },
+    "ltx25_iclora_sdr_to_hdr": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-SDR-To-HDR",
+      "path": "ltx-2.5-22b-ic-lora-sdr-to-hdr-1.0.safetensors",
+      "dir": "loras",
+      "gb": 1.31,
+      "gated": true
+    },
+    "ltx25_sdr_to_hdr_scene_embedding": {
+      "repo": "Lightricks/LTX-2.5-22b-IC-LoRA-SDR-To-HDR",
+      "path": "ltx-2.5-22b-ic-lora-sdr-to-hdr-scene-emb.safetensors",
+      "dir": "embeddings",
+      "gb": 0.01,
+      "gated": true
+    },
+    "ltx23_iclora_dubit": {
+      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-DubIt",
+      "path": "ltx-2.3-22b-ic-lora-dubit-0.9.safetensors",
+      "dir": "loras",
+      "gb": 2.47,
+      "gated": true
     },
     "rife": {
       "repo": "Comfy-Org/frame_interpolation",

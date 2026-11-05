@@ -373,7 +373,10 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
     || (cd $COMFY && git fetch --quiet --tags origin && git checkout --quiet "$TAG") \
     || warn "could not check out ComfyUI $TAG"
   uvi -r $COMFY/requirements.txt || warn "ComfyUI requirements failed"
-  [ -f $COMFY/manager_requirements.txt ] && (uvi -r $COMFY/manager_requirements.txt || true)
+  # the Manager (ComfyUI's Extensions button): its own package, pinned by ComfyUI's manager_requirements.txt
+  if [ -f $COMFY/manager_requirements.txt ]; then
+    uvi -r $COMFY/manager_requirements.txt || warn "the Manager could not be installed, so ComfyUI shows no Extensions button. On the pod: uv pip install -r $COMFY/manager_requirements.txt, then restart ComfyUI"
+  fi
   uvi -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
   # custom nodes named in AINVFX_CUSTOM_NODES: cloned into custom_nodes, their requirements installed
   for url in $CUSTOM_NODES; do
@@ -423,6 +426,19 @@ mkdir -p $COMFY/models/diffusion_models $COMFY/models/text_encoders $COMFY/model
          $COMFY/models/model_patches $COMFY/models/upscale_models $COMFY/models/latent_upscale_models \
          $COMFY/models/geometry_estimation $COMFY/models/checkpoints $COMFY/models/frame_interpolation \
          $COMFY/input $COMFY/output
+# The Manager installs node packs from its Extensions button. ComfyUI listens on 0.0.0.0 for Runpod's proxy, and from such
+# an address the Manager installs nothing unless its network_mode is personal_cloud (ComfyUI-Manager's security policy:
+# installs need risk level middle+). A pod is a one-off machine for one person, so installs are on by default (Adrien,
+# 5 Nov 2026); anyone with the pod's address can then install a node pack on it. The key is set before every start.
+MANAGER_CFG=$COMFY/user/__manager/config.ini
+mkdir -p "$(dirname "$MANAGER_CFG")"
+if [ ! -f "$MANAGER_CFG" ]; then
+  printf '[default]\nnetwork_mode = personal_cloud\nsecurity_level = normal\n' > "$MANAGER_CFG"
+elif grep -q '^network_mode' "$MANAGER_CFG"; then
+  sed -i 's/^network_mode *=.*/network_mode = personal_cloud/' "$MANAGER_CFG"
+else
+  printf 'network_mode = personal_cloud\n' >> "$MANAGER_CFG"
+fi
 if ! curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
   (cd $COMFY && nohup python main.py --listen 0.0.0.0 --port $PORT --enable-manager --preview-method auto \
      >> $ROOT/comfy.log 2>&1 &)
@@ -433,6 +449,12 @@ if ! curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
 fi
 if curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
   say "COMFYUI UP · $PROXY"
+  # the frontend shows the Extensions button only when the Manager reports its own flag (supports_csrf_post)
+  if curl -fs "http://127.0.0.1:$PORT/features" 2>/dev/null | grep -q supports_csrf_post; then
+    say "MANAGER ON · the Extensions button installs node packs on this pod"
+  else
+    warn "the Manager did not load, so ComfyUI shows no Extensions button: see /workspace/comfy.log"
+  fi
   # the proxy, as a browser sees it: Runpod routes <pod id>-8188 to this container
   if curl -fs --max-time 15 "$PROXY/system_stats" >/dev/null 2>&1; then
     say "PROXY OK · $PROXY answers from outside"

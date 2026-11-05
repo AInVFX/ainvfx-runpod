@@ -78,13 +78,13 @@ A profile is a set of models in [`models.json`](models.json). Join several with 
 |---|---|---|---|---|
 | `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, BiRefNet, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image and its colour and depth control | RTX 5090 (32 GB) | 118 GB | 170 GB |
 | `3d` | TRELLIS.2, Pixal3D, TripoSplat, SAM 3D Body, MoGe, BiRefNet | RTX 5090 | 32 GB | 100 GB |
-| `video` | LTX 2.5 and its IC-LoRAs (LoRAs that follow a reference video: ainvfx-fluid and LTX Ripple among them), SeedVR2 7B, RIFE | RTX PRO 6000 (96 GB) | 88 GB | 140 GB |
+| `video` | LTX 2.5 and its IC-LoRAs (LoRAs that follow a reference video: ainvfx-fluid and LTX Ripple among them), SeedVR2 7B fp16, RIFE | RTX PRO 6000 (96 GB) | 102 GB | 150 GB |
 | `train` | the two trainers ([Training a LoRA](#training-a-lora)) | RTX PRO 6000 | none at start, up to 70 GB per run | 190 GB |
 | `image+3d` | | RTX 5090 | 148 GB | 210 GB |
-| `image+video` | | RTX PRO 6000 | 206 GB | 270 GB |
+| `image+video` | | RTX PRO 6000 | 220 GB | 290 GB |
 | `image+train` | | RTX PRO 6000 | 118 GB, then up to 70 GB per run | 320 GB |
-| `video+train` | | RTX PRO 6000 | 88 GB, then up to 68 GB per run | 280 GB |
-| `all` | | RTX PRO 6000 | 236 GB, then up to 68 GB per run | 450 GB |
+| `video+train` | | RTX PRO 6000 | 102 GB, then up to 68 GB per run | 300 GB |
+| `all` | | RTX PRO 6000 | 250 GB, then up to 68 GB per run | 470 GB |
 
 A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB and never under 100 GB. With `train`, it counts the largest recipe's base files, plus 70 GB for the trainers, the caption model, caches and checkpoints. `up` computes the disk from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
 
@@ -116,6 +116,10 @@ Three ways to change a value, from the most lasting to the most temporary:
 **Your own list of models.** Copy [`models.json`](models.json) and keep its shape. In `profiles`, each profile names its entries (`@image` inside a profile means "everything of image, plus"). In `files`, each entry gives the Hugging Face `repo`, the `path` of the file in it, the `dir` under `ComfyUI/models` where it goes, its size in `gb`, and `gated: true` when the repository needs a token. Put the file where the pod can download it: a fork of this repository, a GitHub Gist (its Raw button gives the address), or a Google Drive, Dropbox or GitHub share link open to anyone with the link. Then set `AINVFX_MODELS_URL` in `settings.local.env`, or give `--models-url` for one pod. `up` reads your list before it creates the pod, and stops if the link gives a web page instead of the file. For a file needed once, the pod's terminal is enough: `cd /workspace/ComfyUI/models/<folder> && hf download <repo> <path> --local-dir .`
 
 **The repository release path.** `AINVFX_REPO_RAW` is the raw GitHub URL of this repository at the release the pod runs, for example `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/v1.2.0`. The template sets it, so you never need to. The pod takes `bootstrap.sh`, `models.json` and `train.py` from that path, so a change on `main` reaches no pod before the next release. A models list of your own needs only `AINVFX_MODELS_URL`. To run a branch or a fork, give its path: `--set AINVFX_REPO_RAW=https://raw.githubusercontent.com/<owner>/ainvfx-runpod/<branch>`.
+
+## The Manager
+
+ComfyUI's **Extensions** button opens the Manager, which installs node packs and models on the running pod. The pod turns installs on before ComfyUI starts: it sets the Manager's `network_mode` to `personal_cloud` in `ComfyUI/user/__manager/config.ini`. ComfyUI listens on every address so that Runpod's proxy can reach it, and from such an address the Manager installs nothing in its default `public` mode. A pack installed this way lives on that pod only: the next pod starts clean, and `AINVFX_CUSTOM_NODES` installs packs on every pod you start with it. Anyone who has the pod's address can also install a pack on it, so keep the address to yourself and terminate the pod after your session. The log says `MANAGER ON` once the Manager has loaded.
 
 ## The Hugging Face token
 
