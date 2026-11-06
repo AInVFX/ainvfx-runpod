@@ -110,6 +110,11 @@ class Repo(unittest.TestCase):
             if SETTINGS[key]:
                 self.assertEqual(default, SETTINGS[key], key)
 
+    def test_bootstrap_sh_states_the_release_of_pod_py(self):
+        """bootstrap.sh logs the release it belongs to: pod.py's VERSION. Both default to the branch latest."""
+        self.assertEqual(re.search(r'^TOOLKIT_VERSION="([^"]+)"', BOOTSTRAP, re.M).group(1), pod.VERSION)
+        self.assertIn("${AINVFX_REPO_RAW:-" + pod.REPO_RAW + "}", BOOTSTRAP)
+
     def test_the_readme_lists_every_setting_with_its_default(self):
         rows = {cells[0].strip("`"): cells[1] for cells in table("Your own settings")}
         self.assertEqual(sorted(rows), sorted(SETTINGS))

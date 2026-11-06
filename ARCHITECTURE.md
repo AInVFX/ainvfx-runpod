@@ -19,7 +19,7 @@ Two data files drive them: **`settings.env`** holds every choice the pod makes, 
 | Pod | A Runpod container with a GPU, rented by the second. Its container disk holds everything and is erased when the pod is terminated. |
 | Template | The public Runpod template `4i789znkrd` ("AInVFX bootcamp ComfyUI"): the container image, the ports, the environment variables and the start command. Every pod is created from it, in the browser or by `pod.py`. |
 | Release | A git tag `vX.Y.Z` of this repository. |
-| Release path | `AINVFX_REPO_RAW`: the raw GitHub URL of this repository at a release, such as `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/v1.2.0`. The template sets it, and a pod takes `bootstrap.sh`, `models.json` and `train.py` from it. |
+| Release path | `AINVFX_REPO_RAW`: the raw GitHub URL a pod takes `bootstrap.sh`, `models.json` and `train.py` from. The template names `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest`, a branch that the workflow `latest.yml` moves to each published release. |
 | Profile | A named set of model files in `models.json`: `image`, `3d`, `video`, `train`. `AINVFX_PROFILE` joins several with `+`. |
 | Training family | The base files of one kind of training (`zimage`, `qwen_edit`, `moss`, `ltx`), named by role in the `training` part of `models.json`. The first run that needs them downloads them. |
 | Recipe | One kind of LoRA in `train.py`: its training family, its data, its trainer and its settings. |
@@ -60,7 +60,7 @@ pod.py                               api.runpod.io                      start co
 
 1. **`up`** reads `settings.env`, then `settings.local.env`, then `--set`. It computes the disk from `models.json`, reads the GPU catalog, picks a machine (README, "How `up` picks a GPU") and creates the pod through REST v2 with the template and those values.
 2. It reads the host's maintenance window through GraphQL, and replaces a host under maintenance or due within 24 hours (`AINVFX_MAINT_HOURS`).
-3. The container starts. The template's start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW` (default: `main`) and runs it. If GitHub cannot be reached, it runs Runpod's own `/start.sh`, so SSH and JupyterLab still start.
+3. The container starts. The template's start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW` (the template sets the branch `latest`; the command's own fallback is `main`) and runs it. If GitHub cannot be reached, it runs Runpod's own `/start.sh`, so SSH and JupyterLab still start.
 4. **`bootstrap.sh`** runs its steps (section 6). Meanwhile `pod.py` follows Runpod's log stream (`GET /pods/{id}/logs`, Server-Sent Events). The stream can stay open without delivering the last lines, so `pod.py` reopens it every 60 seconds a few seconds back, and reads the pod's own copy of the log through the ComfyUI proxy every 15 seconds. It stops on `READY` or `FAILED`, and warns when no container has started 8 minutes after creation.
 5. The user works. **`push`** sends files to ComfyUI's `/upload/image`; with `--dataset`, through JupyterLab's contents API, in 8 MiB chunks written to a `.part` file and renamed at the end. **`pull`** walks the output folder through JupyterLab, or falls back to the files ComfyUI's history lists.
 6. **`down`** pulls, terminates, then reports the pod's cost and the credit left. Every command first forgets the records of pods gone from the account.
@@ -188,10 +188,10 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 
 ## 12. Releases and the template
 
-A release is a tag, and pods run the release the template names. A change on `main` therefore reaches no new pod until the template moves.
+A release is a tag. The template names the branch `latest`, which the workflow `.github/workflows/latest.yml` moves to each published release: new pods run the newest release, and a change on `main` reaches no pod before the next release. The template never needs an edit for a release.
 
-1. Set `VERSION` in `pod.py`. Run the tests, and the pod check of section 10 when `bootstrap.sh` or `train.py` changed.
-2. Commit, then tag and push `main` and the tag together, so that both arrive or neither does:
+1. Set `VERSION` in `pod.py` and `TOOLKIT_VERSION` in `bootstrap.sh` (the tests check that they agree). Run the tests, and the pod check of section 10 when `bootstrap.sh` or `train.py` changed.
+2. Commit, then tag and push `main` and the tag together, so that both arrive or neither does, and publish the release:
 
    ```bash
    git tag -a vX.Y.Z -m 'ainvfx-runpod X.Y.Z'
@@ -199,9 +199,9 @@ A release is a tag, and pods run the release the template names. A change on `ma
    gh release create vX.Y.Z --verify-tag --latest --title 'ainvfx-runpod X.Y.Z' --notes-file <notes>
    ```
 
-3. Move the template: set its release path, `AINVFX_REPO_RAW`, to `https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/vX.Y.Z`. Update its README field when the profiles, sizes or defaults changed (the console holds that field; the REST API does not).
+3. Publishing runs `latest.yml`. It checks that the tag, `pod.py` and `bootstrap.sh` name the same version, runs the fast tests, then points `latest` at the tag. New pods follow within about 5 minutes (GitHub's cache of raw files); the log's first line names the release. Update the template's README field when the profiles, sizes or defaults changed (the console holds that field; the REST API does not).
 
-A published tag never moves: a fix is the next patch release.
+A published tag never moves: a fix is the next patch release. Only `latest` moves. To go back to an earlier release (1.3.2 or later), run the workflow by hand: Actions, latest, Run workflow, with that tag.
 
 **The template's settings.**
 
@@ -212,7 +212,7 @@ A published tag never moves: a fix is the next patch release.
 | Container disk | 200 GB: any single profile fits; `up` sizes the disk for a combination |
 | Ports | `8188/http` (ComfyUI), `8888/http` (JupyterLab), `22/tcp` (SSH) |
 | CUDA versions | 13.0 and newer (extend the list when Runpod adds one) |
-| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.43.0`, `AINVFX_REPO_RAW=<the release path>`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
+| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.44.0`, `AINVFX_REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
 
 The start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW`, and falls back to Runpod's `/start.sh` when GitHub cannot be reached:
 

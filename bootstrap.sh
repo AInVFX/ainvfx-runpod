@@ -19,7 +19,7 @@
 #
 # Environment variables, all optional (settings.env documents them; the defaults are the course's):
 #   AINVFX_PROFILE        image · 3d · video · train, several joined by + (image+3d), or all. Default image
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.43.0
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.44.0
 #   AINVFX_PYTHON         default 3.13
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted. Default: torch torchvision torchaudio
 #   AINVFX_TORCH_INDEX    default https://download.pytorch.org/whl/cu130
@@ -54,13 +54,15 @@ if [ "$MODE" != "all" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.43.0}"
+TAG="${AINVFX_COMFY_TAG:-v0.44.0}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
-# models.json and train.py come from the folder this script came from: the release the template names, or the
-# branch or fork given in AINVFX_REPO_RAW.
-REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/main}"
+# The release this script belongs to, logged at start: pod.py's VERSION (tests/test_repo.py checks they agree).
+TOOLKIT_VERSION="1.3.2"
+# models.json and train.py come from the folder this script came from: the branch latest, which follows each
+# release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
+REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest}"
 REPO_RAW="${REPO_RAW%/}"
 MODELS_URL="${AINVFX_MODELS_URL:-$REPO_RAW/models.json}"
 CUSTOM_NODES="${AINVFX_CUSTOM_NODES:-}"
@@ -260,6 +262,7 @@ elif [ "$MODE" = "trainer" ]; then
   exit 0
 else
   say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
+  say "ainvfx-runpod $TOOLKIT_VERSION"
   say "settings: repository $REPO_RAW · torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
 fi
 

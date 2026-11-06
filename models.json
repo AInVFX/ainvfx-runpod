@@ -45,6 +45,10 @@
       "triposplat",
       "triposplat_dino_v3_vit_h",
       "triposplat_vae_decoder",
+      "idol",
+      "idol_decoder",
+      "idol_dino_v3_vit_h",
+      "moss_image_vae",
       "sam_3d_body",
       "rt_detr_v4",
       "sam3_1"
@@ -78,7 +82,6 @@
       "ltx23_iclora_relight",
       "ltx25_iclora_sdr_to_hdr",
       "ltx25_sdr_to_hdr_scene_embedding",
-      "ltx23_iclora_dubit",
       "seedvr2_7b_fp16",
       "rife"
     ],
@@ -377,13 +380,6 @@
       "gb": 0.01,
       "gated": true
     },
-    "ltx23_iclora_dubit": {
-      "repo": "Lightricks/LTX-2.3-22b-IC-LoRA-DubIt",
-      "path": "ltx-2.3-22b-ic-lora-dubit-0.9.safetensors",
-      "dir": "loras",
-      "gb": 2.47,
-      "gated": true
-    },
     "rife": {
       "repo": "Comfy-Org/frame_interpolation",
       "path": "frame_interpolation/rife_v4.26.safetensors",
@@ -475,6 +471,24 @@
       "path": "vae/triposplat_vae_decoder_fp16.safetensors",
       "dir": "vae",
       "gb": 0.58
+    },
+    "idol": {
+      "repo": "Comfy-Org/Idol",
+      "path": "diffusion_models/idol_fp16.safetensors",
+      "dir": "diffusion_models",
+      "gb": 0.74
+    },
+    "idol_decoder": {
+      "repo": "Comfy-Org/Idol",
+      "path": "vae/idol_decoder_fp16.safetensors",
+      "dir": "vae",
+      "gb": 0.58
+    },
+    "idol_dino_v3_vit_h": {
+      "repo": "Comfy-Org/Idol",
+      "path": "clip_vision/dino_v3_vit_h_bf16.safetensors",
+      "dir": "clip_vision",
+      "gb": 1.68
     },
     "sam_3d_body": {
       "repo": "Comfy-Org/sam-3d-body",
