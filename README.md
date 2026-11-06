@@ -78,13 +78,13 @@ A profile is a set of models in [`models.json`](models.json). Join several with 
 |---|---|---|---|---|
 | `image` | Z-Image, Qwen-Image-Edit, ControlNet, SAM 3.1, BiRefNet, SeedVR2, the Qwen-Image-2512 panorama set, FLUX 3 Image Klein, MOSS-Image and its colour and depth control | RTX 5090 (32 GB) | 118 GB | 170 GB |
 | `3d` | TRELLIS.2, Pixal3D, TripoSplat and Idol, SAM 3D Body, MoGe, BiRefNet | RTX 5090 | 36 GB | 100 GB |
-| `video` | LTX 2.5 and its IC-LoRAs (LoRAs that follow a reference video: ainvfx-fluid and LTX Ripple among them), SeedVR2 7B fp16, RIFE | RTX PRO 6000 (96 GB) | 100 GB | 150 GB |
+| `video` | LTX 2.5 and its IC-LoRAs (LoRAs that follow a reference video: ainvfx-fluid and LTX Ripple among them), SeedVR2 7B fp16, RIFE | RTX PRO 6000 (96 GB) | 102 GB | 150 GB |
 | `train` | the two trainers ([Training a LoRA](#training-a-lora)) | RTX PRO 6000 | none at start, up to 70 GB per run | 190 GB |
 | `image+3d` | | RTX 5090 | 152 GB | 210 GB |
-| `image+video` | | RTX PRO 6000 | 218 GB | 290 GB |
+| `image+video` | | RTX PRO 6000 | 220 GB | 290 GB |
 | `image+train` | | RTX PRO 6000 | 118 GB, then up to 70 GB per run | 320 GB |
-| `video+train` | | RTX PRO 6000 | 100 GB, then up to 68 GB per run | 300 GB |
-| `all` | | RTX PRO 6000 | 251 GB, then up to 68 GB per run | 470 GB |
+| `video+train` | | RTX PRO 6000 | 102 GB, then up to 68 GB per run | 300 GB |
+| `all` | | RTX PRO 6000 | 254 GB, then up to 68 GB per run | 480 GB |
 
 A combination rents the GPU of its largest profile. The disk is 115% of the models plus 30 GB for the environment, rounded up to 10 GB and never under 100 GB. With `train`, it counts the largest recipe's base files, plus 70 GB for the trainers, the caption model, caches and checkpoints. `up` computes the disk from the list the pod will download, yours included, and prints it before it creates anything; `--disk` overrides it.
 
