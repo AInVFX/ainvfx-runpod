@@ -11,7 +11,7 @@ carry their time as id, a `since` cursor is exclusive at one-second resolution, 
 keepalives, and the lines after SELFTEST OK never arrive on a live connection (only a fresh request serves
 them). Each test's docstring names the incident it reproduces.
 """
-import base64, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
+import base64, itertools, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -20,6 +20,23 @@ ROOT = os.path.dirname(HERE)
 POD_PY = os.path.join(ROOT, "pod.py")
 sys.path.insert(0, ROOT)
 import pod  # noqa: E402  (the module under test; importing it has no side effect)
+
+# No size of the course's models.json is written in these tests: the list changes with every release. The disk rule is
+# tested on RULE_MODELS, a fixed list whose expected disks are worked out by hand (Helpers.test_the_disk_rule); the
+# end-to-end tests compare what `up` prints with profile_spec on the list it reads (expected_disk_line); test_repo
+# checks the README's Profiles table against models.json.
+RULE_MODELS = {
+    "profiles": {"image": ["a", "shared"], "3d": ["small"], "video": ["v", "shared"], "train": []},
+    "files": {"a": {"gb": 100}, "shared": {"gb": 20}, "small": {"gb": 5}, "v": {"gb": 60}, "t1": {"gb": 30}, "t2": {"gb": 40}},
+    "training": {"one": {"model": "t1", "vae": "shared"}, "two": {"model": "t2"}},
+}
+
+
+def expected_disk_line(profiles, models=None):
+    """The line `up` prints for these profiles and the disk it asks Runpod for, from the models list it reads."""
+    spec = pod.profile_spec(profiles, models)
+    return ("profile {}: about {} GB of models, a {} GB container disk".format(spec["label"], spec["gb"], spec["disk"]),
+            spec["disk"])
 BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
     (0, "[AINVFX] bootstrap start · profile image · ComfyUI v0.39.0"),
     (0, "[AINVFX] no HF_TOKEN: the gated files (LTX, video sessions) will be skipped; the image models need none"),
@@ -705,23 +722,51 @@ class Helpers(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_combined_profiles(self):
-        """Atomic profiles that combine. The disk follows the models, the GPU the
-        profile that needs the most VRAM; `all` is every profile; an unknown profile is refused."""
+        """Atomic profiles that combine. The GPU follows the profile that needs the most VRAM (the disk: test_the_disk_rule);
+        `all` is every profile; an unknown profile is refused."""
         self.assertEqual(pod.parse_profiles("image"), ["image"])
         self.assertEqual(pod.parse_profiles("3d+image"), ["image", "3d"])
         self.assertEqual(pod.parse_profiles("image, video,train"), ["image", "video", "train"])
         self.assertEqual(pod.parse_profiles("all"), ["image", "3d", "video", "train"])
-        self.assertEqual(pod.profile_spec(["image"])["disk"], 170)   # follows models.json
         self.assertEqual(pod.profile_spec(["image"])["gpu"], "NVIDIA GeForce RTX 5090")
-        self.assertEqual(pod.profile_spec(["3d"])["disk"], 100, "never under 100 GB")
         self.assertEqual(pod.profile_spec(["image", "3d"])["gpu"], "NVIDIA GeForce RTX 5090")
         self.assertEqual(pod.profile_spec(["image", "video"])["gpu"], "NVIDIA RTX PRO 6000 Blackwell Server Edition")
         self.assertEqual(pod.profile_spec(["image", "video"])["vram"], 96)
-        self.assertEqual(pod.profile_spec(["video", "train"])["disk"], 280)   # the LTX VAEs counted once
-        spec = pod.profile_spec(["image", "3d", "video", "train"])
-        self.assertEqual((spec["label"], spec["disk"]), ("image+3d+video+train", 450))
+        self.assertEqual(pod.profile_spec(["image", "3d", "video", "train"])["label"], "image+3d+video+train")
         with self.assertRaises(SystemExit):
             pod.parse_profiles("nope+3d")
+
+    def test_the_disk_rule(self):
+        """115% of the models plus 30 GB, rounded up to 10 GB, never under 100 GB. A file in two profiles counts once.
+        With train: the largest family of training files, less the files the profiles already hold, and 70 GB more.
+        On RULE_MODELS, whose sizes never change: each expected value is worked out in its comment."""
+        def spec(*names, models=RULE_MODELS):
+            s = pod.profile_spec(list(names), models)
+            return s["gb"], s["disk"]
+        self.assertEqual(spec("image"), (120, 170))            # 100 + 20 = 120; 120 x 1.15 + 30 = 168, rounded up to 170
+        self.assertEqual(spec("3d"), (5, 100))                 # 5 x 1.15 + 30 = 35.75: never under 100
+        self.assertEqual(spec("image", "video"), (180, 240))   # `shared` once: 180 x 1.15 + 30 = 237 -> 240 (twice: 260)
+        self.assertEqual(spec("train"), (50, 160))             # family one, 30 + 20 = 50: 57.5 + 30 + 70 = 157.5 -> 160
+        self.assertEqual(spec("video", "train"), (120, 240))   # 80, then family two, 40 (one less `shared` is 30): 238 -> 240
+        self.assertEqual(spec("image", "3d", "video", "train"), (225, 360))   # 185 + 40: 258.75 + 100 = 358.75 -> 360
+        self.assertEqual(spec("image", models=dict(RULE_MODELS, training={})), spec("image"), "training files count only with train")
+        inc = dict(RULE_MODELS, profiles=dict(RULE_MODELS["profiles"], video=["@image", "v"]))
+        self.assertEqual(spec("video", models=inc), (180, 240), "@image includes the image profile")
+        self.assertEqual(spec("image", "video", models=inc), (180, 240), "an included file counts once")
+        self.assertEqual(pod.TRAIN_RESERVE_GB, 70, "the reserve README.md states")
+
+    def test_every_combination_of_the_real_list(self):
+        """The course's models.json, with no size written here: every disk is a multiple of 10 and at least 100 GB,
+        and a combination needs at least the disk of each of its profiles and at most their sum."""
+        names = list(pod.PROFILE_ORDER)
+        for n in range(1, len(names) + 1):
+            for combo in itertools.combinations(names, n):
+                disk = pod.profile_spec(list(combo))["disk"]
+                parts = [pod.profile_spec([p])["disk"] for p in combo]
+                self.assertEqual(disk % 10, 0, combo)
+                self.assertGreaterEqual(disk, 100, combo)
+                self.assertGreaterEqual(disk, max(parts), combo)
+                self.assertLessEqual(disk, sum(parts), combo)
 
     def test_history_files_takes_every_key_but_temp(self):
         """The 3D saves report under "3d"; temp previews and non-file values are left out; one entry per file."""
@@ -763,9 +808,11 @@ class Helpers(unittest.TestCase):
 
     def test_training_room_on_the_disk(self):
         """`train` downloads nothing at start; its disk holds the largest family of training files and the reserve."""
-        spec = pod.profile_spec(["train"])
-        self.assertEqual((spec["gb"], spec["disk"], spec["vram"]), (70, 190, 96))
-        self.assertEqual(pod.profile_spec(["image"])["disk"], 170, "the other profiles do not change")
+        spec = pod.profile_spec(["train"], RULE_MODELS)
+        self.assertEqual((spec["gb"], spec["disk"], spec["vram"]), (50, 160, 96))
+        models = pod.read_models()
+        largest = max(sum(models["files"][k]["gb"] for k in set(fam.values())) for fam in models["training"].values())
+        self.assertEqual(pod.profile_spec(["train"])["gb"], round(largest), "the course's list: its largest family")
 
     def test_profiles(self):
         self.assertEqual(sorted(pod.PROFILES), ["3d", "image", "train", "video"])
@@ -1121,8 +1168,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(STATE["posts"]), 0, "nothing created")
         out, rc = self.run_pod("up", "image", "--models-url", base + "zimage.json", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn("profile image: about 18 GB of models, a 100 GB container disk", out, out)
-        self.assertEqual(STATE["posts"][0].get("disk"), 100, out)
+        line, disk = expected_disk_line(["image"], lst)
+        self.assertIn(line, out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), disk, out)
+        self.assertLess(disk, pod.profile_spec(["image"])["disk"], "the disk follows your list, not the course's")
         self.assertIn("READY", out, out)
         self.run_pod("down", "-y", "--no-pull")
 
@@ -1151,8 +1200,9 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image+3d", "-y", "--wait", "1", timeout=90)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn("profile image+3d: about 148 GB of models, a 210 GB container disk", out, out)
-        self.assertEqual(STATE["posts"][0].get("disk"), 210, out)
+        line, disk = expected_disk_line(["image", "3d"])
+        self.assertIn(line, out, out)
+        self.assertEqual(STATE["posts"][0].get("disk"), disk, out)
         self.assertEqual((STATE["posts"][0].get("env") or {}).get("AINVFX_PROFILE"), "image+3d", out)
         self.assertEqual(STATE["posts"][0]["gpu"]["id"], "NVIDIA GeForce RTX 5090", out)
         self.assertIn("READY", out, out)
@@ -1168,7 +1218,8 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
-        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a 170 GB disk, billed from creation? [Y/n]", out, out)
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a {} GB disk, billed from creation? [Y/n]".format(
+            pod.profile_spec(["image"])["disk"]), out, out)
         self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
         self.assertIn("READY", out, out)

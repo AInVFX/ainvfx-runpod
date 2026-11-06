@@ -163,7 +163,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 
 | Module | What it proves | Needs |
 |---|---|---|
-| `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and disks, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
+| `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
 | `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
 | `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py` | Python 3.8 or newer (`sed` for the last test) |
 
@@ -178,7 +178,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 
 ## 11. How to make common changes
 
-- **Add a model to a profile.** Add the file to `files` in `models.json` (repo, path, folder, the size read on Hugging Face, `gated` when needed), then name it in the profile. Update README's Profiles table with the sizes that `test_repo.py` reports.
+- **Add a model to a profile.** Add the file to `files` in `models.json` (repo, path, folder, the size read on Hugging Face, `gated` when needed), then name it in the profile. Then run `python3 tests/readme_profiles.py`: it rewrites the sizes and disks of README's Profiles table from `models.json`, and you commit both files together. No test holds a size of `models.json`: the disk rule is tested on a fixed list of its own.
 - **Add a profile.** `profiles` in `models.json`, `PROFILES` and `PROFILE_ORDER` in `pod.py` (its memory and GPU), and a row in README's Profiles table.
 - **Move the default ComfyUI version.** `settings.env`, the default in `bootstrap.sh` and README's settings table (the tests check all three), then the template's `AINVFX_COMFY_TAG`. Run the course files on a pod first.
 - **Add a setting.** A commented line in `settings.env`, its default in `bootstrap.sh`, a row in README's settings table.

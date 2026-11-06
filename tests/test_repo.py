@@ -29,6 +29,7 @@ def read(name):
 MODELS = json.loads(read("models.json"))
 BOOTSTRAP = read("bootstrap.sh")
 README = read("README.md")
+FIX = ": run python3 tests/readme_profiles.py, then commit README.md with models.json"
 SETTINGS = dict(re.findall(r"^(AINVFX_\w+)=(.*)$", read("settings.env"), re.M))   # every key, empty ones included
 
 
@@ -94,11 +95,11 @@ class Repo(unittest.TestCase):
             profiles = pod.parse_profiles(label)
             spec, keys = pod.profile_spec(profiles, MODELS), keys_of(profiles)
             start = round(gb(keys))
-            self.assertIn("{} GB".format(start) if start else "none at start", cells[-2], label)
+            self.assertIn("{} GB".format(start) if start else "none at start", cells[-2], label + FIX)
             if "train" in profiles:
                 per_run = round(max(gb(set(fam.values()) - set(keys)) for fam in MODELS["training"].values()))
-                self.assertIn("up to {} GB per run".format(per_run), cells[-2], label)
-            self.assertEqual(cells[-1], "{} GB".format(spec["disk"]), label)
+                self.assertIn("up to {} GB per run".format(per_run), cells[-2], label + FIX)
+            self.assertEqual(cells[-1], "{} GB".format(spec["disk"]), label + FIX)
             self.assertIn("5090" if "5090" in spec["gpu"] else "PRO 6000", cells[2], label)
 
     def test_settings_env_and_bootstrap_sh_have_the_same_defaults(self):
