@@ -10,7 +10,7 @@ ainvfx-runpod sets up ComfyUI and its models on a rented Runpod GPU, then termin
 - **`bootstrap.sh`** runs on the pod, as the container's start command. It installs ComfyUI, downloads the models, installs the trainers and renders a test image.
 - **`train.py`** runs on the pod, as the `train` command. It trains LoRAs in the background, with musubi-tuner or sd-scripts.
 
-Two data files drive them: **`settings.env`** holds every choice the pod makes, and **`models.json`** lists every model file, grouped in profiles and training families.
+Three data files drive them: **`settings.env`** holds every choice the pod makes, **`models.json`** lists every model file, grouped in profiles and training families, and **`custom_nodes.json`** lists the custom nodes each profile installs.
 
 ## 2. Words used here and in the code
 
@@ -58,7 +58,7 @@ pod.py                               api.runpod.io                      start co
 
 ## 5. The life of a pod
 
-1. **`up`** reads `settings.env`, then `settings.local.env`, then `--set`. It computes the disk from `models.json`, reads the GPU catalog, picks a machine (README, "How `up` picks a GPU") and creates the pod through REST v2 with the template and those values.
+1. **`up`** reads `settings.env`, then `settings.local.env`, then `--set`. It reads `models.json` and `custom_nodes.json` where the pod will (`AINVFX_REPO_RAW`): the profiles it accepts, the disk, the custom nodes it announces. It reads the GPU catalog, proposes a machine and numbers the others in stock (README, "How `up` picks a GPU") and creates the pod through REST v2 with the template and those values.
 2. It reads the host's maintenance window through GraphQL, and replaces a host under maintenance or due within 24 hours (`AINVFX_MAINT_HOURS`).
 3. The container starts. The template's start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW` (the template sets the branch `latest`; the command's own fallback is `main`) and runs it. If GitHub cannot be reached, it runs Runpod's own `/start.sh`, so SSH and JupyterLab still start.
 4. **`bootstrap.sh`** runs its steps (section 6). Meanwhile `pod.py` follows Runpod's log stream (`GET /pods/{id}/logs`, Server-Sent Events). The stream can stay open without delivering the last lines, so `pod.py` reopens it every 60 seconds a few seconds back, and reads the pod's own copy of the log through the ComfyUI proxy every 15 seconds. It stops on `READY` or `FAILED`, and warns when no container has started 8 minutes after creation.
@@ -71,7 +71,7 @@ pod.py                               api.runpod.io                      start co
 |---|---|---|
 | 0 | Runpod's `/start.sh` in the background: SSH and JupyterLab. Skipped when JupyterLab already runs (a second run on a live pod) | |
 | 1 | Health check: the GPU, its memory and driver (580 or newer), CPU, RAM, free disk, disk write and read speed (`AINVFX_HEALTHCHECK`) | `WARNING` on a bad value |
-| 2 | uv, Python `AINVFX_PYTHON` in `/workspace/venv`, PyTorch from `AINVFX_TORCH_INDEX` (PyPI as a second route for stable CUDA 13.0), ComfyUI at `AINVFX_COMFY_TAG` (git init and a shallow fetch, so a folder that already holds models works), its requirements and the Manager's, `huggingface_hub`, the custom nodes of `AINVFX_CUSTOM_NODES`, then a PyTorch check on the GPU | `FAILED` when Python, PyTorch or ComfyUI cannot work |
+| 2 | uv, Python `AINVFX_PYTHON` in `/workspace/venv`, PyTorch from `AINVFX_TORCH_INDEX` (PyPI as a second route for stable CUDA 13.0), ComfyUI at `AINVFX_COMFY_TAG` (git init and a shallow fetch, so a folder that already holds models works), its requirements and the Manager's, `huggingface_hub`, the custom nodes (those `custom_nodes.json` lists for the profile, then `AINVFX_CUSTOM_NODES`), then a PyTorch check on the GPU | `FAILED` when Python, PyTorch or ComfyUI cannot work |
 | 3 | ComfyUI on port 8188, then one request through the public proxy | `COMFYUI UP`, `PROXY OK` |
 | 4 | The models plan: every file of the profile with its state (to download, present, gated without a token, waiting for a licence, moved). Then each file through `hf download` into a staging folder, moved into place when complete, with the time left | `MODELS DONE`, `WAITING`, `SKIPPED` |
 | 4b | With `train`: both trainers, the fork's sampling fix, `train.py` and the `train` command (section 7) | `TRAINERS OK` |
@@ -129,11 +129,11 @@ On the pod:
 | Part | Main functions | Notes |
 |---|---|---|
 | Constants | `VERSION`, `TEMPLATE_ID`, `PROFILES`, the `AINVFX_*` tuning numbers | Every delay and limit can be changed by an environment variable, which the tests use |
-| Settings and models | `read_env_file`, `load_settings`, `parse_profiles`, `read_models`, `profile_spec` | `profile_spec` sizes the disk |
+| Settings and models | `read_env_file`, `load_settings`, `parse_profiles`, `fetch_json`, `read_models`, `read_nodes`, `profile_names`, `profile_nodes`, `profile_spec` | `profile_names` adds `train` to a list's profiles; `profile_spec` sizes the disk |
 | Config and records | `load_config`, `save_config`, `restrict`, `remember_pod` | `restrict` makes the config file private, on Windows too |
 | HTTP | `request`, `rp` (REST v2), `graphql`, `ApiError` | A 429 is retried five times (Retry-After, or 2 to 32 seconds) |
 | Pods and names | `get_pod`, `list_pods`, `which_pod`, `forget_gone`, `named_for` | A name matches exactly |
-| GPU choice | `read_catalogs`, `make_offers`, `fits_profile`, `pick_candidates`, `wait_for_stock` | `--retry` reads the catalog every 15 seconds |
+| GPU choice | `read_catalogs`, `make_offers`, `fits_profile`, `pick_candidates`, `alternatives`, `show_offers`, `choose`, `wait_for_stock` | `choose` takes the proposed GPU or another by its number; `--retry` reads the catalog every 15 seconds |
 | Host and money | `pod_machine`, `maintenance_of`, `host_check`, `account_money` | The two GraphQL reads |
 | Logs | `log_stream`, `follow_logs`, `ImagePull` | `ImagePull` turns Docker's layer lines into one progress line |
 | Creation | `create_pod`, `try_create` | |
@@ -143,7 +143,7 @@ On the pod:
 
 ### `bootstrap.sh`, in file order
 
-The header (steps, variables, modes), then the settings and paths, the helpers (`say`, `warn`, `fail`, `hold`, `uvi`, `install_torch`, `hf_state`, `access_summary`), the trainers (`install_repo`, `patch_fork`, `install_trainers`, with their pins), the modes (`models`, `trainer`), the token check, steps 0 to 5, and `READY`.
+The header (steps, variables, modes), then the settings and paths, the helpers (`say`, `warn`, `fail`, `hold`, `uvi`, `install_torch`, `hf_state`, `access_summary`), the trainers (`install_repo`, `patch_fork`, `install_trainers`, with their pins), the modes (`models`, `trainer`), the token check, steps 0 to 5 (step 2 reads `custom_nodes.json` before its install marker), and `READY`.
 
 ### `train.py`, in file order
 
@@ -151,7 +151,8 @@ The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION
 
 ### Data files
 
-- **`models.json`**: `profiles` (lists of file keys; `@name` includes another profile), `training` (per family, a file key per role), `files` (per key: `repo`, `path`, `dir` under `ComfyUI/models`, `gb`, and `gated` when the repository needs a token).
+- **`custom_nodes.json`**: per profile name, the git URLs of its custom nodes; `_about` documents the file.
+- **`models.json`**: `profiles` (lists of file keys; `@name` includes another profile; `train` is not one: it installs the trainers), `training` (per family, a file key per role), `files` (per key: `repo`, `path`, `dir` under `ComfyUI/models`, `gb`, and `gated` when the repository needs a token).
 - **`settings.env`**: one commented `AINVFX_*` line per setting. An empty value means the template's value, or `bootstrap.sh`'s default.
 
 ## 10. Tests
@@ -165,7 +166,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 |---|---|---|
 | `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
 | `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
-| `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py` | Python 3.8 or newer (`sed` for the last test) |
+| `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py`, `custom_nodes.json` names known profiles, `bootstrap.sh` installs the custom nodes `pod.py` announces | Python 3.8 or newer (`sed` for the last test) |
 
 **CI** (`.github/workflows/tests.yml`) runs on every push and pull request: pyflakes, shellcheck and vermin; the whole suite on Python 3.12 and 3.14; the pod and repository tests on Python 3.8.
 
@@ -179,7 +180,8 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 ## 11. How to make common changes
 
 - **Add a model to a profile.** Add the file to `files` in `models.json` (repo, path, folder, the size read on Hugging Face, `gated` when needed), then name it in the profile. Then run `python3 tests/readme_profiles.py`: it rewrites the sizes and disks of README's Profiles table from `models.json`, and you commit both files together. No test holds a size of `models.json`: the disk rule is tested on a fixed list of its own.
-- **Add a profile.** `profiles` in `models.json`, `PROFILES` and `PROFILE_ORDER` in `pod.py` (its memory and GPU), and a row in README's Profiles table.
+- **Add a profile.** `profiles` in `models.json`, and its custom nodes in `custom_nodes.json` when it needs any. A course profile also takes `PROFILES` and `PROFILE_ORDER` in `pod.py` (its memory and GPU) and a row in README's Profiles table; a profile in a fork needs no code: `up` accepts it and rents the image profile's GPU.
+- **Add a custom node to a profile.** Its git URL under the profile's name in `custom_nodes.json`. Run the course files that need it on a pod first.
 - **Move the default ComfyUI version.** `settings.env`, the default in `bootstrap.sh` and README's settings table (the tests check all three), then the template's `AINVFX_COMFY_TAG`. Run the course files on a pod first.
 - **Add a setting.** A commented line in `settings.env`, its default in `bootstrap.sh`, a row in README's settings table.
 - **Add a recipe.** An entry in `RECIPES`, a training family in `models.json` when it needs new base files, a fake script in `test_train.py` when it calls a new training script, and a row in README's recipe table.
@@ -227,5 +229,5 @@ The variable appears once, so the command works whether Runpod runs it directly 
 - **GraphQL, for two reads.** `pod.py` reads the pod's host with its maintenance window (`MACHINE_QUERY`) and the account's credit (`MONEY_QUERY`) through Runpod's GraphQL API, because REST v2 offers neither: its specification (`https://api.runpod.io/v2/openapi.json`, version 2.0.0, read on 29 October 2026) has no maintenance window, no balance and no spend rate. Runpod's own CLI shows the same GraphQL fields (`clientBalance`, `currentSpendPerHr` in `runpodctl user`). Runpod deprecates GraphQL for integrators in early 2027. When GraphQL stops answering, `pod.py` keeps working: `up` skips the host check and the credit line, and `test_up_and_down_work_without_graphql` proves it. Move both reads to REST v2 once Runpod adds them there.
 - **The `moss` recipe** follows sd-scripts' MOSS-Image guide and has not yet run on a pod.
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
-- **Custom nodes are not pinned.** `AINVFX_CUSTOM_NODES` clones each node's default branch at its latest commit.
+- **Custom nodes are not pinned.** `custom_nodes.json` and `AINVFX_CUSTOM_NODES` clone each node's default branch at its latest commit.
 - **The pod's address is its only protection.** ComfyUI has no login, and the log it serves holds JupyterLab's token. ComfyUI's own origin check refuses a click from another site, which is why the console's Connect button can show an empty 403 page: kept on purpose.

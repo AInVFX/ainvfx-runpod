@@ -46,7 +46,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest"   # the branch that follows each release
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -97,6 +97,12 @@ PROFILES = {
     "train": dict(vram=96, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
 PROFILE_ORDER = ["image", "3d", "video", "train"]
+# A profile of a models list of your own (a fork, --models-url) that PROFILES does not name rents the image profile's GPU.
+OTHER_PROFILE = dict(vram=32, gpu="NVIDIA GeForce RTX 5090")
+# Beside the GPUs that fit the profile, `up` offers a few others in stock, created only when you choose one by number:
+# whole GPUs with ALT_MIN_VRAM GB or more (an RTX 5090 for video), Blackwell or newer first, then cheapest, ALT_ROWS at most.
+ALT_MIN_VRAM = 32
+ALT_ROWS = 6
 # `up` picks on its own only a Blackwell GPU or newer, and never a 1g MIG slice (the smallest share of a
 # bigger GPU: one ran the self-test in 111 s against 16 s on an RTX 5090). `--gpu` still takes any GPU.
 NEWER_GPU = re.compile(r"blackwell|rubin|\brtx [5-9]0[5-9]0\b|\bg?b[1-9]00\b|\bv?r[1-9]00\b", re.I)
@@ -202,16 +208,20 @@ def load_settings():
     return values
 
 
-def parse_profiles(text):
-    """`image`, `image+3d`, `image,video,train` or `all` -> the profiles in PROFILE_ORDER, no duplicate."""
+def parse_profiles(text, names=None):
+    """`image`, `image+3d`, `image,video,train` or `all` -> the profiles named, no duplicate, in order: the course's
+    first (PROFILE_ORDER), then the others of the models list. `names` are the profiles of that list; default the
+    course's four."""
+    names = names or PROFILE_ORDER
+    order = [p for p in PROFILE_ORDER if p in names] + [p for p in names if p not in PROFILE_ORDER]
     parts = [p.strip().lower() for p in re.split(r"[+,\s]+", (text or "image").strip()) if p.strip()]
     if "all" in parts:
-        return list(PROFILE_ORDER)
-    unknown = [p for p in parts if p not in PROFILES]
+        return order
+    unknown = [p for p in parts if p not in order]
     if unknown:
         die("unknown profile(s): {}. Known: {}, joined by + (image+3d), or all.".format(
-            ", ".join(unknown), ", ".join(PROFILE_ORDER)))
-    return [p for p in PROFILE_ORDER if p in parts]
+            ", ".join(unknown), ", ".join(order)))
+    return [p for p in order if p in parts]
 
 
 def direct_url(url):
@@ -224,16 +234,21 @@ def direct_url(url):
     return re.sub(r"(dropbox\.com/.*[?&])dl=0\b", r"\1dl=1", url)
 
 
+def fetch_json(url):
+    """The JSON file at `url`, as the pod reads it: the copy next to this script for the course's release, else
+    downloaded (a share link works)."""
+    local = HERE / url.rsplit("/", 1)[-1]
+    if url.startswith(REPO_RAW + "/") and local.is_file():
+        return json.loads(local.read_text(encoding="utf-8"))
+    req = urllib.request.Request(direct_url(url), headers={"User-Agent": "ainvfx-runpod/" + VERSION})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def read_models(url=DEFAULT_MODELS_URL):
     """The list the pod will download: the copy next to this script for the course's list, else fetched."""
     try:
-        local = HERE / "models.json"
-        if url == DEFAULT_MODELS_URL and local.is_file():
-            data = json.loads(local.read_text(encoding="utf-8"))
-        else:
-            req = urllib.request.Request(direct_url(url), headers={"User-Agent": "ainvfx-runpod/" + VERSION})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode("utf-8"))
+        data = fetch_json(url)
         if not (isinstance(data, dict) and isinstance(data.get("profiles"), dict) and isinstance(data.get("files"), dict)):
             raise ValueError("no profiles and files")
         return data
@@ -245,13 +260,40 @@ def read_models(url=DEFAULT_MODELS_URL):
         "share link to the file.".format(url, why))
 
 
+def read_nodes(url):
+    """{profile: custom node URLs} from a custom_nodes.json; none when the file is missing or not one (a fork of an
+    older release): the pod then installs the same, nothing but AINVFX_CUSTOM_NODES."""
+    try:
+        data = fetch_json(url)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, list)}
+
+
+def profile_names(models):
+    """The profiles `up` accepts with this models list: its own, and train, which installs the trainers. No list names
+    train: each run downloads the base files of its training family."""
+    return list(models["profiles"]) + ([] if "train" in models["profiles"] else ["train"])
+
+
+def profile_nodes(profiles, nodes):
+    """The custom nodes of one or several profiles: those `nodes` (custom_nodes.json) lists under each name, each once,
+    as bootstrap.sh installs them."""
+    out = []
+    for p in profiles:
+        out += [url for url in nodes.get(p, []) if url not in out]
+    return out
+
+
 def profile_spec(profiles, models=None):
     """disk, vram, gpu, the size of the models (GB) and the label (`image+3d`) for one or several profiles.
     The disk is 115% of the models plus 30 GB for the environment, rounded up to 10, never under 100. With `train`,
     the models include the largest family of training base files (a run downloads its own), and the disk
     TRAIN_RESERVE_GB more."""
     models = models or read_models()
-    missing = [p for p in profiles if p not in models["profiles"]]
+    missing = [p for p in profiles if p not in profile_names(models)]
     if missing:
         die("the models list has no profile {} (it has: {}).".format(", ".join(missing), ", ".join(models["profiles"])))
     keys = []
@@ -272,8 +314,9 @@ def profile_spec(profiles, models=None):
     gb = sum(models["files"][k].get("gb") or 0 for k in keys)
     gb += max([sum(models["files"][k].get("gb") or 0 for k in set(fam.values()) - set(keys))
                for fam in training.values()] or [0])
-    vram = max(PROFILES[p]["vram"] for p in profiles)
-    gpu = next(PROFILES[p]["gpu"] for p in profiles if PROFILES[p]["vram"] == vram)
+    gpus = [PROFILES.get(p, OTHER_PROFILE) for p in profiles]
+    vram = max(g["vram"] for g in gpus)
+    gpu = next(g["gpu"] for g in gpus if g["vram"] == vram)
     disk = max(100, int(-(-(gb * 1.15 + 30 + (TRAIN_RESERVE_GB if "train" in profiles else 0)) // 10) * 10))
     return dict(disk=disk, vram=vram, gpu=gpu, gb=round(gb), label="+".join(profiles))
 
@@ -790,14 +833,54 @@ def offer_line(o):
         o["name"], o["vram"], fmt_money(o["price"]), o["cloud"].title(), offer_where(o))
 
 
-def show_offers(offers, pick, max_price):
-    """The table of GPUs in stock that fit the profile, cheapest first; `>` marks the one `up` will create."""
-    say("     {:<18} {:>6}  {:>9}  {:<9}  {}".format("GPU", "VRAM", "per hour", "cloud", "in stock in"))
-    for o in offers:
-        note = "   (above {}: only with --gpu)".format(fmt_money(max_price)) if o["price"] > max_price else ""
-        say("   {} {:<18} {:>3} GB  {:>9}  {:<9}  {}{}".format(
-            ">" if o is pick else " ", o["name"][:18], o["vram"], fmt_money(o["price"]), o["cloud"].title(),
-            offer_where(o), note))
+def alternatives(offers, exclude):
+    """The GPUs `up` offers beside those that fit: whole GPUs (never a 1g MIG slice) with ALT_MIN_VRAM GB or more,
+    none of the ids in `exclude`, one row per GPU type, Blackwell or newer first, then cheapest (Secure first at
+    the same price), ALT_ROWS at most."""
+    rows, seen = [], set(exclude)
+    for o in sorted(offers, key=lambda o: (not o["newer"], o["price"], o["cloud"] != "SECURE")):
+        if o["id"] not in seen and not o["slice"] and o["vram"] >= ALT_MIN_VRAM:
+            seen.add(o["id"])
+            rows.append(o)
+    return rows[:ALT_ROWS]
+
+
+def show_offers(rows, fit_count, pick, spec, max_price):
+    """The GPUs in stock, numbered for the prompt: the first `fit_count` fit the profile, cheapest first; the others
+    are alternatives, each with what keeps `up` from taking it on its own. `>` marks the GPU `up` proposes."""
+    say("      #  {:<18} {:>6}  {:>9}  {:<9}  {}".format("GPU", "VRAM", "per hour", "cloud", "in stock in"))
+    for n, o in enumerate(rows, 1):
+        if n == fit_count + 1:
+            say("   Also in stock, created only if you choose it:")
+        why = []
+        if n > fit_count and o["vram"] < spec["vram"]:
+            why.append("below {} GB of VRAM".format(spec["vram"]))
+        if n > fit_count and not o["newer"]:
+            why.append("not Blackwell: untested with the course's models")
+        if o["price"] > max_price:
+            why.append("above {}{}".format(fmt_money(max_price), ": by number or --gpu" if n <= fit_count else ""))
+        say("   {} {:>2}  {:<18} {:>3} GB  {:>9}  {:<9}  {}{}".format(
+            ">" if o is pick else " ", n, o["name"][:18], o["vram"], fmt_money(o["price"]), o["cloud"].title(),
+            offer_where(o), "   ({})".format("; ".join(why)) if why else ""))
+
+
+def choose(question, rows, default, yes=False):
+    """The offer answered at a prompt: Enter or y takes `default` (None: nothing), n takes nothing, a number takes
+    that row of the table. --yes takes `default` without asking; no answer at all (no terminal) takes nothing."""
+    while True:
+        if yes:
+            return default
+        try:
+            answer = input(question).strip().lower()
+        except EOFError:
+            return None
+        if answer in ("", "y", "yes"):
+            return default
+        if answer in ("n", "no"):
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(rows):
+            return rows[int(answer) - 1]
+        say("   Answer Enter, n{}.".format(", or a number from 1 to {}".format(len(rows)) if rows else ""))
 
 
 def gpu_report(want, offers, region, community):
@@ -1389,7 +1472,19 @@ def register_ssh_key(cfg, yes):
 
 def cmd_up(args):
     cfg = load_config()
-    profiles = parse_profiles(args.profile)
+    env = load_settings()                     # settings.env, then settings.local.env
+    for item in args.set or []:               # `--set KEY=VALUE`, for this pod only
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key.startswith("AINVFX_") or not value:
+            die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
+        env[key] = value
+    if args.models_url:
+        env["AINVFX_MODELS_URL"] = args.models_url.strip()
+    repo = (env.get("AINVFX_REPO_RAW") or REPO_RAW).rstrip("/")   # where the pod takes its files, as bootstrap.sh does
+    models_url = env.get("AINVFX_MODELS_URL") or repo + "/models.json"
+    models = read_models(models_url)          # its profiles are the ones `up` accepts
+    profiles = parse_profiles(args.profile, profile_names(models))
     profile = "+".join(profiles)              # `image+3d`: the value AINVFX_PROFILE carries
     slug = profile.replace("+", "-")
     api_key(cfg)
@@ -1414,22 +1509,13 @@ def cmd_up(args):
     def make_name():                          # called at creation: after a --retry wait, the name has the creation's time
         return "ainvfx-{}-{}".format(slug, tag if tag != slug else datetime.now().strftime("%m%d-%H%M"))
 
-    env = load_settings()                     # settings.env, then settings.local.env
-    for item in args.set or []:               # `--set KEY=VALUE`, for this pod only
-        key, sep, value = item.partition("=")
-        key, value = key.strip(), value.strip()
-        if not sep or not key.startswith("AINVFX_") or not value:
-            die("--set takes AINVFX_KEY=value (got \"{}\"). The keys are listed in settings.env.".format(item))
-        env[key] = value
-    if args.models_url:
-        env["AINVFX_MODELS_URL"] = args.models_url.strip()
     env["AINVFX_PROFILE"] = profile
     if cfg.get("hf_secret") or secret_exists(cfg):
         env["HF_TOKEN"] = HF_SECRET_REF       # the reference, never the token itself
     if not args.selftest:
         env["AINVFX_SELFTEST"] = "0"
-    models_url = env.get("AINVFX_MODELS_URL", DEFAULT_MODELS_URL)
-    spec = profile_spec(profiles, read_models(models_url))   # before anything is spent
+    spec = profile_spec(profiles, models)    # before anything is spent
+    nodes = profile_nodes(profiles, read_nodes(repo + "/custom_nodes.json"))
     disk = args.disk or spec["disk"]
 
     catalogs = read_catalogs(cfg, args.community)
@@ -1459,16 +1545,16 @@ def cmd_up(args):
     profile_rule = "{} GB of VRAM or more, Blackwell or newer, not a 1g MIG slice, host on CUDA {} or newer".format(
         spec["vram"], MIN_CUDA)
     say("   profile {}: about {} GB of models, a {} GB container disk".format(profile, spec["gb"], disk))
-    if named:                                 # the GPUs named on the command line, and nothing else
+    if nodes:
+        say("   custom nodes of the profile: {}".format(" ".join(nodes)))
+    named_ids = {w["id"] for w in wants} if named else set()
+    shown = [o for o in fits if o["id"] not in named_ids]    # the GPUs that fit, beside any named with --gpu
+    table = shown + alternatives(offers, named_ids | {o["id"] for o in shown})
+    if named:                                 # the GPUs named on the command line, unless you choose another below
         if not candidates:
             say("   No {} in stock right now{}.".format(wname, " on Secure Cloud" if not args.community else ""))
-            others = [o for o in fits if all(o["id"] != w["id"] for w in wants)]
-            if others:
-                say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
-                show_offers(others, None, max_price)
-                say('   To take one:  python pod.py up {} --gpu "{}"'.format(profile, others[0]["name"]))
-            if not args.retry:
-                die("nothing created.")
+            if shown:
+                say('   To take one:  python pod.py up {} --gpu "{}"'.format(profile, shown[0]["name"]))
     elif preferred:
         say("   tried first: {}".format(preferred["dcs"][0]))
     else:
@@ -1476,31 +1562,23 @@ def cmd_up(args):
         say("   Runpod would then pick any host, and twice that was a host being removed from the platform.")
         if candidates:
             say("   Replacement: {}.".format(offer_line(candidates[0])))
-        say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
-        if fits:
-            show_offers(fits, candidates[0] if candidates else None, max_price)
-        else:
-            say("   none right now.")
-        if not candidates:
-            if fits:
-                say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
-                    fmt_money(max_price), profile, fits[0]["name"]))
-            if not args.retry:
-                die("nothing in stock fits the {} profile at {} per hour or less. Try again in a few minutes.".format(
-                    profile, fmt_money(max_price)))
-        else:
-            other = next((o for o in fits if o["id"] != candidates[0]["id"]), None)
-            if other:
-                say('   To choose another one:  python pod.py up {} --gpu "{}"   (any name from the GPU column)'.format(
-                    profile, other["name"]))
+        elif fits:
+            say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
+                fmt_money(max_price), profile, fits[0]["name"]))
         if not args.community:
             say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
                 " picked by Runpod and can fail to start).")
+    rows = table if table and not (named and candidates) else []   # the GPUs named are in stock: nothing else offered
+    if rows:
+        say("\nIn stock now for the {} profile ({}), cheapest first:".format(profile, profile_rule))
+        show_offers(rows, len(shown), candidates[0] if candidates else None, spec, max_price)
+    elif not candidates:
+        say("\nIn stock now for the {} profile: none right now.".format(profile))
 
     balance, spend = account_money(cfg)
     created, host = None, None
-    if candidates:
-        first = candidates[0]
+    first = candidates[0] if candidates else None
+    if first:
         if balance is not None:
             say_credit(balance, spend, first["price"], "of {} at ".format(first["name"]))
         if not args.yes:
@@ -1512,10 +1590,35 @@ def cmd_up(args):
                 cap = retry_cap(wants, named, args.community, max_price)
                 say("   With --retry: if none can be created now, `up` reads the catalog every {} s and creates the first "
                     "one free{}, without asking again.".format(RETRY_EVERY, ", at up to {} per hour".format(fmt_money(cap)) if cap else ""))
-            if not confirm("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n] ".format(
-                    first["name"], fmt_money(first["price"]), disk)):
-                say('Nothing created. To choose another GPU:  python pod.py up {} --gpu "<name from the list>"'.format(profile))
-                return
+        pick = choose("   Create a {} at {} per hour, with a {} GB disk, billed from creation? [Y/n{}] ".format(
+            first["name"], fmt_money(first["price"]), disk, ", or a number from the list" if rows else ""),
+            rows, first, args.yes)
+        if pick is None:
+            say("Nothing created.")
+            return
+    elif args.retry:                          # nothing free: one question, to wait or to take a GPU of the table
+        cap = retry_cap(wants, named, args.community, max_price)
+        if balance is not None and cap:
+            say_credit(balance, spend, cap, "at ", ", the highest price this wait accepts")
+        pick = choose("   Wait, then create the first {} free ({}a {} GB disk, billed from creation)? [Y/n{}] ".format(
+            wname if named else "GPU that fits", "up to {} per hour, ".format(fmt_money(cap)) if cap else "", disk,
+            ", or a number from the list" if rows else ""), rows, "wait", args.yes)
+        if pick is None:
+            say("Nothing created.")
+            return
+        if pick == "wait":
+            pick = None
+    else:
+        pick = choose("   Take one of these? [a number, or Enter for nothing] ", rows, None) if rows and not args.yes else None
+        if pick is None:
+            die("nothing created." if named else "nothing in stock fits the {} profile at {} per hour or less. "
+                "Try again in a few minutes.".format(profile, fmt_money(max_price)))
+    if pick is not None and pick is not first:   # chosen by number: that GPU only, as --gpu would, waits included
+        wants = [next((g for gpus in catalogs.values() for g in gpus if g["id"] == pick["id"]), pick)]
+        named, wname, candidates = True, pick["name"], [pick]
+        if balance is not None:
+            say_credit(balance, spend, pick["price"], "of {} at ".format(pick["name"]))
+    if pick is not None:
         name = make_name()
         created, host, stray = try_create(cfg, candidates, name, disk, env)
         if not created:
@@ -1524,15 +1627,6 @@ def cmd_up(args):
                     "Try again in a minute: `python pod.py up {}` reads the stock again.".format(profile))
             stop_on_stray(stray)
             say("   None could be created now: waiting, as --retry asks.")
-    else:                                     # --retry and nothing free: one question, before the wait
-        cap = retry_cap(wants, named, args.community, max_price)
-        if balance is not None and cap:
-            say_credit(balance, spend, cap, "at ", ", the highest price this wait accepts")
-        if not confirm("   Wait, then create the first {} free ({}a {} GB disk, billed from creation)? [Y/n] ".format(
-                wname if named else "GPU that fits", "up to {} per hour, ".format(fmt_money(cap)) if cap else "", disk),
-                args.yes):
-            say("Nothing created.")
-            return
     if not created:
         created, host, name = wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name,
                                              disk, env)

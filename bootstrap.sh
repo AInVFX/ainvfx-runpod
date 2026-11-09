@@ -5,7 +5,7 @@
 # Every line it prints starts with [AINVFX]. In order:
 #   0. Runpod's own /start.sh in the background: SSH and JupyterLab are up within seconds
 #   1. health check: GPU and driver (580 or newer), disk write and read speed
-#   2. install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at a pinned tag, the Manager, custom nodes
+#   2. install: uv, Python, PyTorch for CUDA 13.0, ComfyUI at a pinned tag, the Manager, the custom nodes
 #   3. start ComfyUI for Runpod's proxy on port 8188           -> COMFYUI UP, PROXY OK
 #   4. the models of the profile, from models.json             -> MODELS DONE
 #      with the profile train: the trainers and the train command  -> TRAINERS OK
@@ -24,11 +24,13 @@
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted. Default: torch torchvision torchaudio
 #   AINVFX_TORCH_INDEX    default https://download.pytorch.org/whl/cu130
 #   AINVFX_MODELS_URL     where models.json comes from (a raw link, or a Drive, Dropbox or GitHub share link)
-#   AINVFX_CUSTOM_NODES   git URLs of custom nodes, separated by spaces. Default: none
+#   AINVFX_CUSTOM_NODES   git URLs of custom nodes, separated by spaces, beside those custom_nodes.json lists
+#                         for the profile. Default: none
 #   AINVFX_HEALTHCHECK    1 measures the disk (default); 0 skips it
 #   AINVFX_SELFTEST       1 renders the test image (default); 0 skips it
 #   AINVFX_REPO_RAW       the raw address of the repository folder this script comes from, without a trailing
-#                         slash: a release, a branch or a fork. models.json and train.py come from there too.
+#                         slash: a release, a branch or a fork. models.json, custom_nodes.json and train.py come
+#                         from there too.
 #                         The template names a release; default: this repository's main branch
 #   HF_TOKEN              a Hugging Face read token for the gated files; Runpod fills it from the secret
 #                         huggingface_token. An unresolved {{ RUNPOD_SECRET_... }} placeholder counts as absent.
@@ -59,9 +61,9 @@ PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 # The release this script belongs to, logged at start: pod.py's VERSION (tests/test_repo.py checks they agree).
-TOOLKIT_VERSION="1.3.3"
-# models.json and train.py come from the folder this script came from: the branch latest, which follows each
-# release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
+TOOLKIT_VERSION="1.4.0"
+# models.json, custom_nodes.json and train.py come from the folder this script came from: the branch latest, which
+# follows each release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
 REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest}"
 REPO_RAW="${REPO_RAW%/}"
 MODELS_URL="${AINVFX_MODELS_URL:-$REPO_RAW/models.json}"
@@ -263,7 +265,7 @@ elif [ "$MODE" = "trainer" ]; then
 else
   say "bootstrap start · profile $PROFILE · ComfyUI $TAG · Python $PY · $(date -u +'%F %T') UTC"
   say "ainvfx-runpod $TOOLKIT_VERSION"
-  say "settings: repository $REPO_RAW · torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL${CUSTOM_NODES:+ · custom nodes: $CUSTOM_NODES}"
+  say "settings: repository $REPO_RAW · torch '$TORCH' from $TORCH_INDEX · models $MODELS_URL"
 fi
 
 # A placeholder Runpod did not substitute (no secret in the account) must not reach Hugging Face:
@@ -357,9 +359,33 @@ if [ ! -x $VENV/bin/python ]; then
 fi
 # shellcheck disable=SC1091
 source $VENV/bin/activate
+# The custom nodes of this pod: those custom_nodes.json lists under the profile's names, then AINVFX_CUSTOM_NODES,
+# each once. The file comes from the repository release path, as models.json and train.py do.
+PROFILE_NODES=""
+if curl -fsSL --retry 3 "$REPO_RAW/custom_nodes.json" -o $ROOT/custom_nodes.json.new 2>/dev/null; then
+  mv -f $ROOT/custom_nodes.json.new $ROOT/custom_nodes.json
+else
+  warn "no custom_nodes.json at $REPO_RAW: the profile's own custom nodes are skipped (AINVFX_CUSTOM_NODES still installs)"
+fi
+rm -f $ROOT/custom_nodes.json.new
+if [ -s $ROOT/custom_nodes.json ]; then
+  PROFILE_NODES=$(python - $ROOT/custom_nodes.json "$PROFILE" <<'PY' 2>/dev/null
+import json, re, sys
+lists = {k: v for k, v in json.load(open(sys.argv[1])).items() if not k.startswith("_") and isinstance(v, list)}
+names = [p for p in re.split(r"[+,\s]+", sys.argv[2].strip()) if p]
+names = list(lists) if "all" in names else names
+print(" ".join(url for p in names for url in lists.get(p, [])))
+PY
+  )
+fi
+NODES=""
+for url in $PROFILE_NODES $CUSTOM_NODES; do
+  case " $NODES " in *" $url "*) ;; *) NODES="${NODES:+$NODES }$url" ;; esac
+done
+[ -n "$NODES" ] && say "custom nodes: $NODES"
 # One marker per set of install settings. Runpod restarts a pod whose settings are edited: another ComfyUI tag,
 # PyTorch or list of custom nodes then installs again, and the same settings skip the install.
-MARK=$VENV/.ainvfx_install_${TAG}_py${PY}_$(printf '%s|%s|%s' "$TORCH" "$TORCH_INDEX" "$CUSTOM_NODES" | cksum | cut -d' ' -f1)
+MARK=$VENV/.ainvfx_install_${TAG}_py${PY}_$(printf '%s|%s|%s' "$TORCH" "$TORCH_INDEX" "$NODES" | cksum | cut -d' ' -f1)
 if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
   install_torch || {
     fail "PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above). Your settings are not the cause. Terminate this pod and create a new one, which lands on another machine: python pod.py down, then python pod.py up $PROFILE; or Terminate in the console, then deploy again from the template."
@@ -381,8 +407,8 @@ if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
     uvi -r $COMFY/manager_requirements.txt || warn "the Manager could not be installed, so ComfyUI shows no Extensions button. On the pod: uv pip install -r $COMFY/manager_requirements.txt, then restart ComfyUI"
   fi
   uvi -U huggingface_hub || warn "huggingface_hub install failed: model downloads will fail"
-  # custom nodes named in AINVFX_CUSTOM_NODES: cloned into custom_nodes, their requirements installed
-  for url in $CUSTOM_NODES; do
+  # the custom nodes (the profile's, then AINVFX_CUSTOM_NODES): cloned into custom_nodes, their requirements installed
+  for url in $NODES; do
     name=$(basename "${url%.git}")
     if [ ! -d "$COMFY/custom_nodes/$name" ]; then
       if git clone --quiet --depth 1 "$url" "$COMFY/custom_nodes/$name"; then say "custom node $name installed"
@@ -534,7 +560,7 @@ def resolve(name, seen=()):
 wanted = [p for p in re.split(r"[+,\s]+", sys.argv[2].strip()) if p]
 if "all" in wanted:
     wanted = list(profiles)
-unknown = [p for p in wanted if p not in profiles]
+unknown = [p for p in wanted if p not in profiles and p != "train"]   # train: the trainers, no file at start
 if unknown:
     sys.stderr.write("unknown profile(s) ignored: %s (known: %s)\n" % (", ".join(unknown), ", ".join(profiles)))
 keys = []

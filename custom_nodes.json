@@ -1,0 +1,6 @@
+{
+  "_about": "The custom nodes each profile installs at start: under a profile's name, git URLs, each cloned with its requirements.txt. A combination installs those of each of its profiles, all installs every list, and AINVFX_CUSTOM_NODES adds more. A profile lists the packs its models need in the course's graphs: video lists Lightricks' nodes, which the LTX 2.5 IC-LoRA graphs need (Tiled Fusion, SDR to HDR, motion track). bootstrap.sh reads this file from the repository release path (AINVFX_REPO_RAW), like models.json.",
+  "video": [
+    "https://github.com/Lightricks/ComfyUI-LTXVideo"
+  ]
+}

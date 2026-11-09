@@ -26,7 +26,7 @@ import pod  # noqa: E402  (the module under test; importing it has no side effec
 # end-to-end tests compare what `up` prints with profile_spec on the list it reads (expected_disk_line); test_repo
 # checks the README's Profiles table against models.json.
 RULE_MODELS = {
-    "profiles": {"image": ["a", "shared"], "3d": ["small"], "video": ["v", "shared"], "train": []},
+    "profiles": {"image": ["a", "shared"], "3d": ["small"], "video": ["v", "shared"]},
     "files": {"a": {"gb": 100}, "shared": {"gb": 20}, "small": {"gb": 5}, "v": {"gb": 60}, "t1": {"gb": 30}, "t2": {"gb": 40}},
     "training": {"one": {"model": "t1", "vae": "shared"}, "two": {"model": "t2"}},
 }
@@ -736,6 +736,37 @@ class Helpers(unittest.TestCase):
         with self.assertRaises(SystemExit):
             pod.parse_profiles("nope+3d")
 
+    def test_profiles_of_a_models_list_of_your_own(self):
+        """A fork's models list adds profiles: they come after the course's four, train included, rent the image
+        profile's GPU, and bring the custom nodes custom_nodes.json lists under each profile's name, each once."""
+        models = {"profiles": {"image": ["a"], "texture": ["t"]}, "files": {"a": {"gb": 10}, "t": {"gb": 5}}}
+        nodes = {"image": ["https://e.x/kj"], "texture": ["https://e.x/kj", "https://e.x/tex"]}
+        names = pod.profile_names(models)
+        self.assertEqual(names, ["image", "texture", "train"])
+        self.assertEqual(pod.parse_profiles("texture+image", names), ["image", "texture"])
+        self.assertEqual(pod.parse_profiles("all", names), ["image", "train", "texture"])
+        spec = pod.profile_spec(["texture"], models)
+        self.assertEqual((spec["gpu"], spec["vram"]), (pod.OTHER_PROFILE["gpu"], 32))
+        self.assertEqual(pod.profile_nodes(["texture"], nodes), ["https://e.x/kj", "https://e.x/tex"])
+        self.assertEqual(pod.profile_nodes(["image", "texture"], nodes), ["https://e.x/kj", "https://e.x/tex"])
+        self.assertEqual(pod.profile_spec(["image", "train"], models)["vram"], 96, "train: the trainers' GPU")
+        with self.assertRaises(SystemExit):
+            pod.parse_profiles("texture")      # the course's list has no texture profile
+
+    def test_alternatives_beside_the_gpus_that_fit(self):
+        """Beside the GPUs that fit: whole GPUs of 32 GB or more, Blackwell first, then cheapest, each GPU type once,
+        ALT_ROWS at most; never a 1g MIG slice, never under 32 GB, never a GPU already listed."""
+        def o(gid, vram, price, newer, cloud="SECURE", small=False):
+            return {"id": gid, "name": gid, "vram": vram, "price": price, "newer": newer, "cloud": cloud,
+                    "slice": small, "dcs": ["X"]}
+        offers = [o("4090", 24, 0.34, False), o("A40", 48, 0.59, False), o("5090", 32, 0.69, True, "COMMUNITY"),
+                  o("4500", 32, 0.72, True), o("5090", 32, 1.19, True), o("H100", 80, 2.89, False),
+                  o("MIG", 34, 0.5, True, small=True), o("PRO6000", 96, 2.49, True)]
+        self.assertEqual([(r["id"], r["cloud"]) for r in pod.alternatives(offers, {"PRO6000"})],
+                         [("5090", "COMMUNITY"), ("4500", "SECURE"), ("A40", "SECURE"), ("H100", "SECURE")])
+        many = [o("g%d" % i, 48, i, True) for i in range(pod.ALT_ROWS + 2)]
+        self.assertEqual(len(pod.alternatives(many, set())), pod.ALT_ROWS)
+
     def test_the_disk_rule(self):
         """115% of the models plus 30 GB, rounded up to 10 GB, never under 100 GB. A file in two profiles counts once.
         With train: the largest family of training files, less the files the profiles already hold, and 70 GB more.
@@ -1060,7 +1091,7 @@ class EndToEnd(unittest.TestCase):
         stock that fit the image profile, cheapest first, and creates the cheapest. Since a Community pod
         never started (9 Oct 2026), Community Cloud is left out unless --community is
         given, so the replacement is the Secure RTX PRO 4500 SE, not the cheaper Community RTX 5090. It
-        leaves out what does not fit (24 GB, Hopper, a 1g MIG slice) and never picks on its own what
+        leaves out 24 GB and 1g MIG slices, offers Hopper by number only, and never picks on its own what
         costs more than 2.50 USD per hour."""
         STATE["no_5090"] = True
         self.run_pod("setup", "-y")
@@ -1073,17 +1104,61 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn("Community Cloud, a host Runpod picks", out, "Community offers are not listed without --community")
         self.assertIn("add --community to include it", out, out)
         self.assertNotIn("B300 MIG", out, "a 1g slice is never listed: 111 s self-test against 16 s (7 Oct 2026)")
-        self.assertIn("above 2.50 USD: only with --gpu", out, "the B300 is listed, never picked on its own")
+        self.assertIn("above 2.50 USD: by number or --gpu", out, "the B300 is listed, never picked on its own")
         self.assertNotIn("RTX 4090", out, "24 GB: does not fit the image profile")
-        self.assertNotIn("H100", out, "Hopper: older than Blackwell")
+        self.assertRegex(out, r"H100 SXM .*not Blackwell: untested with the course's models", "Hopper: by number only")
         self.assertNotIn("PRO 6000 MIG 24GB", out, out)
-        self.assertIn('python pod.py up image --gpu "RTX PRO 6000"', out, out)
+        self.assertRegex(out, r" 2  RTX PRO 6000 ", "every GPU of the table has its number")
         self.assertEqual([(p["gpu"]["id"], p["cloud"], p.get("dataCenterIds")) for p in STATE["posts"]],
                          [("NVIDIA RTX PRO 4500 Blackwell Server Edition", "SECURE", ["US-KS-2"])], out)
         self.assertIn("host checked: no maintenance planned", out, out)
         self.assertIn("READY", out, out)
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
+
+    def test_video_without_a_pro_6000_offers_a_5090_taken_by_its_number(self):
+        """6 Nov 2026: no RTX PRO 6000 in stock, and the wait never ended (session 11). `up video` lists what fits
+        (the B300, above 2.50 USD) and, by number only, other GPUs in stock: the RTX 5090 among them, marked below
+        96 GB. Its number creates it, and nothing else; no answer creates nothing."""
+        STATE["schedule"] = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": [(0, ())]}
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "video", "--wait", "1", input="3\n", timeout=120)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("Also in stock, created only if you choose it:", out, out)
+        self.assertRegex(out, r" 3  RTX 5090 .*below 96 GB of VRAM", out)
+        self.assertIn("Take one of these? [a number, or Enter for nothing]", out, out)
+        self.assertEqual([p["gpu"]["id"] for p in STATE["posts"]], ["NVIDIA GeForce RTX 5090"], out)
+        self.assertIn("READY", out, out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+        out, rc = self.run_pod("up", "video", "--wait", "1", timeout=60)
+        self.assertIn("ERROR: nothing in stock fits the video profile at 2.50 USD per hour or less", out, out)
+        self.assertEqual(len(STATE["posts"]), 1, "no answer: nothing created")
+
+    def test_a_profile_of_your_own_with_its_custom_nodes(self):
+        """Rafael's request (6 Nov 2026): a fork adds a profile with its models and its custom nodes. With the
+        fork's release path (AINVFX_REPO_RAW), `up texture` reads the fork's models.json and custom_nodes.json, as
+        the pod will: it takes the profile, names its custom nodes before creating the pod, rents the image
+        profile's GPU and sends the profile to the pod, whose bootstrap.sh installs them."""
+        fork = os.path.join(self.home, "fork")
+        os.makedirs(fork)
+        with open(os.path.join(fork, "models.json"), "w", encoding="utf-8") as f:
+            json.dump({"profiles": {"image": ["a"], "texture": ["t"]},
+                       "files": {"a": {"repo": "r/a", "path": "a.safetensors", "dir": "checkpoints", "gb": 2},
+                                 "t": {"repo": "r/t", "path": "t.safetensors", "dir": "checkpoints", "gb": 3}}}, f)
+        with open(os.path.join(fork, "custom_nodes.json"), "w", encoding="utf-8") as f:
+            json.dump({"texture": ["https://github.com/example/ComfyUI-Texture"]}, f)
+        self.run_pod("setup", "-y")
+        out, rc = self.run_pod("up", "texture", "--set", "AINVFX_REPO_RAW=" + pod.Path(fork).as_uri(), "-y",
+                               "--wait", "1", timeout=90)
+        self.assertNotIn("Traceback", out, out)
+        self.assertIn("custom nodes of the profile: https://github.com/example/ComfyUI-Texture", out, out)
+        self.assertEqual([(p["gpu"]["id"], p["env"]["AINVFX_PROFILE"]) for p in STATE["posts"]],
+                         [("NVIDIA GeForce RTX 5090", "texture")], out)
+        self.assertEqual(rc, 0, out)
+        self.run_pod("down", "-y")
+        out, rc = self.run_pod("up", "texture", "-y")
+        self.assertIn("unknown profile(s): texture", out, "the course's list has no texture profile")
 
     def test_community_cloud_only_with_the_flag(self):
         """With --community: the Community RTX 5090 at 0.69 is the cheapest fit and
@@ -1218,7 +1293,7 @@ class EndToEnd(unittest.TestCase):
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "--wait", "1", input="n\n", timeout=60)
         self.assertIn("Your Runpod credit: 212.40 USD, about 178 hours of RTX 5090 at 1.19 USD per hour.", out, out)
-        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a {} GB disk, billed from creation? [Y/n]".format(
+        self.assertIn("Create a RTX 5090 at 1.19 USD per hour, with a {} GB disk, billed from creation? [Y/n, or a number from the list]".format(
             pod.profile_spec(["image"])["disk"]), out, out)
         self.assertEqual(len(STATE["posts"]), 0, "answered n: nothing created")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
@@ -1477,8 +1552,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Your Runpod credit: 212.40 USD, about 26 hours at 7.99 USD per hour, the highest price this "
                       "wait accepts.", out, out)
         self.assertRegex(out, r"Wait, then create the first B200 or B300 free \(up to 7\.99 USD per hour, a \d+ GB disk, "
-                              r"billed from creation\)\? \[Y/n\]")
-        self.assertEqual(out.count("[Y/n]"), 1, "one question, before the wait")
+                              r"billed from creation\)\? \[Y/n, or a number from the list\]")
+        self.assertEqual(out.count("[Y/n"), 1, "one question, before the wait")
         self.assertIn("Waiting on Secure Cloud for B200 or B300. Every 1 s, `up` reads the catalog and creates the "
                       "first one free.", out, out)
         self.assertIn("still waiting: 1 read in under a minute, none free", out, out)
@@ -1541,7 +1616,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("With --retry: if none can be created now, `up` reads the catalog every 1 s and creates the first "
                       "one free, at up to 2.50 USD per hour, without asking again.", out, out)
         self.assertIn("Create a RTX PRO 6000 at 2.49 USD per hour", out, out)
-        self.assertEqual(out.count("[Y/n]"), 1, out)
+        self.assertEqual(out.count("[Y/n"), 1, out)
         self.assertIn("None could be created now: waiting, as --retry asks.", out, out)
         self.assertEqual(len(STATE["posts"]), 7, "three full data centers twice, then US-TX-3")
         self.assertEqual(STATE["posts"][-1].get("dataCenterIds"), ["US-TX-3"], out)

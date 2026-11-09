@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +28,7 @@ def read(name):
 
 
 MODELS = json.loads(read("models.json"))
+NODES = json.loads(read("custom_nodes.json"))
 BOOTSTRAP = read("bootstrap.sh")
 README = read("README.md")
 FIX = ": run python3 tests/readme_profiles.py, then commit README.md with models.json"
@@ -49,7 +51,7 @@ def keys_of(profiles):
     out = []
 
     def walk(name, seen=()):
-        for item in MODELS["profiles"][name]:
+        for item in MODELS["profiles"].get(name, []):   # train: the trainers, no file at start
             if item.startswith("@"):
                 if item[1:] not in seen:
                     walk(item[1:], seen + (name,))
@@ -83,8 +85,40 @@ class Repo(unittest.TestCase):
             self.assertIsInstance(f.get("gated", False), bool, key)
 
     def test_pod_py_knows_every_profile(self):
-        self.assertEqual(sorted(pod.PROFILES), sorted(MODELS["profiles"]))
-        self.assertEqual(sorted(pod.PROFILE_ORDER), sorted(MODELS["profiles"]))
+        """The course's profiles: those of models.json, and train, the trainers, which no list names."""
+        self.assertNotIn("train", MODELS["profiles"])
+        self.assertEqual(sorted(pod.PROFILES), sorted(pod.profile_names(MODELS)))
+        self.assertEqual(sorted(pod.PROFILE_ORDER), sorted(pod.profile_names(MODELS)))
+
+    def test_custom_nodes_name_profiles_and_git_urls(self):
+        """custom_nodes.json lists, under a profile's name, git URLs that bootstrap.sh clones: each once, never a
+        profile the course does not have."""
+        for name, urls in NODES.items():
+            if name.startswith("_"):
+                continue
+            self.assertIn(name, pod.profile_names(MODELS), "custom_nodes.json names an unknown profile")
+            self.assertIsInstance(urls, list, name)
+            self.assertEqual(len(urls), len(set(urls)), name + ": a custom node listed twice")
+            for url in urls:
+                self.assertRegex(url, r"^https://\S+$", name)
+
+    def test_bootstrap_sh_installs_the_custom_nodes_pod_py_announces(self):
+        """`up` prints the profile's custom nodes before it creates the pod; bootstrap.sh installs them on the pod.
+        Both read custom_nodes.json the same way: by profile name, `all` for every profile, each URL once."""
+        block = BOOTSTRAP.split("PROFILE_NODES=$(python - ", 1)[1].split("<<'PY' 2>/dev/null\n", 1)[1].split("\nPY\n", 1)[0]
+        lists = {"_about": "x", "video": ["https://e.x/a", "https://e.x/b"], "texture": ["https://e.x/b", "https://e.x/c"]}
+        names = ["image", "video", "texture"]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(lists, f)
+        try:
+            for label in ("image", "video", "video+texture", "all"):
+                out = subprocess.run([sys.executable, "-c", block, f.name, label], stdout=subprocess.PIPE,
+                                     universal_newlines=True, check=True).stdout.split()
+                once = [u for i, u in enumerate(out) if u not in out[:i]]   # bootstrap.sh then keeps each URL once
+                announced = pod.profile_nodes(pod.parse_profiles(label, names), pod.read_nodes(pod.Path(f.name).as_uri()))
+                self.assertEqual(once, announced, label)
+        finally:
+            os.unlink(f.name)
 
     def test_the_readme_profile_table_matches_models_json(self):
         """README.md's Profiles table gives the sizes and the disk that `up` computes from models.json."""
