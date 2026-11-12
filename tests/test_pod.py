@@ -11,7 +11,8 @@ carry their time as id, a `since` cursor is exclusive at one-second resolution, 
 keepalives, and the lines after SELFTEST OK never arrive on a live connection (only a fresh request serves
 them). Each test's docstring names the incident it reproduces.
 """
-import base64, itertools, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
+import base64, hashlib, itertools, json, os, re, shutil, signal, struct, subprocess, sys, tempfile, threading, time, unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -195,6 +196,9 @@ def ts_of(sec):
     return (base + timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+WEB_FILES = dict([("shot_%04d.exr" % n, bytes([n % 256]) * (2000 + n)) for n in range(98, 104)] + [("notes.txt", b"notes")])
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -219,6 +223,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         p = u.path
+        if p.startswith("/web/"):
+            return self.web(p)
+        if "/8888/api/kernels/" in p and (self.headers.get("Upgrade") or "").lower() == "websocket":
+            return self.fake_kernel()
         if p.startswith("/proxy/"):
             return self.proxy_get(p, q)
         if p.startswith("/files/"):          # a models list served as a raw file
@@ -262,6 +270,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/graphql":
             return self.graphql()
+        if u.path.startswith("/proxy/") and u.path.endswith("/8888/api/kernels"):
+            self.body()
+            if STATE["outfiles"] is None or self.headers.get("Authorization") != "token faketoken":
+                return self.problem(403, "Forbidden")
+            STATE["kernels"].append("started")
+            return self.send_json(201, {"id": "k1", "name": "python3"})
         if u.path.startswith("/proxy/") and u.path.endswith("/upload/image"):
             STATE["uploads"].append(len(self.body()))
             return self.send_json(200, {"name": "x.png", "subfolder": "", "type": "input"})
@@ -337,6 +351,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.jupyter_write("PATCH")
 
     def do_DELETE(self):
+        if self.path.startswith("/proxy/") and "/8888/api/kernels/" in self.path:
+            STATE["kernels"].append("removed")
+            self.send_response(204); self.send_header("Content-Length", "0"); self.end_headers()
+            return
         if self.path.startswith("/proxy/") and "/8888/" in self.path:
             return self.jupyter_write("DELETE")
         if self.headers.get("Authorization") != "Bearer fake-key":
@@ -420,6 +438,76 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
             self.wfile.write(data); return
         return self.problem(404, "no route")
+
+    def web(self, p):
+        """A small web site for `push URL`: /web/shot/ is a folder page as a web server writes it (a parent link, sort
+        links, a subfolder, a link to another site, six numbered frames, one other file); /web/plain/ lists two files
+        without numbers; every other path under them is a file of WEB_FILES."""
+        if p in ("/web/shot", "/web/plain"):                          # as a web server does: the folder's address ends with /
+            self.send_response(301); self.send_header("Location", p + "/"); self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if p == "/web/shot/":
+            links = ['<a href="../">Parent Directory</a>', '<a href="?C=N;O=D">Name</a>', '<a href="sub/">sub/</a>',
+                     '<a href="https://example.org/elsewhere.exr">elsewhere</a>']
+            links += ['<a href="{0}">{0}</a>'.format(n) for n in sorted(WEB_FILES) if "/" not in n]
+            page = "<html><body><h1>Index of /web/shot</h1>" + "<br>".join(links) + "</body></html>"
+        elif p == "/web/plain/":
+            page = '<html><body><a href="alpha.png">alpha.png</a> <a href="beta.png">beta.png</a></body></html>'
+        else:
+            data = WEB_FILES.get(p.split("/web/", 1)[1].split("/", 1)[-1])
+            if data is None:
+                return self.problem(404, "no such file")
+            STATE["web_gets"].append(p)
+            self.send_response(200); self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data))); self.end_headers()
+            self.wfile.write(data); return
+        data = page.encode()
+        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data))); self.end_headers()
+        self.wfile.write(data)
+
+    def fake_kernel(self):
+        """The kernel channel of a fake JupyterLab: the WebSocket handshake, a message for another client (to be
+        ignored), a ping, then the one execute_request run for real by a Python subprocess, its output as a stream
+        message, an error message when it fails, and idle."""
+        if self.headers.get("Authorization") != "token faketoken":
+            return self.problem(403, "Forbidden")
+        accept = base64.b64encode(hashlib.sha1((self.headers["Sec-WebSocket-Key"] +
+                                                "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        self.send_response(101); self.send_header("Upgrade", "websocket"); self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept); self.end_headers()
+
+        def read_frame():
+            b0, b1 = self.rfile.read(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self.rfile.read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self.rfile.read(8))[0]
+            mask = self.rfile.read(4)
+            return b0 & 0x0F, bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(n)))
+
+        def frame(data, opcode=0x1):
+            n = len(data)
+            size = bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else bytes([127]) + struct.pack(">Q", n)
+            self.wfile.write(bytes([0x80 | opcode]) + size + data); self.wfile.flush()
+
+        def send(kind, parent, content):
+            frame(json.dumps({"msg_type": kind, "parent_header": {"msg_id": parent}, "content": content}).encode())
+        _, data = read_frame()
+        msg = json.loads(data.decode())
+        mid = msg["header"]["msg_id"]
+        send("status", "another-client", {"execution_state": "idle"})
+        frame(b"hello", 0x9)
+        r = subprocess.run([sys.executable, "-c", msg["content"]["code"]], capture_output=True, text=True, timeout=60)
+        opcode, pong = read_frame()
+        STATE["kernels"].append("pong" if (opcode, pong) == (0xA, b"hello") else "no pong")
+        if r.stdout:
+            send("stream", mid, {"name": "stdout", "text": r.stdout})
+        if r.returncode:
+            send("error", mid, {"ename": "RuntimeError", "evalue": r.stderr.strip().splitlines()[-1], "traceback": [r.stderr]})
+        send("status", mid, {"execution_state": "idle"})
+        self.close_connection = True
 
     def jupyter_get(self, p):
         """A fake JupyterLab with its root at /, as Runpod starts it: the contents API (one folder per request) and
@@ -812,6 +900,31 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.history_files({}), [])
         self.assertEqual(pod.history_files(None), [])
 
+    def test_folder_pages_and_frame_ranges(self):
+        """`push URL`: a folder page gives its own files, each once, and no parent, subfolder, sort or foreign link; a
+        frame range is found by the last number of the names, before the extension (clip.mp4 has none); the largest
+        sequence wins; a folder without a sequence says so with pattern None."""
+        html = ('<a href="../">Parent</a><a href="?C=N;O=D">Name</a><a href="05_4a_00480.exr">a</a>'
+                '<a href="/t/05_4a/linear_hd/05_4a_00481.exr">b</a><a href="sub/">sub</a><a href=\'my%20file.exr\'>c</a>'
+                '<a href="https://other.org/x.exr">o</a><a href="05_4a_00480.exr">again</a><a href=".hidden">h</a>')
+        base = "https://media.example.org/t/05_4a/linear_hd/"
+        want = [("05_4a_00480.exr", base + "05_4a_00480.exr"), ("05_4a_00481.exr", base + "05_4a_00481.exr"),
+                ("my file.exr", base + "my%20file.exr")]
+        self.assertEqual(pod.index_links(base, html), want)
+        self.assertEqual(pod.index_links(base[:-1], html), want, "a folder address without its last slash")
+        self.assertEqual(pod.frame_split("05_4a_00480.exr"), ("05_4a_", 480, 5, ".exr"))
+        self.assertEqual(pod.frame_split("plate.0012.exr"), ("plate.", 12, 4, ".exr"))
+        self.assertEqual(pod.frame_split("frame7"), ("frame", 7, 1, ""))
+        self.assertIsNone(pod.frame_split("clip.mp4"))
+        self.assertIsNone(pod.frame_split("readme.txt"))
+        names = ["05_4a_%05d.exr" % n for n in range(470, 610)] + ["notes.txt", "v2_001.png", "v2_002.png", "clip.mp4"]
+        got, pattern, lo, hi = pod.frames_in_range(names, 480, 600)
+        self.assertEqual((len(got), got[0], got[-1], pattern, lo, hi), (121, "05_4a_00480.exr", "05_4a_00600.exr",
+                                                                         "05_4a_#####.exr", 470, 609))
+        self.assertEqual(pod.frames_in_range(names, 700, 800), ([], "05_4a_#####.exr", 470, 609))
+        self.assertEqual(pod.frames_in_range(["alpha.png", "beta.png", "take1.mov"], 1, 9), ([], None, 0, 0))
+        compile(pod.remote_code("https://x/y/", "/tmp/in", "plate", (480, 600)), "remote", "exec")
+
     def test_jupyter_token_and_safe_paths(self):
         ready = ("[AINVFX] READY · ComfyUI https://x-8188.proxy.runpod.net · JupyterLab "
                  "https://x-8888.proxy.runpod.net/lab?token=abc123 · log /workspace/ComfyUI/input/ainvfx/bootstrap.log")
@@ -877,7 +990,7 @@ class EndToEnd(unittest.TestCase):
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
                       "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
-                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}})
+                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": []})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -968,6 +1081,67 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("JupyterLab did not answer", out, out)
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
+    def test_push_from_a_web_address(self):
+        """`push URL`: the pod downloads by itself. The code that pod.py sends runs for real in the fake kernel, against
+        a folder page of the fake site. A file's address gives that file; a folder's address gives every file it lists
+        (not its parent, its subfolder or a foreign link) in a folder of its name, or of --into; --frames keeps the
+        frames of the range; a second run downloads nothing again; a range outside the sequence and a folder without
+        numbers each say what was found and write nothing; each run removes its kernel; a ping is answered."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        inp = os.path.join(self.home, "pod_input")
+        self.env.update(AINVFX_POD_INPUT=inp, AINVFX_POD_DATASET=os.path.join(self.home, "pod_dataset"))
+        site = "http://127.0.0.1:%d/web/" % self.port
+
+        def listing(*parts):
+            return sorted(os.listdir(os.path.join(inp, *parts)))
+        out, rc = self.run_pod("push", site + "shot/shot_0100.exr")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(listing(), ["shot_0100.exr"], out)
+        self.assertIn("1 file(s) downloaded, 0 unchanged", out, out)
+        out, rc = self.run_pod("push", site + "shot/", "--frames", "100-102", "--into", "plate")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(listing("plate"), ["shot_0100.exr", "shot_0101.exr", "shot_0102.exr"], out)
+        self.assertIn("shot_####.exr: frames 100 to 102, 3 files", out, out)
+        with open(os.path.join(inp, "plate", "shot_0101.exr"), "rb") as f:
+            self.assertEqual(f.read(), WEB_FILES["shot_0101.exr"])
+        before = len(STATE["web_gets"])
+        out, rc = self.run_pod("push", "image", site + "shot/", "--frames", "100-102", "--into", "plate")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("0 file(s) downloaded, 3 unchanged", out, out)
+        self.assertEqual(len(STATE["web_gets"]), before + 3, "the second run opens each file for its size, and reads no more")
+        out, rc = self.run_pod("push", site + "shot")                # the whole folder, under its own name
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(listing("shot"), sorted(WEB_FILES), out)
+        self.assertEqual([p for p in os.listdir(os.path.join(inp, "shot")) if p.endswith(".part")], [])
+        out, rc = self.run_pod("push", site + "shot/", "--frames", "480-600")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("no frame from 480 to 600 in this folder: shot_####.exr runs from 98 to 103", out, out)
+        out, rc = self.run_pod("push", site + "plain/", "--frames", "1-5", "--into", "stills")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("without --frames", out, out)
+        self.assertFalse(os.path.exists(os.path.join(inp, "stills")), "nothing is written when the range cannot apply")
+        out, rc = self.run_pod("push", site + "shot/shot_0100.exr", "--frames", "1-5")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("this address is one file", out, out)
+        out, rc = self.run_pod("push", "--dataset", "liquids", site + "plain/")
+        self.assertNotEqual(rc, 0, out)                              # the fake site has no alpha.png: the files fail, and it says so
+        self.assertIn("did not arrive", out, out)
+        out, rc = self.run_pod("push", site + "shot/", "x.png")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("one web address", out, out)
+        out, rc = self.run_pod("push", site + "shot/", "--frames", "600-480")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("--frames takes a first and a last frame number", out, out)
+        ks = STATE["kernels"]
+        self.assertEqual(ks.count("started"), ks.count("removed"), ks)
+        self.assertEqual(ks.count("pong"), ks.count("started"), ks)
+        self.assertNotIn("no pong", ks)
+        self.assertGreater(ks.count("started"), 6, ks)
 
     def test_push_dataset_through_jupyterlab(self):
         """A training dataset goes up through JupyterLab: subfolders kept, captions without BOM nor CR, a large file

@@ -38,7 +38,7 @@ pod.py                               api.runpod.io                      start co
   ~/.ainvfx-runpod/config.json         GraphQL: host maintenance,           models.json, train.py from the same folder
                                        account credit                       ComfyUI on port 8188
                                      proxy https://<id>-8188 ---------->  ComfyUI (log copy, /upload/image, /history)
-                                     proxy https://<id>-8888 ---------->  JupyterLab (pull, push --dataset)
+                                     proxy https://<id>-8888 ---------->  JupyterLab (pull, push --dataset, push URL)
                                                                           musubi-tuner, sd-scripts, `train` (profile train)
 ```
 
@@ -52,7 +52,7 @@ pod.py                               api.runpod.io                      start co
 - **Every step can run again.** An install marker per set of install settings (ComfyUI tag, Python, PyTorch, custom nodes), files already present, one marker per trainer commit: a restarted pod skips what it has. `bash bootstrap.sh models` and `bash bootstrap.sh trainer` repeat one step on a live pod.
 - **`pod.py` reads the log.** Every bootstrap line starts with `[AINVFX]`. The log words are fixed, because `pod.py` and the tests react to them: a changed word changes `bootstrap.sh`, `pod.py` and `tests/test_pod.py` in the same commit. The trainers end on `TRAINERS OK`, never on a line containing `READY`, because `pod.py` stops following on that word.
 - **One place per value.** A setting lives in `settings.env`, a model in `models.json`, a recipe in `train.py`, a trainer pin in `bootstrap.sh`. Where a copy must exist (the defaults in `bootstrap.sh`, the tables of README.md), `tests/test_repo.py` checks that it agrees.
-- **Secrets stay out of files and logs.** The API key lives in `~/.ainvfx-runpod/config.json` (readable by its owner only) or in `RUNPOD_API_KEY`. The Hugging Face token is a Runpod secret: the pod receives a reference, which Runpod resolves when the pod starts. One deliberate exception: the `READY` line carries JupyterLab's token, so that `pull` and `push --dataset` can use JupyterLab. The pod's address therefore stays private.
+- **Secrets stay out of files and logs.** The API key lives in `~/.ainvfx-runpod/config.json` (readable by its owner only) or in `RUNPOD_API_KEY`. The Hugging Face token is a Runpod secret: the pod receives a reference, which Runpod resolves when the pod starts. One deliberate exception: the `READY` line carries JupyterLab's token, so that `pull`, `push --dataset` and `push URL` can use JupyterLab. The pod's address therefore stays private.
 - **Messages, never tracebacks.** A user error ends in one sentence that says what to do. `AINVFX_DEBUG=1` shows the trace.
 - **Plain words.** Messages and documents use short sentences, one idea each: many users read English as a second language.
 
@@ -62,7 +62,7 @@ pod.py                               api.runpod.io                      start co
 2. It reads the host's maintenance window through GraphQL, and replaces a host under maintenance or due within 24 hours (`AINVFX_MAINT_HOURS`).
 3. The container starts. The template's start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW` (the template sets the branch `latest`; the command's own fallback is `main`) and runs it. If GitHub cannot be reached, it runs Runpod's own `/start.sh`, so SSH and JupyterLab still start.
 4. **`bootstrap.sh`** runs its steps (section 6). Meanwhile `pod.py` follows Runpod's log stream (`GET /pods/{id}/logs`, Server-Sent Events). The stream can stay open without delivering the last lines, so `pod.py` reopens it every 60 seconds a few seconds back, and reads the pod's own copy of the log through the ComfyUI proxy every 15 seconds. It stops on `READY` or `FAILED`, and warns when no container has started 8 minutes after creation.
-5. The user works. **`push`** sends files to ComfyUI's `/upload/image`; with `--dataset`, through JupyterLab's contents API, in 8 MiB chunks written to a `.part` file and renamed at the end. **`pull`** walks the output folder through JupyterLab, or falls back to the files ComfyUI's history lists.
+5. The user works. **`push`** sends files to ComfyUI's `/upload/image`; with `--dataset`, through JupyterLab's contents API, in 8 MiB chunks written to a `.part` file and renamed at the end; with a web address, the pod downloads by itself: `pod.py` starts a kernel in the pod's JupyterLab, sends it the source of its own download functions over the kernel's WebSocket, prints what the kernel prints, then removes the kernel. **`pull`** walks the output folder through JupyterLab, or falls back to the files ComfyUI's history lists.
 6. **`down`** pulls, terminates, then reports the pod's cost and the credit left. Every command first forgets the records of pods gone from the account.
 
 ## 6. What `bootstrap.sh` does
@@ -139,6 +139,7 @@ On the pod:
 | Creation | `create_pod`, `try_create` | |
 | Commands | `cmd_setup`, `cmd_up`, `cmd_status`, `cmd_logs`, `cmd_open`, `cmd_push`, `cmd_pull`, `cmd_down`, `cmd_list`, `cmd_ssh`, `cmd_doctor` | |
 | Files | `jupyter_tree`, `jupyter_upload`, `push_dataset`, `history_files`, `fetch_to`, `pull` | Downloads go through a `.part` file |
+| Push from a web address | `index_links`, `frame_split`, `frames_in_range`, `remote_push`, `remote_code`, `ws_connect`, `ws_send`, `ws_messages`, `kernel_run`, `push_url` | The first four run on the pod as well: `remote_code` sends their source |
 | Entry | `main` | argparse |
 
 ### `bootstrap.sh`, in file order
@@ -227,6 +228,7 @@ The variable appears once, so the command works whether Runpod runs it directly 
 ## 13. Known limits and planned work
 
 - **GraphQL, for two reads.** `pod.py` reads the pod's host with its maintenance window (`MACHINE_QUERY`) and the account's credit (`MONEY_QUERY`) through Runpod's GraphQL API, because REST v2 offers neither: its specification (`https://api.runpod.io/v2/openapi.json`, version 2.0.0, read on 29 October 2026) has no maintenance window, no balance and no spend rate. Runpod's own CLI shows the same GraphQL fields (`clientBalance`, `currentSpendPerHr` in `runpodctl user`). Runpod deprecates GraphQL for integrators in early 2027. When GraphQL stops answering, `pod.py` keeps working: `up` skips the host check and the credit line, and `test_up_and_down_work_without_graphql` proves it. Move both reads to REST v2 once Runpod adds them there.
+- **`push URL` reads plain folder pages only.** A folder page must list its files as links, as Apache and nginx write them. A share page drawn by a script (a Google Drive or Dropbox folder) lists nothing, and subfolders are not followed. The WebSocket client in `pod.py` holds only what a kernel needs: text frames, ping and close.
 - **The `moss` recipe** follows sd-scripts' MOSS-Image guide and has not yet run on a pod.
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
 - **Custom nodes are not pinned.** `custom_nodes.json` and `AINVFX_CUSTOM_NODES` clone each node's default branch at its latest commit.

@@ -10,6 +10,7 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py logs [pod]         follow the pod's log until READY
   python pod.py open [pod]         open ComfyUI in your browser
   python pod.py push [pod] FILES   copy files into the pod's input folder; --dataset NAME for training
+  python pod.py push [pod] URL     the pod downloads a file or a folder page itself; --frames 480-600, --into NAME
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
   python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here
   python pod.py ssh [pod]          a terminal on the pod
@@ -28,6 +29,7 @@ import argparse
 import base64
 import getpass
 import http.client
+import inspect
 import io
 import json
 import os
@@ -35,6 +37,8 @@ import platform
 import re
 import shutil
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -46,7 +50,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest"   # the branch that follows each release
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -123,6 +127,9 @@ UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per reques
 TEXT_SUFFIXES = (".txt", ".toml", ".json", ".jsonl", ".md", ".csv")
 DATASET_SKIP = {"__MACOSX", "Thumbs.db", "desktop.ini"}       # left behind, as every hidden name
 DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+WEB_ADDRESS = re.compile(r"https?://", re.I)
+POD_INPUT = os.environ.get("AINVFX_POD_INPUT", "/workspace/ComfyUI/input")     # where a pod keeps ComfyUI's input folder
+POD_DATASET = os.environ.get("AINVFX_POD_DATASET", "/workspace/dataset")       # and its training datasets
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -1768,6 +1775,12 @@ def multipart(fields, filefield, path):
 
 
 def cmd_push(args):
+    if any(WEB_ADDRESS.match(f) for f in args.files):
+        if len(args.files) != 1:
+            die("push takes local files, or one web address: one command for each")
+        return push_url(args, args.files[0])
+    if args.frames or args.into:
+        die("--frames and --into go with a web address: python pod.py push https://... --into NAME")
     files = [Path(f).expanduser() for f in args.files]
     for f in files:
         if not f.exists():
@@ -1993,6 +2006,313 @@ def push_dataset(rec, name, paths):
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
         sent, kept, total / 1e6, time.time() - t0, name))
     say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(name))
+
+# --------------------------------------------------------------------------- push from a web address
+# `push URL` makes the pod download by itself: nothing passes through the user's connection. pod.py starts a kernel in
+# the pod's JupyterLab (its REST API), sends it one piece of Python over the kernel's WebSocket, prints what it prints,
+# then removes the kernel. The Python sent is the source of the functions below (inspect.getsource): they are tested
+# here and run there. The WebSocket client is the small part of RFC 6455 that a kernel needs: text frames, ping, close.
+def index_links(page_url, html):
+    """(name, url) of each file that a folder page lists, in page order, each once: the links that point one level
+    under the page itself. Links to the parent folder, to subfolders, to sort orders (?C=N) and to other sites are
+    left out. Reads the index pages that web servers write themselves (Apache, nginx)."""
+    if not page_url.endswith("/"):
+        page_url += "/"
+    base = urllib.parse.urlsplit(page_url)
+    seen, out = set(), []
+    for href in re.findall(r"""href\s*=\s*["']([^"'#]+)["']""", html, re.I):
+        u = urllib.parse.urlsplit(urllib.parse.urljoin(page_url, href.strip()))
+        if u.scheme not in ("http", "https") or u.netloc != base.netloc or u.query or not u.path.startswith(base.path):
+            continue
+        rest = u.path[len(base.path):]
+        name = urllib.parse.unquote(rest)
+        if not rest or "/" in rest or name.startswith(".") or name in seen:
+            continue
+        seen.add(name)
+        out.append((name, urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "", ""))))
+    return out
+
+
+def frame_split(name):
+    """(prefix, number, digits, tail) around the last run of digits before the extension, or None when the name has
+    no number: `shot_00480.exr` gives ('shot_', 480, 5, '.exr')."""
+    stem, dot, ext = name.rpartition(".")
+    if not stem:                                   # no extension, or a name that starts with a dot
+        stem, dot, ext = name, "", ""
+    m = re.match(r"^(.*?)(\d+)(\D*)$", stem)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), len(m.group(2)), m.group(3) + dot + ext
+
+
+def frames_in_range(names, first, last):
+    """The files of a frame range: (names, pattern, lowest, highest). The sequence is the largest set of names that
+    differ only by their last number; `pattern` shows it with # for the digits (None when no two names form a
+    sequence); `names` are its files numbered first..last, in order; lowest and highest are the numbers it holds."""
+    groups = {}
+    for n in names:
+        sp = frame_split(n)
+        if sp:
+            groups.setdefault((sp[0], sp[3]), []).append((sp[1], sp[2], n))
+    groups = {k: v for k, v in groups.items() if len(v) > 1}
+    if not groups:
+        return [], None, 0, 0
+    (prefix, tail), seq = max(groups.items(), key=lambda kv: len(kv[1]))
+    seq.sort()
+    pattern = prefix + "#" * min(d for _, d, _ in seq) + tail
+    return [n for num, _, n in seq if first <= num <= last], pattern, seq[0][0], seq[-1][0]
+
+
+def remote_push(url, base, into, frames):
+    """Runs on the pod. Downloads `url` under `base`: one file, or every file a folder page lists (into base/<into>,
+    by default the folder's own name), or with `frames` (first, last) the frames of that range. Eight downloads at a
+    time, each through a .part file; a file already there with the same size is skipped. Prints progress, then one
+    line that pod.py reads: AINVFX_PUSH_DONE {json} or AINVFX_PUSH_ERROR message."""
+    import concurrent.futures
+    import threading
+    agent = {"User-Agent": "Mozilla/5.0 (compatible; ainvfx-runpod)"}
+
+    def fail(msg):
+        print("AINVFX_PUSH_ERROR " + msg, flush=True)
+
+    def get(u, timeout=120):
+        return urllib.request.urlopen(urllib.request.Request(u, headers=agent), timeout=timeout)
+    url = direct_url(url)
+    try:
+        r = get(url)
+    except Exception as e:
+        return fail("the pod cannot open {} ({})".format(url, e))
+    with r:
+        final = r.geturl()
+        if (r.headers.get("Content-Type") or "").lower().startswith("text/html"):
+            files = index_links(final, r.read(16 << 20).decode("utf-8", "replace"))
+            if not files:
+                return fail("this page lists no file. Give the address of a file, or of a folder page that lists its files.")
+            if frames:
+                names, pattern, lo, hi = frames_in_range([n for n, _ in files], frames[0], frames[1])
+                if pattern is None:
+                    return fail("the {} files of this folder carry no frame numbers that form a sequence, so --frames "
+                                "cannot pick a range. To send the whole folder, run the command again without --frames."
+                                .format(len(files)))
+                if not names:
+                    return fail("no frame from {} to {} in this folder: {} runs from {} to {}."
+                                .format(frames[0], frames[1], pattern, lo, hi))
+                keep = set(names)
+                files = [(n, u) for n, u in files if n in keep]
+                print("   {}: frames {} to {}, {} files".format(pattern, frames[0], frames[1], len(files)), flush=True)
+            folder = into or urllib.parse.unquote(urllib.parse.urlsplit(final).path.rstrip("/").rsplit("/", 1)[-1]) or "download"
+            dest = os.path.join(base, folder)
+        else:
+            if frames:
+                return fail("--frames picks frames in a folder, and this address is one file. Give the folder's address.")
+            m = re.search(r'filename="?([^";]+)', r.headers.get("Content-Disposition") or "")
+            name = m.group(1) if m else urllib.parse.unquote(urllib.parse.urlsplit(final).path.rsplit("/", 1)[-1])
+            files = [(os.path.basename(name.strip()) or "download", url)]
+            dest = os.path.join(base, into) if into else base
+    os.makedirs(dest, exist_ok=True)
+    lock, count = threading.Lock(), {"bytes": 0, "done": 0, "kept": 0}
+
+    def fetch(item):
+        name, u = item
+        path = os.path.join(dest, name)
+        with get(u, 600) as resp:
+            size = int(resp.headers.get("Content-Length") or -1)
+            if size >= 0 and os.path.isfile(path) and os.path.getsize(path) == size:
+                with lock:
+                    count["kept"] += 1
+                    count["done"] += 1
+                return
+            with open(path + ".part", "wb") as f:
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    f.write(chunk)
+                    with lock:
+                        count["bytes"] += len(chunk)
+        os.replace(path + ".part", path)
+        with lock:
+            count["done"] += 1
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        jobs = [pool.submit(fetch, item) for item in files]
+        while concurrent.futures.wait(jobs, timeout=3)[1]:
+            print("   {}/{} files · {:.0f} MB".format(count["done"], len(files), count["bytes"] / 1e6), flush=True)
+    failed = ["{} ({})".format(item[0], job.exception()) for item, job in zip(files, jobs) if job.exception() is not None]
+    if failed:
+        return fail("{} of {} files did not arrive; the first: {}. Run the command again: it skips the files already there."
+                    .format(len(failed), len(files), failed[0][:200]))
+    print("AINVFX_PUSH_DONE " + json.dumps({"files": len(files), "kept": count["kept"], "bytes": count["bytes"],
+                                            "seconds": round(time.time() - t0, 1), "dest": dest}), flush=True)
+
+
+def remote_code(url, base, into, frames):
+    """The Python that the pod runs for `push URL`: the functions above, then the call."""
+    parts = ["import json\nimport os\nimport re\nimport time\nimport urllib.parse\nimport urllib.request"]
+    parts += [inspect.getsource(f) for f in (direct_url, index_links, frame_split, frames_in_range, remote_push)]
+    parts.append("remote_push({!r}, {!r}, {!r}, {!r})".format(url, base, into, frames))
+    return "\n\n".join(parts) + "\n"
+
+
+def ws_connect(url, headers, timeout=120):
+    """Open a WebSocket (ws:// or wss://) and return its socket, the handshake done."""
+    u = urllib.parse.urlsplit(url)
+    secure = u.scheme == "wss"
+    sock = socket.create_connection((u.hostname, u.port or (443 if secure else 80)), timeout=timeout)
+    if secure:
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+    lines = ["GET {} HTTP/1.1".format(u.path + ("?" + u.query if u.query else "")), "Host: " + u.netloc,
+             "Upgrade: websocket", "Connection: Upgrade", "Sec-WebSocket-Version: 13",
+             "Sec-WebSocket-Key: " + base64.b64encode(os.urandom(16)).decode("ascii")]
+    lines += ["{}: {}".format(k, v) for k, v in headers.items()]
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+    head = b""
+    while not head.endswith(b"\r\n\r\n"):      # one byte at a time: the frames that follow stay in the socket
+        byte = sock.recv(1)
+        if not byte or len(head) > 65536:
+            break
+        head += byte
+    status = head.split(b"\r\n", 1)[0].decode("latin-1")
+    if " 101" not in status:
+        sock.close()
+        raise ApiError(0, "the WebSocket was refused: " + (status or "no answer"), url)
+    return sock
+
+
+def ws_send(sock, text, opcode=0x1):
+    """One masked frame, as a client must send it."""
+    data = text.encode("utf-8") if isinstance(text, str) else text
+    n = len(data)
+    head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)
+                                     if n < 65536 else bytes([0x80 | 127]) + struct.pack(">Q", n))
+    mask = os.urandom(4)
+    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def ws_messages(sock):
+    """Each text message of the socket, whole. Answers a ping, stops when the other side closes."""
+    def need(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("the connection closed")
+            buf += chunk
+        return buf
+    parts = []
+    while True:
+        b0, b1 = need(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", need(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", need(8))[0]
+        mask = need(4) if b1 & 0x80 else None
+        data = need(n)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        opcode = b0 & 0x0F
+        if opcode == 0x8:
+            return
+        if opcode == 0x9:
+            ws_send(sock, data, 0xA)
+        elif opcode in (0x0, 0x1, 0x2):
+            parts.append(data)
+            if b0 & 0x80:
+                yield b"".join(parts).decode("utf-8", "replace")
+                parts = []
+
+
+def kernel_run(rec, code, on_line):
+    """Run `code` in a new Python kernel of the pod's JupyterLab; each line it prints goes to on_line. The kernel is
+    removed at the end, also on Ctrl+C, which stops what it was doing."""
+    pod_id = rec["id"]
+    if not comfy_alive(pod_id):
+        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
+    token = jupyter_token(proxy_log(pod_id))
+    if not token:
+        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A download "
+            "from a web address runs through JupyterLab.")
+    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    kernel = request("POST", base + "/api/kernels", body={}, headers=hdrs, timeout=60).get("id")
+    if not kernel:
+        die("JupyterLab did not start a kernel on the pod. Try again in a minute.")
+    sock, msg_id = None, uuid.uuid4().hex
+    try:
+        sock = ws_connect(re.sub(r"^http", "ws", base) + "/api/kernels/{}/channels".format(kernel),
+                          dict(hdrs, **{"User-Agent": "ainvfx-runpod/" + VERSION}))
+        ws_send(sock, json.dumps({
+            "header": {"msg_id": msg_id, "msg_type": "execute_request", "username": "ainvfx", "session": uuid.uuid4().hex,
+                       "version": "5.3"},
+            "parent_header": {}, "metadata": {}, "channel": "shell", "buffers": [],
+            "content": {"code": code, "silent": False, "store_history": False, "user_expressions": {},
+                        "allow_stdin": False, "stop_on_error": True}}))
+        pending = ""
+        for text in ws_messages(sock):
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                continue
+            if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                continue
+            kind, content = msg.get("msg_type") or (msg.get("header") or {}).get("msg_type"), msg.get("content") or {}
+            if kind == "stream":
+                pending += content.get("text", "")
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    on_line(line)
+            elif kind == "error":
+                raise ApiError(0, "the pod's Python stopped: {}: {}".format(content.get("ename"), content.get("evalue")), base)
+            elif kind == "status" and content.get("execution_state") == "idle":
+                break
+        if pending:
+            on_line(pending)
+    except (OSError, ConnectionError) as e:
+        raise ApiError(0, "the link to the pod broke ({}). Run the command again: it skips the files already there."
+                       .format(e), base)
+    finally:
+        if sock is not None:
+            sock.close()
+        try:
+            request("DELETE", base + "/api/kernels/" + kernel, headers=hdrs, timeout=30)
+        except ApiError:
+            pass
+
+
+def push_url(args, url):
+    """`push URL`: the pod downloads one file, a folder page's files, or a frame range of them, into ComfyUI's input
+    folder (or /workspace/dataset/NAME with --dataset)."""
+    frames = None
+    if args.frames:
+        m = re.fullmatch(r"(\d+)-(\d+)", args.frames)
+        if not m or int(m.group(1)) > int(m.group(2)):
+            die("--frames takes a first and a last frame number, such as 480-600 (got \"{}\")".format(args.frames))
+        frames = (int(m.group(1)), int(m.group(2)))
+    if args.into and args.dataset:
+        die("--into names a folder of ComfyUI's input; with --dataset, the dataset's name is the folder")
+    for opt, name in ((" --into", args.into), ("--dataset", args.dataset)):
+        if name and not DATASET_NAME.fullmatch(name):
+            die("{} takes a folder name: letters, digits, _ . or - (got \"{}\")".format(opt.strip(), name))
+    _, rec = which_pod(load_config(), args.profile)
+    base, into = (POD_DATASET, args.dataset) if args.dataset else (POD_INPUT, args.into)
+    say("The pod downloads {}".format(url))
+    got = {}
+
+    def on_line(line):
+        if line.startswith("AINVFX_PUSH_DONE "):
+            got.update(json.loads(line.split(" ", 1)[1]))
+        elif line.startswith("AINVFX_PUSH_ERROR "):
+            got["error"] = line.split(" ", 1)[1]
+        elif line.strip():
+            say(line.rstrip())
+    kernel_run(rec, remote_code(url, base, into, frames), on_line)
+    if got.get("error"):
+        die(got["error"])
+    if "files" not in got:
+        die("the pod did not say how the download ended. Run the command again: it skips the files already there.")
+    say("{} file(s) downloaded, {} unchanged, {:.1f} MB in {:.0f} s -> {}".format(
+        got["files"] - got["kept"], got["kept"], got["bytes"] / 1e6, got["seconds"], got["dest"]))
+    if args.dataset:
+        say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(args.dataset))
+    else:
+        say("Done. In ComfyUI, press R to refresh the lists of the loading nodes.")
 
 
 def fetch_to(url, target, headers=None, timeout=600):
@@ -2234,9 +2554,14 @@ def main():
     command("open", cmd_open, "open ComfyUI in the browser")
     command("pull", cmd_pull, "download the outputs")
     p = command("push", cmd_push, "upload files into the pod's input folder, or a training dataset")
-    p.add_argument("files", nargs="+")
+    p.add_argument("files", nargs="+", help="local files, or one web address that the pod downloads itself: a file, "
+                                            "or a folder page that lists its files")
     p.add_argument("--dataset", metavar="NAME", help="send these files and folders into /workspace/dataset/NAME, "
                                                      "for training (through the pod's JupyterLab)")
+    p.add_argument("--frames", metavar="FIRST-LAST", help="with a folder's web address: only the frames of this "
+                                                          "range, found by the numbers in the file names (480-600)")
+    p.add_argument("--into", metavar="NAME", help="with a web address: the folder under ComfyUI's input that "
+                                                  "receives the files (default: the web folder's own name)")
     p = command("down", cmd_down, "pull, then terminate")
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
@@ -2246,8 +2571,8 @@ def main():
     command("doctor", cmd_doctor, "check this machine and the configuration", pod=False)
 
     args = ap.parse_args()
-    # `push image file.png` and `push file.png` both work: a first argument that is a file is a file
-    if args.cmd == "push" and args.profile and Path(args.profile).expanduser().exists():
+    # `push image file.png` and `push file.png` both work: a first argument that is a file or a web address is one
+    if args.cmd == "push" and args.profile and (WEB_ADDRESS.match(args.profile) or Path(args.profile).expanduser().exists()):
         args.files.insert(0, args.profile)
         args.profile = None
     try:

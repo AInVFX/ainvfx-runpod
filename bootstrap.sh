@@ -61,7 +61,7 @@ PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 # The release this script belongs to, logged at start: pod.py's VERSION (tests/test_repo.py checks they agree).
-TOOLKIT_VERSION="1.4.1"
+TOOLKIT_VERSION="1.5.0"
 # models.json, custom_nodes.json and train.py come from the folder this script came from: the branch latest, which
 # follows each release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
 REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest}"
