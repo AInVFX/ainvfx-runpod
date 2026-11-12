@@ -793,6 +793,37 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.retry_cap([pro], False, False, 2.0), 2.49, "the profile's GPU is taken above max_price")
         self.assertIsNone(pod.retry_cap([{"id": "x", "name": "x"}], True, False, 2.5))
 
+    def test_the_price_ceiling_follows_the_catalog(self):
+        """Runpod's catalog of 12 Nov 2026 lists the RTX PRO 6000 at 2.69 USD (2.49 on 10 Nov) and the RTX 5090 at 1.39
+        (1.19 on 29 Oct): the fixed ceiling of 2.50 USD fell below the video profile's own GPU, and `up image` no longer fell back on it. The
+        ceiling is now read in the catalog: the Secure price of the dearest GPU the course's profiles name. A ceiling
+        of one's own (--max-price, AINVFX_MAX_PRICE) wins; a catalog without those GPUs gives none, and then nothing
+        but the profile's GPU is taken without a choice."""
+        pro = {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "name": "RTX PRO 6000", "memory": 96,
+               "price": {"secure": 2.69, "community": 1.69}, "availability": "LOW",
+               "dataCenters": [{"id": "EUR-IS-2", "availability": "LOW"}]}
+        wk = {"id": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "name": "RTX PRO 6000 WK", "memory": 96,
+              "price": {"secure": 2.79, "community": 1.69}, "availability": "LOW",
+              "dataCenters": [{"id": "US-WA-1", "availability": "LOW"}]}
+        r5090 = {"id": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "memory": 32, "price": {"secure": 1.39, "community": 0.69},
+                 "availability": "NONE"}
+        secure = [pro, wk, r5090]
+        self.assertEqual(pod.price_cap(secure), 2.69)
+        self.assertEqual(pod.price_cap(secure, 0), 2.69, "0 is no ceiling of one's own")
+        self.assertEqual(pod.price_cap(secure, 3.5), 3.5)
+        self.assertEqual(pod.price_cap([dict(pro, price={"secure": 3.05})]), 3.05, "tomorrow's price, with no change here")
+        self.assertIsNone(pod.price_cap([wk]))
+        self.assertIsNone(pod.price_cap([dict(pro, price={})]))
+        self.assertEqual(pod.MAX_PRICE, 0, "no price is written in pod.py")
+        cat = {"SECURE": secure}
+        image = {"vram": 32, "gpu": r5090["id"]}
+        cands = pod.pick_candidates(cat, [r5090], False, image, "NA", "CA", pod.price_cap(secure))[3]
+        self.assertEqual([o["name"] for o in cands], ["RTX PRO 6000"], "image falls back on the PRO 6000 at its price of the day")
+        self.assertEqual(pod.pick_candidates(cat, [r5090], False, image, "NA", "CA", 2.5)[3], [], "what the fixed 2.50 did")
+        self.assertEqual(pod.pick_candidates(cat, [r5090], False, image, "NA", "CA", None)[3], [])
+        self.assertEqual(pod.retry_cap([pro], False, False, None), 2.69)
+        self.assertIsNone(pod.retry_cap([{"id": "x", "name": "x"}], False, False, None))
+
     def test_two_commands_keep_each_others_pods(self):
         """Two `up` started at once from one machine (7 Oct 2026): both records must survive."""
         d = tempfile.mkdtemp(prefix="ainvfx-cfg-")
@@ -1266,7 +1297,7 @@ class EndToEnd(unittest.TestCase):
         never started (9 Oct 2026), Community Cloud is left out unless --community is
         given, so the replacement is the Secure RTX PRO 4500 SE, not the cheaper Community RTX 5090. It
         leaves out 24 GB and 1g MIG slices, offers Hopper by number only, and never picks on its own what
-        costs more than 2.50 USD per hour."""
+        costs more than the ceiling: the RTX PRO 6000's price in the catalog, 2.49 USD here."""
         STATE["no_5090"] = True
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
@@ -1278,7 +1309,7 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn("Community Cloud, a host Runpod picks", out, "Community offers are not listed without --community")
         self.assertIn("add --community to include it", out, out)
         self.assertNotIn("B300 MIG", out, "a 1g slice is never listed: 111 s self-test against 16 s (7 Oct 2026)")
-        self.assertIn("above 2.50 USD: by number or --gpu", out, "the B300 is listed, never picked on its own")
+        self.assertIn("above 2.49 USD: by number or --gpu", out, "the B300 is listed, never picked on its own")
         self.assertNotIn("RTX 4090", out, "24 GB: does not fit the image profile")
         self.assertRegex(out, r"H100 SXM .*not Blackwell: untested with the course's models", "Hopper: by number only")
         self.assertNotIn("PRO 6000 MIG 24GB", out, out)
@@ -1292,7 +1323,7 @@ class EndToEnd(unittest.TestCase):
 
     def test_video_without_a_pro_6000_offers_a_5090_taken_by_its_number(self):
         """6 Nov 2026: no RTX PRO 6000 in stock, and the wait never ended (session 11). `up video` lists what fits
-        (the B300, above 2.50 USD) and, by number only, other GPUs in stock: the RTX 5090 among them, marked below
+        (the B300, above the ceiling: the catalog's 2.49 USD) and, by number only, other GPUs in stock: the RTX 5090 among them, marked below
         96 GB. Its number creates it, and nothing else; no answer creates nothing."""
         STATE["schedule"] = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": [(0, ())]}
         self.run_pod("setup", "-y")
@@ -1306,7 +1337,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
         out, rc = self.run_pod("up", "video", "--wait", "1", timeout=60)
-        self.assertIn("ERROR: nothing in stock fits the video profile at 2.50 USD per hour or less", out, out)
+        self.assertIn("ERROR: nothing in stock fits the video profile at 2.49 USD per hour or less", out, out)
         self.assertEqual(len(STATE["posts"]), 1, "no answer: nothing created")
 
     def test_a_profile_of_your_own_with_its_custom_nodes(self):
@@ -1760,16 +1791,16 @@ class EndToEnd(unittest.TestCase):
 
     def test_retry_without_gpu_keeps_the_price_ceiling(self):
         """`up video --retry` with no RTX PRO 6000 free and a B300 in stock at 7.89 USD per hour: the B300 is
-        never created, since `up` takes nothing above 2.50 USD per hour on its own. The RTX PRO 6000 is, once it
+        never created, since `up` takes nothing above its ceiling (the catalog's 2.49 USD) on its own. The RTX PRO 6000 is, once it
         comes back (the third read here)."""
         STATE["schedule"] = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": [(3, ("US-NC-2",))]}
         self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
         self.run_pod("setup", "-y")
         out, rc = self.run_pod("up", "video", "--retry", "-y", "--wait", "1", timeout=120)
         self.assertNotIn("Traceback", out, out)
-        self.assertIn('To take one above 2.50 USD per hour:  python pod.py up video --gpu "B300"', out, out)
+        self.assertIn('To take one above 2.49 USD per hour:  python pod.py up video --gpu "B300"', out, out)
         self.assertIn("Waiting on Secure Cloud for RTX PRO 6000, or any GPU that fits the video profile at up to "
-                      "2.50 USD per hour.", out, out)
+                      "2.49 USD per hour.", out, out)
         self.assertIn("RTX PRO 6000 free on Secure Cloud (US-NC-2): creating it", out, out)
         self.assertEqual([p["gpu"]["id"] for p in STATE["posts"]], ["NVIDIA RTX PRO 6000 Blackwell Server Edition"], out)
         self.assertIn("READY", out, out)
@@ -1788,7 +1819,7 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("up", "video", "--retry", "--wait", "1", input="y\n", timeout=120)
         self.assertNotIn("Traceback", out, out)
         self.assertIn("With --retry: if none can be created now, `up` reads the catalog every 1 s and creates the first "
-                      "one free, at up to 2.50 USD per hour, without asking again.", out, out)
+                      "one free, at up to 2.49 USD per hour, without asking again.", out, out)
         self.assertIn("Create a RTX PRO 6000 at 2.49 USD per hour", out, out)
         self.assertEqual(out.count("[Y/n"), 1, out)
         self.assertIn("None could be created now: waiting, as --retry asks.", out, out)

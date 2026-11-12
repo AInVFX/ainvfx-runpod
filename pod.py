@@ -77,7 +77,8 @@ PROXY_FMT = os.environ.get("AINVFX_PROXY_FMT", "https://{id}-{port}.proxy.runpod
 OUTPUTS = Path(os.environ.get("AINVFX_OUTPUTS") or HERE / "outputs")
 SETTINGS = Path(os.environ.get("AINVFX_SETTINGS") or HERE / "settings.env")
 SETTINGS_LOCAL = Path(os.environ.get("AINVFX_SETTINGS_LOCAL") or SETTINGS.with_name("settings.local.env"))
-MAX_PRICE = env_num("AINVFX_MAX_PRICE", "2.5", float)      # USD per hour: the most `up` picks on its own
+MAX_PRICE = env_num("AINVFX_MAX_PRICE", "0", float)        # USD per hour: your own ceiling for what `up` picks by
+#                                                             itself; 0 follows Runpod's prices of the day (price_cap)
 MAINT_HOURS = env_num("AINVFX_MAINT_HOURS", "24", float)   # a host with maintenance this close is refused
 HOST_WAIT = env_num("AINVFX_HOST_WAIT", "40")              # seconds to wait for the API to name the host
 RETRY_EVERY = max(1, env_num("AINVFX_RETRY_EVERY", "15"))  # `up --retry`: seconds between catalog reads
@@ -799,16 +800,35 @@ def find_gpu(catalog, ref):
         ref, ", ".join('"{}"'.format(g.get("name") or g["id"]) for g in list(hits.values())[:12])))
 
 
+def price_cap(secure, own=None):
+    """The most `up` takes per hour on its own, in USD. `own` when the person set one (--max-price, AINVFX_MAX_PRICE).
+    Otherwise it follows Runpod's prices: the Secure price, read in the catalog at this moment, of the dearest GPU
+    that the course's profiles name. No price is written in this script. None when the catalog prices none of those
+    GPUs: `up` then takes no other GPU on its own."""
+    if own:
+        return float(own)
+    course = {p["gpu"] for p in PROFILES.values()}
+    prices = []
+    for g in secure or []:
+        if g.get("id") in course:
+            try:
+                prices.append(float((g.get("price") or {}).get("secure") or 0))
+            except (TypeError, ValueError):
+                pass
+    prices = [x for x in prices if x > 0]
+    return max(prices) if prices else None
+
+
 def pick_candidates(catalogs, wants, named, spec, region, country, max_price):
     """What `up` may create now, in the order it tries them. With --gpu: the GPUs named, in the order given.
     Without: the profile's GPU on Secure Cloud, then every GPU that fits the profile at max_price or less,
-    cheapest first. Returns (offers, fits, preferred, candidates)."""
+    cheapest first (none when max_price is None). Returns (offers, fits, preferred, candidates)."""
     offers = make_offers(catalogs, region, country)
     fits = [o for o in offers if fits_profile(o, spec["vram"])]
     if named:
         return offers, fits, None, [o for w in wants for o in offers if o["id"] == w["id"]]
     preferred = next((o for o in offers if o["id"] == wants[0]["id"] and o["cloud"] == "SECURE"), None)
-    rest = [o for o in fits if o is not preferred and o["price"] <= max_price]
+    rest = [o for o in fits if o is not preferred and max_price is not None and o["price"] <= max_price]
     return offers, fits, preferred, ([preferred] + rest) if preferred else rest
 
 
@@ -823,7 +843,7 @@ def retry_cap(wants, named, community, max_price):
                 prices.append(float((w.get("price") or {}).get(k)))
             except (TypeError, ValueError):
                 pass
-    if not named:
+    if not named and max_price is not None:
         prices.append(max_price)
     return max(prices) if prices else None
 
@@ -864,7 +884,10 @@ def show_offers(rows, fit_count, pick, spec, max_price):
             why.append("below {} GB of VRAM".format(spec["vram"]))
         if n > fit_count and not o["newer"]:
             why.append("not Blackwell: untested with the course's models")
-        if o["price"] > max_price:
+        if max_price is None:
+            if n <= fit_count and o is not pick:
+                why.append("by number or --gpu")
+        elif o["price"] > max_price:
             why.append("above {}{}".format(fmt_money(max_price), ": by number or --gpu" if n <= fit_count else ""))
         say("   {} {:>2}  {:<18} {:>3} GB  {:>9}  {:<9}  {}{}".format(
             ">" if o is pick else " ", n, o["name"][:18], o["vram"], fmt_money(o["price"]), o["cloud"].title(),
@@ -1309,15 +1332,16 @@ def stop_on_stray(stray):
             "The wait stops here.".format(", ".join(stray), stray[0]))
 
 
-def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name, disk, env):
+def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name, disk, env, own_cap=None):
     """`up --retry`: read the catalog every RETRY_EVERY seconds until a candidate is free, then create it: one
     pod, never more. Returns (pod, host, name). Before each creation the record of `tag` is read again: if
     another `up` has created a pod under that name meanwhile, the wait stops. Ctrl+C exits with code 130."""
     if named:
         what = " or ".join(str(w.get("name") or w["id"]) for w in wants)
     else:
-        what = "{}, or any GPU that fits the {} profile at up to {} per hour".format(
-            wants[0].get("name") or wants[0]["id"], spec["label"], fmt_money(max_price))
+        what = "{}, or any GPU that fits the {} profile{}".format(
+            wants[0].get("name") or wants[0]["id"], spec["label"],
+            " at up to {} per hour".format(fmt_money(max_price)) if max_price is not None else "")
     say("\nWaiting on {} for {}. Every {} s, `up` reads the catalog and creates the first one free.".format(
         "Secure and Community Cloud" if args.community else "Secure Cloud", what, RETRY_EVERY))
     say("Ctrl+C stops the wait. No pod bills before one is created.")
@@ -1340,6 +1364,7 @@ def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_pric
                     say("   {}  the catalog could not be read ({}): still waiting".format(now, e.code or e.detail[:80]))
                     last_note = time.time()
                 continue
+            max_price = price_cap(catalogs.get("SECURE"), own_cap) or max_price   # the ceiling follows each read
             candidates = pick_candidates(catalogs, wants, named, spec, region, country, max_price)[3]
             if not candidates:
                 if time.time() - last_note >= RETRY_NOTE:
@@ -1527,7 +1552,8 @@ def cmd_up(args):
 
     catalogs = read_catalogs(cfg, args.community)
     secure = catalogs.get("SECURE") or []
-    max_price = MAX_PRICE if args.max_price is None else args.max_price
+    own_cap = MAX_PRICE if args.max_price is None else args.max_price     # the person's own ceiling, or none
+    max_price = price_cap(secure, own_cap)                                # else Runpod's price of the day
     named = bool(args.gpu)
     if named:                                 # `--gpu B200 --gpu B300`: those GPUs only, in that order
         wants = []
@@ -1570,8 +1596,8 @@ def cmd_up(args):
         if candidates:
             say("   Replacement: {}.".format(offer_line(candidates[0])))
         elif fits:
-            say('   To take one above {} per hour:  python pod.py up {} --gpu "{}"'.format(
-                fmt_money(max_price), profile, fits[0]["name"]))
+            say('   To take one{}:  python pod.py up {} --gpu "{}"'.format(
+                " above {} per hour".format(fmt_money(max_price)) if max_price is not None else "", profile, fits[0]["name"]))
         if not args.community:
             say("   Community Cloud is not considered: add --community to include it (cheaper; the host is"
                 " picked by Runpod and can fail to start).")
@@ -1618,8 +1644,8 @@ def cmd_up(args):
     else:
         pick = choose("   Take one of these? [a number, or Enter for nothing] ", rows, None) if rows and not args.yes else None
         if pick is None:
-            die("nothing created." if named else "nothing in stock fits the {} profile at {} per hour or less. "
-                "Try again in a few minutes.".format(profile, fmt_money(max_price)))
+            die("nothing created." if named else "nothing in stock fits the {} profile{}. Try again in a few minutes.".format(
+                profile, " at {} per hour or less".format(fmt_money(max_price)) if max_price is not None else ""))
     if pick is not None and pick is not first:   # chosen by number: that GPU only, as --gpu would, waits included
         wants = [next((g for gpus in catalogs.values() for g in gpus if g["id"] == pick["id"]), pick)]
         named, wname, candidates = True, pick["name"], [pick]
@@ -1636,7 +1662,7 @@ def cmd_up(args):
             say("   None could be created now: waiting, as --retry asks.")
     if not created:
         created, host, name = wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_price, make_name,
-                                             disk, env)
+                                             disk, env, own_cap)
 
     pod_id = created["id"]
     created_at = datetime.now(timezone.utc)
@@ -2531,8 +2557,9 @@ def main():
     p.add_argument("--gpu", action="append", metavar="NAME",
                    help='a GPU by its name ("RTX PRO 4500 SE") or full id; only that GPU is tried. '
                         "Repeat it to accept several, tried in the order given: --gpu B200 --gpu B300")
-    p.add_argument("--max-price", type=float, help="the most per hour `up` takes on its own when the profile's GPU "
-                                                   "has no stock (default {:.2f} USD)".format(MAX_PRICE))
+    p.add_argument("--max-price", type=float, help="the most per hour, in USD, that `up` takes on its own when the "
+                                                   "profile's GPU has no stock (default: today's price of the "
+                                                   "course's dearest GPU, read in Runpod's catalog)")
     p.add_argument("--disk", type=int, help="container disk in GB (default: from the models list)")
     p.add_argument("--region", choices=["EU", "NA"])
     p.add_argument("--community", action="store_true",
