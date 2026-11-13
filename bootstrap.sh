@@ -19,7 +19,7 @@
 #
 # Environment variables, all optional (settings.env documents them; the defaults are the course's):
 #   AINVFX_PROFILE        image · 3d · video · train, several joined by + (image+3d), or all. Default image
-#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.44.0
+#   AINVFX_COMFY_TAG      the ComfyUI git tag or branch. Default v0.45.3
 #   AINVFX_PYTHON         default 3.13
 #   AINVFX_TORCH          the PyTorch packages, with pip flags if wanted. Default: torch torchvision torchaudio
 #   AINVFX_TORCH_INDEX    default https://download.pytorch.org/whl/cu130
@@ -56,12 +56,12 @@ if [ "$MODE" != "all" ]; then
 fi
 
 PROFILE="${AINVFX_PROFILE:-image}"
-TAG="${AINVFX_COMFY_TAG:-v0.44.0}"
+TAG="${AINVFX_COMFY_TAG:-v0.45.3}"
 PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 # The release this script belongs to, logged at start: pod.py's VERSION (tests/test_repo.py checks they agree).
-TOOLKIT_VERSION="1.5.0"
+TOOLKIT_VERSION="1.5.1"
 # models.json, custom_nodes.json and train.py come from the folder this script came from: the branch latest, which
 # follows each release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
 REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest}"

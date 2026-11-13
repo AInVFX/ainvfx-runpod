@@ -216,7 +216,7 @@ A published tag never moves: a fix is the next patch release. Only `latest` move
 | Container disk | 200 GB: any single profile fits; `up` sizes the disk for a combination |
 | Ports | `8188/http` (ComfyUI), `8888/http` (JupyterLab), `22/tcp` (SSH) |
 | CUDA versions | 13.0 and newer (extend the list when Runpod adds one) |
-| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.44.0`, `AINVFX_REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
+| Environment | `AINVFX_PROFILE=image`, `AINVFX_COMFY_TAG=v0.45.3`, `AINVFX_REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest`, `HF_TOKEN={{ RUNPOD_SECRET_huggingface_token }}` |
 
 The start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW`, and falls back to Runpod's `/start.sh` when GitHub cannot be reached:
 
