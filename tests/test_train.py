@@ -299,6 +299,88 @@ class Units(unittest.TestCase):
             train.check_blocks("ltx_av", train.dataset_blocks(train.make_config("ltx_av", sound), "v"), "v")
         self.assertIn("1 clip(s) have no sound", out.getvalue())
         self.assertIn(": b.mp4", out.getvalue())
+    def test_a_mixed_dataset(self):
+        """ltx_mix: one block per kind with its own cache; the clips read whole up to 121 frames; the blocks with sound
+        repeated until 30% of the steps have sound; the settings of ltx_av with the two flags of a mixed run."""
+        mix = train.DATASETS / "mix"
+        (mix / "images").mkdir(parents=True)
+        for k in range(12):
+            (mix / "images" / "i{:02d}.png".format(k)).write_bytes(b"png")
+            (mix / "images" / "i{:02d}.txt".format(k)).write_text("mxw, a lighthouse, still {}\n".format(k))
+        clip(mix / "clips" / "c1.mp4", 121, sound=True, caption="mxw, waves break on the rocks, the sea roars")
+        clip(mix / "clips" / "c2.mp4", 97, caption="mxw, gulls cross the frame")
+        (mix / "audio").mkdir()
+        (mix / "audio" / "s1.wav").write_bytes(b"wav")
+        (mix / "audio" / "s1.txt").write_text("mxw, a foghorn in the distance\n")
+        blocks = tomllib.loads(train.make_config("ltx_mix", mix))["datasets"]
+        self.assertEqual([[k for k in b if k.endswith("_directory") and k != "cache_directory"] for b in blocks],
+                         [["image_directory"], ["video_directory"], ["audio_directory"]])
+        self.assertEqual((blocks[1]["frame_extraction"], blocks[1]["max_frames"]), ("full", 121))
+        self.assertIsInstance(blocks[1]["target_fps"], float)
+        self.assertEqual(len({b["cache_directory"] for b in blocks}), 3)
+        self.assertEqual([b["num_repeats"] for b in blocks], [1, 4, 4], "8 of 24 steps with sound: 33%")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            infos = train.check_blocks("ltx_mix", train.dataset_blocks(train.make_config("ltx_mix", mix), "m"), "m")
+        self.assertIn("8 of the 24 steps", out.getvalue())
+        self.assertIn("1 clip(s) have no sound", out.getvalue())
+        self.assertEqual([i["kind"] for i in infos], ["images", "clips", "sounds"])
+        args = train.RECIPES["ltx_mix"]["args"]
+        self.assertEqual(args[:len(train.LTX_AV)], train.LTX_AV)
+        self.assertEqual((train.arg_value(args, "--audio_batch_probability"),
+                          train.arg_value(args, "--audio_supervision_mode")), ("0.4", "warn"))
+        self.assertEqual(train.RECIPES["ltx_mix"]["cache"], train.RECIPES["ltx_av"]["cache"])
+        self.assertEqual(train.sound_repeats(0, 2, 0), 1)
+        self.assertEqual(train.sound_repeats(12, 1, 99), 1, "out of reach even at 10: left at 1, and the check says so")
+
+    def test_a_flat_mixed_folder(self):
+        """Without sub-folders, one block per kind of file in the folder, each with its own cache; two files of one name
+        would share a caption, which stops the run."""
+        flat = train.DATASETS / "flat"
+        flat.mkdir()
+        (flat / "a.png").write_bytes(b"png")
+        (flat / "a.txt").write_text("fw, a still\n")
+        clip(flat / "b.mp4", 121, sound=True, caption="fw, a clip")
+        (flat / "c.wav").write_bytes(b"wav")
+        (flat / "c.txt").write_text("fw, a sound\n")
+        blocks = tomllib.loads(train.make_config("ltx_mix", flat))["datasets"]
+        self.assertEqual([b.get("image_directory") or b.get("video_directory") or b.get("audio_directory")
+                          for b in blocks], [str(flat)] * 3)
+        self.assertEqual(len({b["cache_directory"] for b in blocks}), 3)
+        clip(flat / "a.mp4", 121, sound=True)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            train.make_config("ltx_mix", flat)
+
+    def test_a_mixed_dataset_that_cannot_train_stops_before_the_gpu(self):
+        """No sound at all, sound alone, a sound file without its caption; and a block of sound files given to a recipe
+        that trains on clips."""
+        mute = train.DATASETS / "mute"
+        clip(mute / "clips" / "c.mp4", 121, caption="w, a silent shot")
+        (mute / "images").mkdir()
+        (mute / "images" / "i.png").write_bytes(b"png")
+        (mute / "images" / "i.txt").write_text("w, a still")
+        heard = train.DATASETS / "heard"
+        (heard / "audio").mkdir(parents=True)
+        (heard / "audio" / "s.wav").write_bytes(b"wav")
+        (heard / "audio" / "s.txt").write_text("w, a voice")
+        bare = train.DATASETS / "bare_sound"
+        clip(bare / "clips" / "c.mp4", 121, sound=True, caption="w, a shot")
+        (bare / "audio").mkdir()
+        (bare / "audio" / "s.wav").write_bytes(b"wav")
+        (bare / "audio" / "t.wav").write_bytes(b"wav")
+        (bare / "audio" / "t.txt").write_text("w, a voice")
+        for folder, words in ((mute, "no clip with a sound track"), (heard, "only sound files"),
+                              (bare, "1 sound file(s) without a caption")):
+            err = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                train.check_blocks("ltx_mix", train.dataset_blocks(train.make_config("ltx_mix", folder), "x"), "x")
+            self.assertIn(words, err.getvalue())
+        text = '[general]\nresolution = [960, 544]\n[[datasets]]\naudio_directory = "{}"\ncache_directory = "/c"\n'.format(
+            heard / "audio")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            train.check_blocks("ltx", train.dataset_blocks(text, "t.toml"), "t.toml")
+        self.assertIn("holds sounds, and the ltx recipe trains on clips", err.getvalue())
 
 @unittest.skipIf(train is None, "train.py runs on the pod, with Python 3.11 or newer")
 class Runs(unittest.TestCase):
@@ -390,6 +472,28 @@ class Runs(unittest.TestCase):
         out, rc = self.run_train("caption", "chars", "--trigger", "two words")
         self.assertNotEqual(rc, 0, out)
 
+    def test_a_mixed_run_end_to_end(self):
+        """ltx_mix through the command: its config of three blocks, the settings of ltx_av with the two flags of a mixed
+        run, a clip's caption as the first sample prompt, the fork's ComfyUI copies linked."""
+        mix = train.DATASETS / "mixrun"
+        (mix / "images").mkdir(parents=True)
+        for stem in ("i1", "i2"):
+            (mix / "images" / (stem + ".png")).write_bytes(b"png")
+            (mix / "images" / (stem + ".txt")).write_text("mxr, a lighthouse at dusk\n")
+        clip(mix / "clips" / "c1.mp4", 121, sound=True, caption="mxr, waves break on the rocks, the sea roars")
+        (mix / "audio").mkdir()
+        (mix / "audio" / "s1.wav").write_bytes(b"wav")
+        (mix / "audio" / "s1.txt").write_text("mxr, a foghorn in the distance\n")
+        out, rc = self.run_train("ltx_mix", "x1", "--dataset", "mixrun")
+        self.assertEqual(rc, 0, out)
+        run = train.RUNS / "x1"
+        args = json.loads((run / "args.json").read_text())
+        self.assertEqual(train.arg_value(args, "--ltx2_mode"), "av")
+        self.assertEqual(train.arg_value(args, "--audio_batch_probability"), "0.4")
+        self.assertEqual((run / "dataset.toml").read_text().count("[[datasets]]"), 3)
+        self.assertTrue((run / "prompts.txt").read_text().splitlines()[2].startswith("mxr, waves break"), out)
+        self.assertIn("2 of the 4 steps of each pass over the data have sound", out)
+        self.assertTrue((train.LORAS / "x1" / "x1.comfy.safetensors").is_symlink(), out)
 
 if __name__ == "__main__":
     unittest.main()

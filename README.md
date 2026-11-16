@@ -171,8 +171,9 @@ The `train` profile makes the pod a training machine too. After ComfyUI, it inst
 | `ltx_images` | a look, on LTX 2.5, from still images | images | 70 GB | 1,500 · 1e-4 · 32 |
 | `ltx_iclora` | a control video turned into a result (an IC-LoRA) | clip pairs | 70 GB | 2,000 · 1e-4 · 32 |
 | `ltx_av` | the picture and the sound together, on LTX 2.5 | clips with sound | 70 GB | 1,500 · 1e-4 · 32 |
+| `ltx_mix` | the look, the motion and the sound together, on LTX 2.5 | stills, clips and sound files | 70 GB | 1,500 · 1e-4 · 32 |
 
-A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip with its caption. The trainer reads each clip at 25 fps and takes its first 121 frames: it leaves out a shorter clip ([Clips of several lengths](#clips-of-several-lengths)). **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names.
+A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip with its caption. The trainer reads each clip at 25 fps and takes its first 121 frames: it leaves out a shorter clip ([Clips of several lengths](#clips-of-several-lengths)). **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names. **Stills, clips and sound**: up to three sub-folders, `images/`, `clips/` and `audio/` ([Stills, clips and sound in one run](#stills-clips-and-sound-in-one-run)).
 
 ### A first run
 
@@ -216,7 +217,7 @@ train ltx_iclora fx_s1 --dataset fx/low.toml \
   --then fx --from fx_s2 --steps 500 --lr 2e-5 --dataset fx/high.toml
 ```
 
-The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods. The `moss` recipe follows the MOSS-Image guide of sd-scripts and is not yet proven on a pod. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
+The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods, except `ltx_mix`: it follows the trainer's guide for mixed audio and video training, with the settings of `ltx_av`, and has not yet run to the end on a pod. The `moss` recipe follows the MOSS-Image guide of sd-scripts and is not yet proven on a pod. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
 
 ### Clips of several lengths
 
@@ -240,7 +241,32 @@ target_fps = 25.0
 num_repeats = 1
 ```
 
-Each clip then gives all its frames up to 121, rounded down to a length of 8k + 1 frames, the lengths LTX's video encoder takes: 97 stays 97, 100 becomes 97. The trainer decodes each clip whole before it keeps the start, so cut a long clip first.
+Each clip then gives all its frames up to 121, rounded down to a length of 8k + 1 frames, the lengths LTX's video encoder takes: 97 stays 97, 100 becomes 97. The trainer decodes each clip whole before it keeps the start, so cut a long clip first. The `ltx_mix` recipe reads its clips this way.
+
+### Stills, clips and sound in one run
+
+The `ltx_mix` recipe trains the look, the motion and the sound of a subject in one run. Put each kind of file in its own sub-folder of the dataset folder, each file with its caption. Each sub-folder is optional:
+
+| Sub-folder | Files | What they teach |
+|---|---|---|
+| `images/` | stills | the look; a still teaches the sound nothing |
+| `clips/` | clips of any length, with or without a sound track | the motion, and the sound when the clip has one |
+| `audio/` | sound files: `.wav`, `.flac`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.opus` or `.wma` | the sound alone |
+
+Any mix works: stills and clips, clips and sound files, stills and sound files, or all three. A dataset folder without these sub-folders works too: `train` sorts its files by kind. Each file then needs its own name, since a still and a clip of the same name would share one caption.
+
+```bash
+python pod.py push --dataset mysubject mysubject/     # mysubject/images, mysubject/clips, mysubject/audio
+train ltx_mix mysubject_v1 --dataset mysubject        # in a terminal on the pod
+```
+
+Before any GPU time, `train` checks the mix:
+
+- **The share of steps with sound.** In each pass over the dataset, the trainer takes every file once, so the share of steps with sound is the share of files with sound. Many stills slow the sound down. The trainer's guide aims at 30 to 50% of steps with sound. `train` repeats the clips and the sound files, up to 10 times in each pass, until at least 30% of the steps have sound, and writes the repeats in the run's `dataset.toml` (`num_repeats`). `--audio_batch_probability 0.4` then spreads the steps with sound through each pass.
+- **A clip without a sound track** trains the picture only. The trainer's sound cache counts it as failed (`No audio stream found`), so `train` names those clips first.
+- **No sound at all** stops the run, since the recipe trains the sound too. For the picture alone, train `ltx_images` on the stills, then `ltx` on the clips with `--from` the first run.
+- **A file without its caption**: a still is left out; a clip or a sound file stops the run, since the trainer would stop on it.
+- **Clips of any length** count: the recipe reads each clip whole, up to 121 frames ([Clips of several lengths](#clips-of-several-lengths)).
 
 ## How `up` picks a GPU
 

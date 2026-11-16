@@ -52,6 +52,7 @@ COMFY_URL = os.environ.get("AINVFX_COMFY_URL", "http://127.0.0.1:8188")
 CAPTION_MODEL = "Qwen/Qwen3-VL-8B-Instruct"                         # Apache 2.0, 17.6 GB, downloaded at first use
 IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")        # the fork's IMAGE_EXTENSIONS and VIDEO_EXTENSIONS
 VIDEOS = (".mp4", ".webm", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg")
+SOUNDS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma")    # the fork's AUDIO_EXTENSIONS
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 ACTIVE = ("starting", "running")
 SAVE_EVERY = 250          # steps between two checkpoints, and two sets of samples
@@ -59,6 +60,10 @@ STABLE_SECONDS = 15       # a checkpoint untouched this long is complete: it is 
 CLIP_FPS = 25.0           # the frame rate the trainer reads an LTX clip at, when its block names none
 FRAME_STEP = 8            # LTX's video encoder takes the first frame alone, then groups of 8: 8k + 1 frames
 LONG_CLIP = 10            # a clip read whole that runs this many times the frames kept is named: decoded whole
+SOUND_SHARE = 0.3         # the least share of steps with sound in a mixed run; the trainer's guide aims at 30-50%
+MIX = (("images", "images"), ("clips", "clips"), ("audio", "sounds"))   # a mixed dataset: sub-folder, kind
+KINDS = {"images": (IMAGES, "image_directory"), "clips": (VIDEOS, "video_directory"),
+         "sounds": (SOUNDS, "audio_directory")}       # a kind's files and the block key the trainer reads
 
 # ----------------------------------------------------------------------------- recipes
 # A recipe is one kind of LoRA: its family of base files (the `training` part of models.json names them), the data it
@@ -89,6 +94,15 @@ LTX_SAMPLE = "--n blurry, low quality, static, watermark --w 768 --h 448 --f 65 
 LTX_STYLE = ["--ltx2_mode", "video", "--lora_target_preset", "video_sa_ca_ff", "--timestep_sampling",
              "shifted_logit_normal", "--shifted_logit_uniform_prob", "0.30", "--caption_dropout_rate", "0.1",
              "--max_train_steps", "1500"]
+# The sound and the picture together (ltx_av and ltx_mix): the caches read each clip's own sound track.
+LTX_AV_CACHE = [LTX_LATENTS + ["--ltx2_audio_vae", "{audio_vae}", "--ltx2_mode", "av", "--ltx2_audio_source", "video"],
+                LTX_TEXT + ["--ltx2_mode", "av"]]
+LTX_AV = LTX_TRAIN + ["--ltx2_audio_vae", "{audio_vae}", "--ltx2_mode", "av", "--separate_audio_buckets",
+                      "--lora_target_preset", "t2v", "--audio_dim", "16", "--audio_alpha", "16", "--audio_lr", "5e-5",
+                      "--timestep_sampling", "shifted_logit_normal", "--shifted_logit_uniform_prob", "0.30",
+                      "--caption_dropout_rate", "0.1", "--max_train_steps", "1500", "--sample_merge_audio"]
+LTX_AV_SAMPLE = ("a control room, rows of consoles under a large screen, slow pan; a voice on the radio counts down, "
+                 "the room is quiet")
 RECIPES = {
     "zimage": dict(
         about="Z-Image LoRA on Z-Image Base: a style, a character, an object",
@@ -165,21 +179,28 @@ RECIPES = {
     "ltx_av": dict(
         about="LTX 2.5 LoRA from clips with their sound: the picture and the audio together",
         family="ltx", data="clips", general=dict(resolution=[960, 544], batch_size=1), block=LTX_CLIPS,
-        cache=[LTX_LATENTS + ["--ltx2_audio_vae", "{audio_vae}", "--ltx2_mode", "av", "--ltx2_audio_source", "video"],
-               LTX_TEXT + ["--ltx2_mode", "av"]],
+        cache=LTX_AV_CACHE, script="ltx2_train_network.py", args=LTX_AV, comfy="fork", sample=LTX_AV_SAMPLE,
+        options=LTX_SAMPLE, control=None),
+    # Stills, clips and sound files in one run, as the trainer's guide sets it out (« Mixed Audio-Video Training »),
+    # with the settings of ltx_av and one block per kind of file. A still teaches the look and gives the sound
+    # nothing; a clip teaches the motion, and the sound when it has a sound track; a sound file teaches the sound
+    # alone. The trainer takes each item once per pass over the data, so the share of steps with sound is the share
+    # of items with sound: the blocks with sound repeat until it reaches SOUND_SHARE (mixed_blocks), and
+    # --audio_batch_probability spreads those steps through each pass. The clips are read whole up to 121 frames.
+    "ltx_mix": dict(
+        about="LTX 2.5 LoRA from stills, clips and sound files together: the look, the motion and the sound",
+        family="ltx", data="mixed", general=dict(resolution=[960, 544], batch_size=1),
+        block=dict(frame_extraction="full", max_frames=121, target_fps=25.0), cache=LTX_AV_CACHE,
         script="ltx2_train_network.py",
-        args=LTX_TRAIN + ["--ltx2_audio_vae", "{audio_vae}", "--ltx2_mode", "av", "--separate_audio_buckets",
-                          "--lora_target_preset", "t2v", "--audio_dim", "16", "--audio_alpha", "16", "--audio_lr", "5e-5",
-                          "--timestep_sampling", "shifted_logit_normal", "--shifted_logit_uniform_prob", "0.30",
-                          "--caption_dropout_rate", "0.1", "--max_train_steps", "1500", "--sample_merge_audio"],
-        comfy="fork", sample="a control room, rows of consoles under a large screen, slow pan; a voice on the radio "
-                             "counts down, the room is quiet", options=LTX_SAMPLE, control=None),
+        args=LTX_AV + ["--audio_batch_probability", "0.4", "--audio_supervision_mode", "warn"], comfy="fork",
+        sample=LTX_AV_SAMPLE, options=LTX_SAMPLE, control=None),
 }
 DATA = {
     "images": "images, each with its caption: a .txt of the same name",
     "clips": "video clips of 121 frames or more, each with its caption",
     "image pairs": "targets/ (the results, with their captions) and control/ (the images to edit, same names)",
     "clip pairs": "targets/ (the result clips, with their captions) and control/ (the control clips, same names)",
+    "mixed": "images/ (stills), clips/ (any length, with or without a sound track) and audio/ (sound files), each optional, every file with its caption",
 }
 CAPTION_PROMPTS = {
     "image": "Describe this image in two sentences: subject, action, framing, lighting, setting. Present tense, "
@@ -408,23 +429,85 @@ def make_config(recipe, folder):
         lines += ["", "[[datasets.subsets]]", "image_dir = {}".format(toml_value(str(folder))), "num_repeats = 1"]
         return "\n".join(lines) + "\n"
     general = dict(dict(caption_extension=".txt", enable_bucket=True, bucket_no_upscale=False), **r["general"])
-    cache = CACHE / recipe / cache_name(folder)
-    block = {}
-    if r["data"] == "images":
-        block["image_directory"] = str(folder)
-    elif r["data"] == "clips":
-        block["video_directory"] = str(folder)
-    elif r["data"] == "image pairs":
-        block.update(image_directory=str(folder / "targets"), control_directory=str(folder / "control"))
+    if r["data"] == "mixed":
+        blocks = mixed_blocks(recipe, folder)
     else:
-        block.update(video_directory=str(folder / "targets"), reference_directory=str(folder / "control"),
-                     reference_cache_directory=str(cache) + "_control")
-    block.update(r["block"])
-    block.update(cache_directory=str(cache), num_repeats=1)
+        cache = CACHE / recipe / cache_name(folder)
+        block = {}
+        if r["data"] == "images":
+            block["image_directory"] = str(folder)
+        elif r["data"] == "clips":
+            block["video_directory"] = str(folder)
+        elif r["data"] == "image pairs":
+            block.update(image_directory=str(folder / "targets"), control_directory=str(folder / "control"))
+        else:
+            block.update(video_directory=str(folder / "targets"), reference_directory=str(folder / "control"),
+                         reference_cache_directory=str(cache) + "_control")
+        block.update(r["block"])
+        block.update(cache_directory=str(cache), num_repeats=1)
+        blocks = [block]
     lines = head + ["[general]"]
     lines += ["{} = {}".format(k, toml_value(v)) for k, v in general.items()]
-    lines += ["", "[[datasets]]"] + ["{} = {}".format(k, toml_value(v)) for k, v in block.items()]
+    for block in blocks:
+        lines += ["", "[[datasets]]"] + ["{} = {}".format(k, toml_value(v)) for k, v in block.items()]
     return "\n".join(lines) + "\n"
+
+
+def mix_parts(folder):
+    """[(kind, folder)] of a dataset for the ltx_mix recipe: its sub-folders images/, clips/ and audio/, those that
+    exist; or, with none of them, the folder itself once for each kind of file it holds. The trainer lists a folder by
+    its files' extensions, so the blocks of one folder each take their own kind."""
+    subs = [(kind, folder / sub) for sub, kind in MIX if (folder / sub).is_dir()]
+    return subs or [(kind, folder) for _, kind in MIX if media_files(folder, KINDS[kind][0])]
+
+
+def sound_repeats(stills, sound, silent):
+    """How many times the blocks with sound (clips and sound files) repeat in one pass over the data: the least, up to
+    10, that gives at least SOUND_SHARE of the steps with sound. Stills repeat once. When even 10 falls short (many
+    clips without sound), 1, and the check says what to change."""
+    for r in range(1, 11):
+        if sound and r * sound >= SOUND_SHARE * (stills + r * (sound + silent)):
+            return r
+    return 1
+
+
+def mixed_blocks(recipe, folder):
+    """The blocks of a mixed dataset: one per kind of file, each with its own cache; the clips read whole up to 121
+    frames; the blocks with sound repeated as sound_repeats says, from the captioned files' count."""
+    parts = mix_parts(folder)
+    if not parts:
+        die("{} holds no images, clips or sound files, and no images/, clips/ or audio/ folder (README, \"Stills, clips "
+            "and sound in one run\")".format(folder))
+    others = sorted(p.name for p in folder.iterdir() if p.is_dir() and not p.name.startswith(".")
+                    and p.name not in [sub for sub, _ in MIX])
+    if others and any(where != folder for _, where in parts):
+        say("{}: not read: {} (the ltx_mix recipe reads images/, clips/ and audio/)".format(folder, ", ".join(others)))
+    if len({where for _, where in parts}) < len(parts):  # one folder for several kinds: one caption per name
+        stems = Counter(f.stem for kind, where in parts for f in media_files(where, KINDS[kind][0]))
+        shared = sorted(s for s, k in stems.items() if k > 1)
+        if shared:
+            die("{}: a still, a clip or a sound file share a name, and so one caption: {}. Give each file its own name, "
+                "or put each kind in its own sub-folder: images/, clips/, audio/".format(folder, ", ".join(shared[:4])))
+    stills = sound = silent = 0
+    for kind, where in parts:
+        files = [f for f in media_files(where, KINDS[kind][0]) if caption_of(f)]
+        if kind == "images":
+            stills += len(files)
+        elif kind == "sounds":
+            sound += len(files)
+        else:                                           # a clip that cannot be read here counts as one with sound
+            probes = [clip_probe(f) for f in files]
+            silent += sum(1 for p in probes if p and not p[2])
+            sound += sum(1 for p in probes if not p or p[2])
+    repeats, blocks = sound_repeats(stills, sound, silent), []
+    for kind, where in parts:
+        block = {KINDS[kind][1]: str(where)}
+        if kind == "clips":
+            block.update(RECIPES[recipe]["block"])
+        name = cache_name(where) if where != folder else "{}_{}".format(cache_name(folder), kind)
+        block.update(cache_directory=str(CACHE / recipe / name), num_repeats=1 if kind == "images" else repeats)
+        blocks.append(block)
+    return blocks
 
 
 def dataset_config(recipe, ref):
@@ -595,45 +678,58 @@ def check_clips(where, block, files, av_run):
                 where, need, rate, need, need / rate)), 0
 
 
+def block_kind(b):
+    """The kind of files a block holds: images, clips, image pairs, clip pairs or sounds."""
+    if "audio_directory" in b or "audio_jsonl_file" in b:
+        return "sounds"
+    pairs = " pairs" if b.get("reference_directory") or b.get("control_directory") else "s"
+    return ("clip" if "video_directory" in b or "video_jsonl_file" in b else "image") + pairs
+
+
 def check_blocks(recipe, blocks, source):
     """Every block of a dataset config, checked against the recipe before any GPU time is spent: its folder, its files,
-    their captions and partners, the clips' lengths, and two settings the trainer refuses. Returns one summary per
-    block (None for a JSONL dataset, which is not checked here)."""
+    their captions and partners, the clips' lengths, two settings the trainer refuses, and for a mixed run the share
+    of steps with sound. Returns one summary per block (None for a JSONL dataset, which is not checked here)."""
     want, infos, caches, problems = RECIPES[recipe]["data"], [], [], []
     trainer = RECIPES[recipe].get("trainer", "musubi-tuner")
+    accepted = ("images", "clips", "sounds") if want == "mixed" else (want,)
     for n, b in enumerate(blocks, 1):
         where = "{} (block {})".format(source, n) if len(blocks) > 1 else source
         if b.get("_format") != trainer:
             problems.append("{} is in {}'s dataset format, and the {} recipe trains with {}".format(
                 where, b.get("_format"), recipe, trainer))
             continue
-        if "image_jsonl_file" in b or "video_jsonl_file" in b:
+        if "image_jsonl_file" in b or "video_jsonl_file" in b or "audio_jsonl_file" in b:
             say("{}: a JSONL dataset, not checked here".format(where))
             infos.append(None)
             continue
-        video = "video_directory" in b
-        folder, control = b.get("video_directory") or b.get("image_directory"), b.get("reference_directory") or b.get(
-            "control_directory")
-        kind = ("clip" if video else "image") + (" pairs" if control else "s")
-        if kind != want:
-            problems.append("{} holds {}, and the {} recipe trains on {}".format(where, kind, recipe, want))
+        kind = block_kind(b)
+        if kind not in accepted:
+            problems.append("{} holds {}, and the {} recipe trains on {}".format(
+                where, kind, recipe, "stills, clips and sound files" if want == "mixed" else want))
             continue
+        video, sounds = kind.startswith("clip"), kind == "sounds"
+        folder = b.get("video_directory") or b.get("image_directory") or b.get("audio_directory")
+        control = b.get("reference_directory") or b.get("control_directory")
         if not folder or not Path(folder).is_dir():
             problems.append("{}: no folder {}{}".format(where, folder, " (a pair dataset holds targets/ and control/)"
                                                         if control else ""))
             continue
-        files = media_files(folder, VIDEOS if video else IMAGES)
+        files = media_files(folder, SOUNDS if sounds else VIDEOS if video else IMAGES)
+        noun = "sound files" if sounds else "clips" if video else "images"
         captioned = [f for f in files if caption_of(f)]
         bare = [f.name for f in files if not caption_of(f)]
         index = control_index(control) if control and Path(control).is_dir() else {}
         if not files:
-            problems.append("{}: no {} in {}".format(where, "clips" if video else "images", folder))
+            problems.append("{}: no {} in {}".format(where, noun, folder))
         elif not captioned:
-            problems.append("{}: no captions in {}: `train caption <dataset> --trigger <word>` writes them".format(
-                where, folder))
-        elif video and bare:                            # the trainer opens each clip's caption and stops on a missing one
-            problems.append("{}: {} clip(s) without a caption, and the trainer stops on the first one: write theirs, "
-                            "or take them out: {}".format(where, len(bare), ", ".join(bare[:4])))
+            problems.append("{}: no captions in {}: {}".format(where, folder, "write one for each sound file (README, "
+                            "\"Stills, clips and sound in one run\")" if sounds else
+                            "`train caption <dataset> --trigger <word>` writes them"))
+        elif bare and (video or sounds):                # the trainer opens each caption and stops on a missing one
+            problems.append("{}: {} {} without a caption, and the trainer stops on the first one: write theirs, or "
+                            "take them out: {}".format(where, len(bare), "clip(s)" if video else "sound file(s)",
+                                                       ", ".join(bare[:4])))
         elif control and not Path(control).is_dir():
             problems.append("{}: no folder {} (the files the model is given, same names as the results)".format(
                 where, control))
@@ -653,21 +749,46 @@ def check_blocks(recipe, blocks, source):
                 problems.append("{}: cache_directory {} is another block's too: the trainer needs one per "
                                 "block".format(where, cache))
             caches.append(cache)
-        sound = 0
+        sound = len(captioned) if sounds else 0
         if files and captioned:
-            say("{}: {} {}, {} with a caption{}".format(where, len(files), "clips" if video else "images", len(captioned),
+            say("{}: {} {}, {} with a caption{}".format(where, len(files), noun, len(captioned),
                                                         ", each with its partner" if control else ""))
-            if bare and not video:
+            if bare and not (video or sounds):
                 say("  {} without a caption: write theirs, or take them out{}".format(
                     len(bare), " (the trainer leaves them out)" if trainer == "musubi-tuner" else ""))
             if video:
                 problem, sound = check_clips(where, b, captioned, av_recipe(recipe))
                 if problem:
                     problems.append(problem)
-        infos.append(dict(files=captioned, control=control, index=index, kind=kind, sound=sound))
+        infos.append(dict(files=captioned, control=control, index=index, kind=kind, sound=sound,
+                          repeats=int(b.get("num_repeats", 1))))
+    if want == "mixed" and not problems:
+        mix_share(source, [i for i in infos if i], problems)
     if problems:
         die("the dataset is not ready:\n  " + "\n  ".join(problems))
     return infos
+
+
+def mix_share(source, infos, problems):
+    """The share of steps with sound in a mixed run, said before any GPU time. No sound stops the run, since the
+    trainer's sampler fails without it (--audio_batch_probability), and so does sound without a still or a clip."""
+    if not infos:
+        return
+    if all(i["kind"] == "sounds" for i in infos):
+        problems.append("{}: only sound files: the ltx_mix recipe needs stills or clips beside them".format(source))
+        return
+    steps = sum(len(i["files"]) * i["repeats"] for i in infos)
+    heard = sum((len(i["files"]) if i["sound"] is None else i["sound"]) * i["repeats"] for i in infos)
+    if not heard:
+        problems.append("{}: no clip with a sound track and no sound file, and the ltx_mix recipe trains the sound too. "
+                        "For the picture alone: `train ltx_images` on the stills, then `train ltx` on the clips with "
+                        "--from the first run".format(source))
+        return
+    say("{}: {} of the {} steps of each pass over the data have sound ({:.0%}; the trainer's guide aims at 30 to "
+        "50%)".format(source, heard, steps, heard / steps))
+    if heard / steps < SOUND_SHARE:
+        say("  Under 30%, the sound learns slowly. Add clips with sound or sound files, take stills out, or raise "
+            "num_repeats on the blocks with sound in a copy of the run's dataset.toml")
 
 
 # ----------------------------------------------------------------------------- sample prompts
@@ -862,7 +983,8 @@ def cmd_train(recipe, argv):
         except OSError:
             die("no prompts file {}".format(prompts_file))
     else:
-        info = next((i for i in plans[0][1] if i), None)
+        infos = [i for i in plans[0][1] if i]          # a mixed run's prompts start from a clip's caption
+        info = next((i for i in infos if i["kind"] == "clips"), infos[0] if infos else None)
         if not info:
             die("--prompts FILE is needed: this dataset's files could not be read here")
         prompts, trigger = make_prompts(recipe, info, trigger)

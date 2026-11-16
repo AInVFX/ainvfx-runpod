@@ -98,6 +98,8 @@ pod.py                               api.runpod.io                      start co
 
 A recipe is data (`RECIPES`): argument lists with `{name}` placeholders, filled per run (`fill`). `--steps`, `--lr`, `--rank` and `--from` edit those lists (`set_flag`, `with_rank`). `train caption` writes captions with Qwen3-VL-8B-Instruct (downloaded at first use, 17.6 GB).
 
+**The mixed recipe** (`ltx_mix`) reads one block per kind of file (`mix_parts`, `mixed_blocks`): `images/`, `clips/` and `audio/`, or one folder listed by its files' extensions, as the trainer lists it. Each block has its own cache. The trainer's audio sampler (`AudioProbabilityIndexSampler`, `audio_quota_sampler.py`) takes each item once per pass over the data: `--audio_batch_probability` orders the steps, and the share of steps with sound is the share of items with sound, counted with `num_repeats`. So `sound_repeats` repeats the blocks with sound, up to 10 times, until `SOUND_SHARE` (30%) of the steps have sound, and `mix_share` states the share before any GPU time. The sampler raises an error when no batch has sound, so no sound stops the check. In `av` mode the trainer's sound cache counts a clip without a sound track as failed and trains it as a step without sound; `check_clips` names such clips first. A block of sound files in an `av` run gets a virtual video latent from the trainer, the fix of its pinned commit. A sound file without its caption stops the check, as a clip does.
+
 ## 8. Where files go
 
 On the user's computer:
@@ -149,7 +151,7 @@ The header (steps, variables, modes), then the settings and paths, the helpers (
 
 ### `train.py`, in file order
 
-The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION_PROMPTS`), the helpers, the job record, the base files, the datasets (`make_config`, `check_blocks`, and the clips' check: `clip_probe`, `frames_at`, `frames_kept`, `check_clips`), the sample prompts, a run (`parse_stages`, `stage_commands`, `publish`, `cmd_train`, `run_job`, `run_stage`, `follow`), the other commands, the captions, and `main`.
+The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION_PROMPTS`), the helpers, the job record, the base files, the datasets (`make_config` with a mixed dataset's `mix_parts`, `sound_repeats` and `mixed_blocks`; `check_blocks` with `mix_share`; the clips' check: `clip_probe`, `frames_at`, `frames_kept`, `check_clips`), the sample prompts, a run (`parse_stages`, `stage_commands`, `publish`, `cmd_train`, `run_job`, `run_stage`, `follow`), the other commands, the captions, and `main`.
 
 ### Data files
 
@@ -167,7 +169,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 | Module | What it proves | Needs |
 |---|---|---|
 | `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
-| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, the clips' lengths (with a stand-in for PyAV), sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
+| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, the clips' lengths (with a stand-in for PyAV), sample prompts, stages, a run end to end, a chain, a mixed dataset and a mixed run, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
 | `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py`, `custom_nodes.json` names known profiles, `bootstrap.sh` installs the custom nodes `pod.py` announces | Python 3.8 or newer (`sed` for the last test) |
 
 **CI** (`.github/workflows/tests.yml`) runs on every push and pull request: pyflakes, shellcheck and vermin; the whole suite on Python 3.12 and 3.14; the pod and repository tests on Python 3.8.
@@ -231,6 +233,7 @@ The variable appears once, so the command works whether Runpod runs it directly 
 - **GraphQL, for two reads.** `pod.py` reads the pod's host with its maintenance window (`MACHINE_QUERY`) and the account's credit (`MONEY_QUERY`) through Runpod's GraphQL API, because REST v2 offers neither: its specification (`https://api.runpod.io/v2/openapi.json`, version 2.0.0, read on 29 October 2026) has no maintenance window, no balance and no spend rate. Runpod's own CLI shows the same GraphQL fields (`clientBalance`, `currentSpendPerHr` in `runpodctl user`). Runpod deprecates GraphQL for integrators in early 2027. When GraphQL stops answering, `pod.py` keeps working: `up` skips the host check and the credit line, and `test_up_and_down_work_without_graphql` proves it. Move both reads to REST v2 once Runpod adds them there.
 - **`push URL` reads plain folder pages only.** A folder page must list its files as links, as Apache and nginx write them. A share page drawn by a script (a Google Drive or Dropbox folder) lists nothing, and subfolders are not followed. The WebSocket client in `pod.py` holds only what a kernel needs: text frames, ping and close.
 - **The `moss` recipe** follows sd-scripts' MOSS-Image guide and has not yet run on a pod.
+- **The `ltx_mix` recipe** follows the trainer's guide for mixed audio and video training, with the settings of `ltx_av`, and has not yet run to the end on a pod. Its clips are read with `frame_extraction = "full"`, which decodes each clip whole before it keeps up to `max_frames`: a long clip costs time and memory.
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
 - **Custom nodes are not pinned.** `custom_nodes.json` and `AINVFX_CUSTOM_NODES` clone each node's default branch at its latest commit.
 - **The pod's address is its only protection.** ComfyUI has no login, and the log it serves holds JupyterLab's token. ComfyUI's own origin check refuses a click from another site, which is why the console's Connect button can show an empty 403 page: kept on purpose.
