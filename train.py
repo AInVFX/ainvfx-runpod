@@ -22,6 +22,7 @@ bootstrap.sh pins for it. README.md, "Training a LoRA", is the guide.
 """
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -55,6 +56,9 @@ RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 ACTIVE = ("starting", "running")
 SAVE_EVERY = 250          # steps between two checkpoints, and two sets of samples
 STABLE_SECONDS = 15       # a checkpoint untouched this long is complete: it is then converted for ComfyUI
+CLIP_FPS = 25.0           # the frame rate the trainer reads an LTX clip at, when its block names none
+FRAME_STEP = 8            # LTX's video encoder takes the first frame alone, then groups of 8: 8k + 1 frames
+LONG_CLIP = 10            # a clip read whole that runs this many times the frames kept is named: decoded whole
 
 # ----------------------------------------------------------------------------- recipes
 # A recipe is one kind of LoRA: its family of base files (the `training` part of models.json names them), the data it
@@ -478,14 +482,127 @@ def control_index(folder):
     return {p.stem: p for p in media_files(folder, IMAGES + VIDEOS)}
 
 
+# ----------------------------------------------------------------------------- clips: their length and their sound
+def have_pyav():
+    """True when PyAV can be imported: the trainer's environment holds it, so `train` always has it on a pod."""
+    import importlib.util
+    return importlib.util.find_spec("av") is not None
+
+
+def clip_probe(path):
+    """(frames, frames per second, has a sound track) of a clip, read from its container by PyAV; None when the file
+    cannot be read, or when PyAV is missing. The frame count is the one the video stream states, or its packets
+    counted when the container states none."""
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        with av.open(str(path)) as c:
+            v = c.streams.video[0]
+            fps = float(v.average_rate or v.base_rate or 0)
+            frames = int(v.frames or 0) or sum(1 for p in c.demux(v) if p.size)
+            return frames, fps, any(s.type == "audio" for s in c.streams)
+    except Exception:                                     # PyAV's own errors, or a file without a video stream
+        return None
+
+
+def frames_at(frames, fps, rate):
+    """The frames a clip gives at the block's frame rate, counted as the trainer counts them: it drops frames to reach
+    the rate only when the source's rate, rounded up, is more than 1 away from it; a slower source keeps every frame."""
+    if not fps or fps <= rate or abs(math.ceil(fps) - rate) <= 1:
+        return frames
+    return int((frames - 1) * rate / fps) + 1
+
+
+def frame_length(n):
+    """A length as LTX's video encoder takes it: rounded down to 8k + 1 frames (0 for none)."""
+    return (n - 1) // FRAME_STEP * FRAME_STEP + 1 if n > 0 else 0
+
+
+def frames_kept(block, frames):
+    """The frames the trainer takes from a clip that gives `frames` at the block's rate, 0 when it leaves the clip out:
+    from the start, the longest length of target_frames that fits ("head", the default), or the whole clip up to
+    max_frames ("full"); both as 8k + 1 frames."""
+    if block.get("frame_extraction", "head") == "full":
+        return frame_length(min(frames, int(block.get("max_frames", 129))))
+    return max((frame_length(t) for t in block.get("target_frames", [1]) if frames >= frame_length(t)), default=0)
+
+
+def av_recipe(recipe):
+    """True for a recipe that trains the sound too (--ltx2_mode av)."""
+    return arg_value(RECIPES[recipe]["args"], "--ltx2_mode") == "av"
+
+
+def check_clips(where, block, files, av_run):
+    """The clips' lengths before any GPU time: the frames each clip gives at the block's frame rate, against what the
+    trainer takes from it. Says how many clips the trainer leaves out and names the first ones; in a run with sound,
+    names the clips without a sound track. Returns (a problem when no clip can be used, else None; the number of
+    clips with a sound track, None when PyAV is missing here)."""
+    if not have_pyav():
+        say("{}: the clips' lengths are not checked here: PyAV is missing (the trainer's environment holds it)".format(
+            where))
+        return None, None
+    rate, full = float(block.get("target_fps") or CLIP_FPS), block.get("frame_extraction", "head") == "full"
+    source, most = block.get("source_fps"), frames_kept(block, 10 ** 9)
+    rows, unread = [], []
+    for f in files:
+        probe = clip_probe(f)
+        if probe:
+            n = frames_at(probe[0], float(source or probe[1]), rate)
+            rows.append((f.name, n, frames_kept(block, n), probe[2]))
+        else:
+            unread.append(f.name)
+
+    def named(items):
+        names = [x if isinstance(x, str) else "{} ({})".format(x[0], x[1]) for x in items]
+        return ", ".join(names[:4]) + (" and {} more".format(len(names) - 4) if len(names) > 4 else "")
+    kept, out = [r for r in rows if r[2]], [r for r in rows if not r[2]]
+    if full:
+        lengths = sorted(Counter(r[2] for r in kept).items(), reverse=True)
+        say("{}: at {:g} fps, each clip is read whole up to {} frames: {}".format(where, rate, most, ", ".join(
+            "{} of {} frames".format(c, k) for k, c in lengths) or "none"))
+        stills = [r for r in kept if r[2] == 1]
+        if stills:
+            say("  {} clip(s) give fewer than {} frames: the trainer keeps one frame of each, as a still: {}".format(
+                len(stills), FRAME_STEP + 1, named(stills)))
+        long_ = [r for r in kept if r[1] > LONG_CLIP * most]
+        if long_:
+            say("  {} clip(s) run far longer than {} frames, and the trainer decodes each whole first: cut them to save "
+                "time and memory: {}".format(len(long_), most, named(long_)))
+    elif most == 1:
+        say("{}: target_frames is [1], the trainer's default, so it takes 1 frame of each clip, as a still. For clips, "
+            "set target_frames = [121], or frame_extraction = \"full\" with max_frames = 121".format(where))
+    else:
+        say("{}: at {:g} fps, {} of {} clips give the {} frames the trainer takes".format(
+            where, rate, len(kept), len(files), most))
+        if out:
+            say("  {} clip(s) give fewer frames, and the trainer leaves them out: {}".format(len(out), named(out)))
+    if unread:
+        say("  {} file(s) could not be read as clips, and the trainer leaves them out: {}".format(
+            len(unread), named(unread)))
+    silent = [r[0] for r in rows if not r[3]]
+    if av_run and silent:
+        say("  {} clip(s) have no sound: they train the picture only, and the trainer's sound cache counts each as "
+            "failed (\"No audio stream found\"): {}".format(len(silent), named(silent)))
+    if kept:
+        return None, sum(1 for r in rows if r[3])
+    if full:
+        return "{}: no file here could be read as a clip".format(where), 0
+    need = min(frame_length(t) for t in block.get("target_frames", [1]))
+    return ("{}: no clip gives {} frames at {:g} fps, so the trainer would have nothing to learn from. Use clips of {} "
+            "frames or more ({:.1f} s), or have each read whole (README, \"Clips of several lengths\")".format(
+                where, need, rate, need, need / rate)), 0
+
+
 def check_blocks(recipe, blocks, source):
     """Every block of a dataset config, checked against the recipe before any GPU time is spent: its folder, its files,
-    their captions and partners, and two settings the trainer refuses. Returns one summary per block (None for a
-    JSONL dataset, which is not checked here)."""
+    their captions and partners, the clips' lengths, and two settings the trainer refuses. Returns one summary per
+    block (None for a JSONL dataset, which is not checked here)."""
     want, infos, caches, problems = RECIPES[recipe]["data"], [], [], []
+    trainer = RECIPES[recipe].get("trainer", "musubi-tuner")
     for n, b in enumerate(blocks, 1):
         where = "{} (block {})".format(source, n) if len(blocks) > 1 else source
-        trainer = RECIPES[recipe].get("trainer", "musubi-tuner")
         if b.get("_format") != trainer:
             problems.append("{} is in {}'s dataset format, and the {} recipe trains with {}".format(
                 where, b.get("_format"), recipe, trainer))
@@ -507,12 +624,16 @@ def check_blocks(recipe, blocks, source):
             continue
         files = media_files(folder, VIDEOS if video else IMAGES)
         captioned = [f for f in files if caption_of(f)]
+        bare = [f.name for f in files if not caption_of(f)]
         index = control_index(control) if control and Path(control).is_dir() else {}
         if not files:
             problems.append("{}: no {} in {}".format(where, "clips" if video else "images", folder))
         elif not captioned:
             problems.append("{}: no captions in {}: `train caption <dataset> --trigger <word>` writes them".format(
                 where, folder))
+        elif video and bare:                            # the trainer opens each clip's caption and stops on a missing one
+            problems.append("{}: {} clip(s) without a caption, and the trainer stops on the first one: write theirs, "
+                            "or take them out: {}".format(where, len(bare), ", ".join(bare[:4])))
         elif control and not Path(control).is_dir():
             problems.append("{}: no folder {} (the files the model is given, same names as the results)".format(
                 where, control))
@@ -532,12 +653,18 @@ def check_blocks(recipe, blocks, source):
                 problems.append("{}: cache_directory {} is another block's too: the trainer needs one per "
                                 "block".format(where, cache))
             caches.append(cache)
+        sound = 0
         if files and captioned:
             say("{}: {} {}, {} with a caption{}".format(where, len(files), "clips" if video else "images", len(captioned),
                                                         ", each with its partner" if control else ""))
-            if len(captioned) < len(files):
-                say("  {} without a caption: write theirs, or take them out".format(len(files) - len(captioned)))
-        infos.append(dict(files=captioned, control=control, index=index))
+            if bare and not video:
+                say("  {} without a caption: write theirs, or take them out{}".format(
+                    len(bare), " (the trainer leaves them out)" if trainer == "musubi-tuner" else ""))
+            if video:
+                problem, sound = check_clips(where, b, captioned, av_recipe(recipe))
+                if problem:
+                    problems.append(problem)
+        infos.append(dict(files=captioned, control=control, index=index, kind=kind, sound=sound))
     if problems:
         die("the dataset is not ready:\n  " + "\n  ".join(problems))
     return infos

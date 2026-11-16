@@ -172,7 +172,7 @@ The `train` profile makes the pod a training machine too. After ComfyUI, it inst
 | `ltx_iclora` | a control video turned into a result (an IC-LoRA) | clip pairs | 70 GB | 2,000 · 1e-4 · 32 |
 | `ltx_av` | the picture and the sound together, on LTX 2.5 | clips with sound | 70 GB | 1,500 · 1e-4 · 32 |
 
-A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip of 121 frames or more with its caption; the trainer reads its first 121 frames at 25 fps. **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names.
+A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip with its caption. The trainer reads each clip at 25 fps and takes its first 121 frames: it leaves out a shorter clip ([Clips of several lengths](#clips-of-several-lengths)). **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names.
 
 ### A first run
 
@@ -217,6 +217,30 @@ train ltx_iclora fx_s1 --dataset fx/low.toml \
 ```
 
 The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods. The `moss` recipe follows the MOSS-Image guide of sd-scripts and is not yet proven on a pod. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
+
+### Clips of several lengths
+
+The trainer reads every clip at 25 frames per second: from a clip filmed at 50 fps, it keeps every second frame. The `ltx`, `ltx_av` and `ltx_iclora` recipes take the first 121 frames of each clip (4.8 seconds) and leave out a shorter clip, and the trainer's log does not say so. So before any GPU time, `train` reads the length of every clip. It says how many clips the trainer will leave out, names the first ones with their frames at 25 fps, and stops when no clip is long enough. A clip without its caption stops it too, since the trainer would stop on that clip.
+
+To keep shorter clips with `ltx` or `ltx_av`, have each clip read whole, up to 121 frames. Save this dataset config as `/workspace/dataset/mychar_full.toml`, with your folder's name in it, then give it to the run: `train ltx mychar_v1 --dataset mychar_full.toml`.
+
+```toml
+[general]
+caption_extension = ".txt"
+enable_bucket = true
+resolution = [960, 544]
+batch_size = 1
+
+[[datasets]]
+video_directory = "/workspace/dataset/mychar"
+cache_directory = "/workspace/cache/ltx/mychar_full"
+frame_extraction = "full"
+max_frames = 121
+target_fps = 25.0
+num_repeats = 1
+```
+
+Each clip then gives all its frames up to 121, rounded down to a length of 8k + 1 frames, the lengths LTX's video encoder takes: 97 stays 97, 100 becomes 97. The trainer decodes each clip whole before it keeps the start, so cut a long clip first.
 
 ## How `up` picks a GPU
 

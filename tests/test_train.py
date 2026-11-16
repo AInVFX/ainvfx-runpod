@@ -9,7 +9,7 @@ whose `accelerate` runs the script it is given, fake musubi-tuner and sd-scripts
 write (checkpoints, ComfyUI copies, their arguments), the course's models.json with dummy base files, and datasets.
 `Units` tests the pure functions; `Runs` runs the real commands through subprocess, as on the pod.
 """
-import json, os, shutil, subprocess, sys, tempfile, time, unittest
+import contextlib, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -18,6 +18,52 @@ TMP = Path(tempfile.mkdtemp(prefix="ainvfx-train-"))
 os.environ["AINVFX_ROOT"] = str(TMP)                  # before train.py is imported: its folders follow
 os.environ["AINVFX_COMFY_URL"] = "http://127.0.0.1:9"  # no ComfyUI here: the request to free its memory fails at once
 sys.path.insert(0, str(REPO))
+FAKE_AV = TMP / "fake_av"                             # a stand-in for PyAV, which train.py reads the clips with
+FAKE_AV.mkdir()
+(FAKE_AV / "av.py").write_text('''"""A stand-in for PyAV in the tests. A clip file holds JSON: {"frames": 97, "fps": 25.0, "sound": true}.
+A file that holds anything else cannot be read, as PyAV fails on a broken file."""
+import io
+import json
+
+
+class Stream:
+    def __init__(self, kind, frames=0, fps=0.0):
+        self.type, self.frames, self.average_rate, self.base_rate = kind, frames, fps, fps
+
+
+class Streams(list):
+    @property
+    def video(self):
+        return [s for s in self if s.type == "video"]
+
+
+class Packet:
+    size = 1
+
+
+class Container:
+    def __init__(self, path):
+        with io.open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.streams = Streams([Stream("video", d.get("frames", 0), d.get("fps", 25.0))]
+                               + ([Stream("audio")] if d.get("sound") else []))
+        self.packets = d.get("packets", 0)
+
+    def demux(self, stream):
+        return [Packet() for _ in range(self.packets)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def open(path):
+    return Container(path)
+''', encoding="utf-8")
+sys.path.insert(0, str(FAKE_AV))
+os.environ["PYTHONPATH"] = os.pathsep.join([str(FAKE_AV)] + [p for p in [os.environ.get("PYTHONPATH")] if p])
 try:
     import tomllib
     import train
@@ -48,6 +94,13 @@ for w in (name + "-step00000250.safetensors", name + ".safetensors"):
 print("steps: 100%| 250/250")
 """
 
+
+def clip(path, frames, fps=25.0, sound=False, caption=None):
+    """A clip for the stand-in PyAV, with its caption when one is given."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(frames=frames, fps=fps, sound=sound)), encoding="utf-8")
+    if caption:
+        path.with_suffix(".txt").write_text(caption + "\n", encoding="utf-8")
 
 def setUpModule():
     if not train:
@@ -82,9 +135,9 @@ def setUpModule():
     for sub in ("targets", "control"):
         (train.DATASETS / "fx" / sub).mkdir(parents=True)
     for stem in ("s1", "s2"):
-        (train.DATASETS / "fx" / "targets" / (stem + ".mp4")).write_bytes(b"mp4")
+        (train.DATASETS / "fx" / "targets" / (stem + ".mp4")).write_text(json.dumps(dict(frames=130, fps=25.0)))
         (train.DATASETS / "fx" / "targets" / (stem + ".txt")).write_text("fxw, smoke rises from a chimney\n")
-        (train.DATASETS / "fx" / "control" / (stem + ".mp4")).write_bytes(b"mp4")
+        (train.DATASETS / "fx" / "control" / (stem + ".mp4")).write_text(json.dumps(dict(frames=130, fps=25.0)))
 
 
 def tearDownModule():
@@ -195,6 +248,57 @@ class Units(unittest.TestCase):
             self.assertEqual(table[name][-2], "{} GB".format(round(size)), name)
             self.assertEqual(table[name][-1], "{:,} · {} · {}".format(int(steps), lr, rank), name)
 
+    def test_the_frames_a_clip_gives(self):
+        """The trainer's own count: frames dropped to reach the block's rate only beyond 1 fps of it; lengths of 8k + 1;
+        head keeps a clip only when it is long enough, full keeps it whole up to max_frames."""
+        self.assertEqual(train.frames_at(97, 25.0, 25.0), 97)
+        self.assertEqual(train.frames_at(97, 24.0, 25.0), 97, "24 fps is within 1 of 25: no frame dropped")
+        self.assertEqual(train.frames_at(97, 23.976, 25.0), 97)
+        self.assertEqual(train.frames_at(97, 50.0, 25.0), 49)
+        self.assertEqual(train.frames_at(121, 30.0, 25.0), 101)
+        self.assertEqual(train.frames_at(60, 12.0, 25.0), 60, "a slower source keeps every frame")
+        head, full = dict(train.LTX_CLIPS), dict(frame_extraction="full", max_frames=121)
+        self.assertEqual([train.frames_kept(head, n) for n in (97, 121, 300)], [0, 121, 121])
+        self.assertEqual([train.frames_kept(full, n) for n in (5, 97, 100, 300)], [1, 97, 97, 121])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):                # a config of one's own that names no target_frames
+            train.check_clips("t", dict(target_fps=25.0), [train.DATASETS / "fx" / "targets" / "s1.mp4"], False)
+        self.assertIn("takes 1 frame of each clip, as a still", out.getvalue())
+
+    def test_clip_lengths_are_checked_before_the_gpu(self):
+        """A clip shorter than the recipe's 121 frames at 25 fps is named before any GPU time; no clip long enough, or a
+        clip without its caption, stops the run; a run with sound names the clips without a sound track."""
+        folder = train.DATASETS / "lengths"
+        clip(folder / "a.mp4", 97, caption="w, a")
+        clip(folder / "b.mp4", 97, fps=50.0, caption="w, b")
+        clip(folder / "c.mp4", 150, caption="w, c")
+        (folder / "d.mp4").write_bytes(b"\xff\xfe broken")
+        (folder / "d.txt").write_text("w, d")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            infos = train.check_blocks("ltx", train.dataset_blocks(train.make_config("ltx", folder), "l"), "l")
+        self.assertEqual(len(infos[0]["files"]), 4)
+        self.assertIn("1 of 4 clips give the 121 frames", out.getvalue())
+        self.assertIn("a.mp4 (97), b.mp4 (49)", out.getvalue())
+        self.assertIn("could not be read as clips", out.getvalue())
+        short = train.DATASETS / "allshort"
+        clip(short / "a.mp4", 97, caption="w, a")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            train.check_blocks("ltx", train.dataset_blocks(train.make_config("ltx", short), "s"), "s")
+        self.assertIn("no clip gives 121 frames at 25 fps", err.getvalue())
+        clip(short / "e.mp4", 130)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            train.check_blocks("ltx", train.dataset_blocks(train.make_config("ltx", short), "s"), "s")
+        self.assertIn("1 clip(s) without a caption, and the trainer stops on the first one", err.getvalue())
+        sound = train.DATASETS / "withsound"
+        clip(sound / "a.mp4", 130, sound=True, caption="w, a")
+        clip(sound / "b.mp4", 130, caption="w, b")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            train.check_blocks("ltx_av", train.dataset_blocks(train.make_config("ltx_av", sound), "v"), "v")
+        self.assertIn("1 clip(s) have no sound", out.getvalue())
+        self.assertIn(": b.mp4", out.getvalue())
 
 @unittest.skipIf(train is None, "train.py runs on the pod, with Python 3.11 or newer")
 class Runs(unittest.TestCase):

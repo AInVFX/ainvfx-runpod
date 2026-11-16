@@ -91,7 +91,7 @@ pod.py                               api.runpod.io                      start co
 
 **A run** (`train.py`).
 
-1. `train <recipe> <run> --dataset ...` checks everything before any GPU time: the dataset's folders, files, captions and pairs (`check_blocks`), the sample prompts (`make_prompts`), the base files (`ensure_models`: downloaded once into `ComfyUI/models`, with a disk check first).
+1. `train <recipe> <run> --dataset ...` checks everything before any GPU time: the dataset's folders, files, captions and pairs (`check_blocks`), the frames each clip gives (`check_clips`), the sample prompts (`make_prompts`), the base files (`ensure_models`: downloaded once into `ComfyUI/models`, with a disk check first). `check_clips` reads each clip's container with PyAV, which the trainer's environment holds, and counts as the trainer does: frames dropped to reach the block's rate only when the source's rate, rounded up, is more than 1 away from it; lengths of 8k + 1 frames; `head` keeps a clip only when it is long enough, `full` keeps it whole up to `max_frames`. A clip without its caption stops the check: the trainer opens each clip's caption while caching and stops on a missing one, while it leaves out an image without one.
 2. It writes the job record `ComfyUI/output/train/.job.json`, asks ComfyUI to free the GPU (`/free`), starts itself in the background in a new session (`train _run`), then follows the log.
 3. The background process runs each stage's commands in order: the trainer's caching scripts (musubi-tuner), then `accelerate launch` of the training script. Every 30 seconds it publishes the new checkpoints (`publish`): Z-Image's converted for ComfyUI once untouched for 15 seconds, LTX's `.comfy.safetensors` copies, the others as they are, each linked under `ComfyUI/models/loras/train/<run>/`.
 4. `log` and `status` read the job record and the run's `train.log`. `stop` signals the whole process group: SIGTERM, then SIGKILL after 30 seconds.
@@ -149,7 +149,7 @@ The header (steps, variables, modes), then the settings and paths, the helpers (
 
 ### `train.py`, in file order
 
-The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION_PROMPTS`), the helpers, the job record, the base files, the datasets, the sample prompts, a run (`parse_stages`, `stage_commands`, `publish`, `cmd_train`, `run_job`, `run_stage`, `follow`), the other commands, the captions, and `main`.
+The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION_PROMPTS`), the helpers, the job record, the base files, the datasets (`make_config`, `check_blocks`, and the clips' check: `clip_probe`, `frames_at`, `frames_kept`, `check_clips`), the sample prompts, a run (`parse_stages`, `stage_commands`, `publish`, `cmd_train`, `run_job`, `run_stage`, `follow`), the other commands, the captions, and `main`.
 
 ### Data files
 
@@ -167,7 +167,7 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 | Module | What it proves | Needs |
 |---|---|---|
 | `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
-| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
+| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, the clips' lengths (with a stand-in for PyAV), sample prompts, stages, a run end to end, a chain, a MOSS-Image run, a failure, `stop`, captions in a dry run, and README's recipe table | Python 3.11 or newer (skipped below) |
 | `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py`, `custom_nodes.json` names known profiles, `bootstrap.sh` installs the custom nodes `pod.py` announces | Python 3.8 or newer (`sed` for the last test) |
 
 **CI** (`.github/workflows/tests.yml`) runs on every push and pull request: pyflakes, shellcheck and vermin; the whole suite on Python 3.12 and 3.14; the pod and repository tests on Python 3.8.
