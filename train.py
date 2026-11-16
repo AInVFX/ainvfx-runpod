@@ -57,6 +57,8 @@ RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 ACTIVE = ("starting", "running")
 SAVE_EVERY = 250          # steps between two checkpoints, and two sets of samples
 STABLE_SECONDS = 15       # a checkpoint untouched this long is complete: it is then converted for ComfyUI
+BEAT = float(os.environ.get("AINVFX_BEAT", "30"))   # seconds between two marks of a run in its record (`beat`), its sign
+                                                    # of life, and two looks for new checkpoints; the tests shorten it
 CLIP_FPS = 25.0           # the frame rate the trainer reads an LTX clip at, when its block names none
 FRAME_STEP = 8            # LTX's video encoder takes the first frame alone, then groups of 8: 8k + 1 frames
 LONG_CLIP = 10            # a clip read whole that runs this many times the frames kept is named: decoded whole
@@ -1009,7 +1011,7 @@ def cmd_train(recipe, argv):
         if line.strip() and not line.startswith("#"):
             say("  " + line)
     paths = ensure_models(RECIPES[recipe]["family"])
-    job = dict(recipe=recipe, state="starting", stage=0, created=time.time(), stages=[])
+    job = dict(recipe=recipe, state="starting", stage=0, created=time.time(), beat=time.time(), stages=[])
     for st, (text, _) in zip(stages, plans):
         run = RUNS / st["name"]
         (run / "logs").mkdir(parents=True, exist_ok=True)
@@ -1031,7 +1033,7 @@ def cmd_train(recipe, argv):
 
 def run_job(argv=None):
     """The background part of a run (`train _run`): every stage in order; the first failure ends the run."""
-    job = update_job(pid=os.getpid(), state="running", started=time.time())
+    job = update_job(pid=os.getpid(), state="running", started=time.time(), beat=time.time())
     for i, st in enumerate(job["stages"]):
         update_job(stage=i)
         rc = run_stage(job["recipe"], st, i, len(job["stages"]))
@@ -1054,8 +1056,10 @@ def run_stage(recipe, st, i, n):
             p = subprocess.Popen(cmd, cwd=st["cwd"], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             while p.poll() is None:
                 time.sleep(2)
-                if title == "training" and time.time() - last >= 30:
-                    publish(recipe, run, st["name"])
+                if time.time() - last >= BEAT:
+                    update_job(beat=time.time())          # the record of a run in progress keeps moving
+                    if title == "training":
+                        publish(recipe, run, st["name"])
                     last = time.time()
             if p.returncode:
                 note("FAILED · {} ended with code {} after {}: the lines above say why".format(

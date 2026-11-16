@@ -477,9 +477,9 @@ class Runs(unittest.TestCase):
         self.assertEqual(train.read_job()["state"], "failed")
 
     def test_stop(self):
-        """A run stopped from another terminal: its process group ends, the record says stopped, and the terminal
-        that followed it returns."""
-        e = dict(os.environ, FAKE_SLEEP="60")
+        """A run in progress marks its record every BEAT seconds, its sign of life. Stopped from another terminal: its
+        process group ends, the record says stopped, and the terminal that followed it returns."""
+        e = dict(os.environ, FAKE_SLEEP="60", AINVFX_BEAT="1")
         e.pop("HF_TOKEN", None)
         follower = subprocess.Popen([sys.executable, str(REPO / "train.py"), "zimage", "st1", "--dataset", "chars"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e)
@@ -489,7 +489,12 @@ class Runs(unittest.TestCase):
                 if job.get("stages", [{}])[0].get("name") == "st1" and job.get("state") == "running" and job.get("pid"):
                     break
                 time.sleep(0.2)
-            pid = train.read_job()["pid"]
+            pid, beat = train.read_job()["pid"], train.read_job()["beat"]
+            for _ in range(100):
+                if train.read_job()["beat"] > beat:
+                    break
+                time.sleep(0.2)
+            self.assertGreater(train.read_job()["beat"], beat, "the record of a run in progress keeps moving")
             out, rc = self.run_train("stop", "-y")
             self.assertEqual(rc, 0, out)
             self.assertEqual(train.read_job()["state"], "stopped")
