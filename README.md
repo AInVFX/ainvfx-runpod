@@ -191,7 +191,7 @@ train caption mychar --trigger mychr            # writes a caption for every ima
 train zimage mychar_v1 --dataset mychar         # trains in the background; its log follows on screen
 ```
 
-- **Read every caption before training.** JupyterLab opens the `.txt` files under `workspace/dataset/mychar`. The caption model makes mistakes, and a wrong word is learned like the others. `train caption` ends with the words found in most captions: a word that describes the style goes in `--avoid`, then `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`.
+- **Read every caption before training.** JupyterLab opens the `.txt` files under `workspace/dataset/mychar`. The caption model makes mistakes, and a wrong word is learned like the others. `train caption` ends with the words found in most captions: a word that describes the style goes in `--avoid`, then `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`. For `ltx_av`, `--audio` adds what is heard to each clip's caption: the caption model hears nothing and guesses the sound from the picture, so read those lines too.
 - **During the run**, Ctrl+C stops the display, never the run. `train log` shows it again, `train status` says where it stands, `train stop` stops it. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
 - **Every 250 steps**, a checkpoint and test images (samples) land in `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI to refresh it). Judge the samples, not the loss curve: stop when they stop improving.
 - **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats.
@@ -267,6 +267,8 @@ Before any GPU time, `train` checks the mix:
 - **No sound at all** stops the run, since the recipe trains the sound too. For the picture alone, train `ltx_images` on the stills, then `ltx` on the clips with `--from` the first run.
 - **A file without its caption**: a still is left out; a clip or a sound file stops the run, since the trainer would stop on it.
 - **Clips of any length** count: the recipe reads each clip whole, up to 121 frames ([Clips of several lengths](#clips-of-several-lengths)).
+
+**Captions.** `train caption mysubject --trigger mysbj` gives each kind its own prompt: a still is described as an image, a clip with a sound track with what is seen and what is heard, a silent clip with what is seen. The caption model sees pictures and hears nothing: for a clip, it guesses what is heard from what it sees, so read every line about sound. It writes nothing for a sound file. `train caption` lists those, and you write each caption yourself, in a `.txt` of the same name: the trigger word, then what is heard (a voice and its words, a place, a noise).
 
 ## How `up` picks a GPU
 

@@ -1205,33 +1205,51 @@ def cmd_recipes(argv):
 
 # ----------------------------------------------------------------------------- captions
 def caption_targets(ref, audio):
-    """[dict(files, control, index, mode)] for one dataset: its folder (with targets/ and control/ for pairs), or
-    each block of a dataset config. Images with an image to edit get an edit instruction; clips are described."""
+    """[dict(files, control, index, mode)] for one dataset: its folder (with targets/ and control/ for pairs, or the
+    kinds of a mixed dataset), or each block of a dataset config. Images with an image to edit get an edit
+    instruction; clips are described, with what is heard when --audio is given or, in a mixed dataset, when the clip
+    has a sound track; sound files get none, since the caption model hears nothing."""
     if ref.endswith(".toml"):
         path = resolve_path(ref, DATASETS)
         try:
             blocks = dataset_blocks(path.read_text(encoding="utf-8"), str(path))
         except OSError:
             die("no dataset config {}".format(path))
-        pairs = [(b.get("video_directory") or b.get("image_directory"), b.get("control_directory")) for b in blocks]
+        parts = [(b.get("video_directory") or b.get("image_directory") or b.get("audio_directory"),
+                  b.get("control_directory"), "sounds" if block_kind(b) == "sounds" else None) for b in blocks]
     else:
         folder = resolve_path(ref, DATASETS)
         if (folder / "targets").is_dir():
-            pairs = [(str(folder / "targets"), str(folder / "control") if (folder / "control").is_dir() else None)]
+            parts = [(str(folder / "targets"), str(folder / "control") if (folder / "control").is_dir() else None, None)]
+        elif folder.is_dir() and (any((folder / sub).is_dir() for sub, _ in MIX) or len(mix_parts(folder)) > 1):
+            parts = [(str(where), None, kind) for kind, where in mix_parts(folder)]
         else:
-            pairs = [(str(folder), None)]
+            parts = [(str(folder), None, None)]
     targets = []
-    for media, control in pairs:
+    for media, control, kind in parts:
         if not media or not Path(media).is_dir():
             die("no folder {} (from {})".format(media, ref))
-        videos = media_files(media, VIDEOS)
-        files = videos or media_files(media, IMAGES)
+        if kind == "sounds":
+            files, mode = media_files(media, SOUNDS), "sound"
+        else:
+            videos = [] if kind == "images" else media_files(media, VIDEOS)
+            files = videos or ([] if kind == "clips" else media_files(media, IMAGES))
+            edit = bool(control) and not videos
+            mode = ("audio" if audio else "clips" if kind == "clips" else "video") if videos else (
+                "edit" if edit else "image")
         if not files:
-            die("no images or clips in {}".format(media))
-        edit = bool(control) and not videos
-        mode = ("audio" if audio else "video") if videos else ("edit" if edit else "image")
-        targets.append(dict(files=files, control=control, index=control_index(control) if edit else {}, mode=mode))
+            die("no {} in {}".format("sound files" if kind == "sounds" else "images or clips", media))
+        targets.append(dict(files=files, control=control, index=control_index(control) if mode == "edit" else {},
+                            mode=mode))
     return targets
+
+
+def caption_prompt(target, f):
+    """The prompt for one file: a clip of a mixed dataset is described with what is heard when it has a sound track."""
+    if target["mode"] != "clips":
+        return target["mode"]
+    probe = clip_probe(f)
+    return "video" if probe and not probe[2] else "audio"
 
 
 def clean_caption(text, avoid):
@@ -1265,9 +1283,10 @@ def caption_files(todo, trigger, avoid, max_words):
     model = Qwen3VLForConditionalGeneration.from_pretrained(CAPTION_MODEL, dtype=torch.bfloat16, device_map="cuda")
     processor = AutoProcessor.from_pretrained(CAPTION_MODEL)
     for k, (t, f) in enumerate(todo, 1):
-        if t["mode"] in ("video", "audio"):
+        mode = caption_prompt(t, f)
+        if mode in ("video", "audio"):
             content = [{"type": "video", "video": str(f), "fps": 2.0, "max_pixels": 360 * 640}]
-        elif t["mode"] == "edit":
+        elif mode == "edit":
             source = t["index"].get(f.stem)
             if not source:
                 say("[{}/{}] {}: no image of the same name in {}: skipped".format(k, len(todo), f.name, t["control"]))
@@ -1276,7 +1295,7 @@ def caption_files(todo, trigger, avoid, max_words):
                        {"type": "image", "image": str(f), "max_pixels": 1024 * 1024}]
         else:
             content = [{"type": "image", "image": str(f), "max_pixels": 1024 * 1024}]
-        prompt = CAPTION_PROMPTS[t["mode"]] + " Maximum {} words.".format(max_words)
+        prompt = CAPTION_PROMPTS[mode] + " Maximum {} words.".format(max_words)
         messages = [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         images, videos = process_vision_info(messages)
@@ -1304,18 +1323,26 @@ def cmd_caption(argv):
         die("the trigger is one word, without spaces or commas")
     avoid = [w.strip() for w in a.avoid.split(",") if w.strip()]
     targets = [t for ref in a.datasets for t in caption_targets(ref, a.audio)]
-    todo = [(t, f) for t in targets for f in t["files"] if a.overwrite or not caption_of(f)]
-    say("{} file(s), {} to caption{}".format(sum(len(t["files"]) for t in targets), len(todo),
+    seen = [t for t in targets if t["mode"] != "sound"]
+    todo = [(t, f) for t in seen for f in t["files"] if a.overwrite or not caption_of(f)]
+    unheard = [f for t in targets if t["mode"] == "sound" for f in t["files"] if not caption_of(f)]
+    say("{} file(s), {} to caption{}".format(sum(len(t["files"]) for t in seen), len(todo),
                                               "" if a.overwrite else " (the captions already written are kept; "
                                                                      "--overwrite writes them again)"))
     if a.dry_run:
         for _, f in todo:
             say("  " + str(f))
-        return 0
-    if todo:
+    elif todo:
         if active_job():
             say("A training run is in progress: captioning shares the GPU with it.")
         caption_files(todo, a.trigger, avoid, a.max_words)
+    if unheard:
+        say("{} sound file(s) without a caption. The caption model hears nothing, so write each yourself, in a .txt of "
+            "the same name: the trigger word {}, then what is heard (a voice and its words, a place, a noise): {}".format(
+                len(unheard), a.trigger, ", ".join(f.name for f in unheard[:6])
+                + (" and {} more".format(len(unheard) - 6) if len(unheard) > 6 else "")))
+    if a.dry_run:
+        return 0
     word_report([f for t in targets for f in t["files"]], a.trigger)
     say("Read every caption before training: the model makes mistakes, and a wrong word is learned like the others.")
     return 0

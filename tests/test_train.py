@@ -381,6 +381,20 @@ class Units(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             train.check_blocks("ltx", train.dataset_blocks(text, "t.toml"), "t.toml")
         self.assertIn("holds sounds, and the ltx recipe trains on clips", err.getvalue())
+    def test_the_caption_prompt_of_each_kind(self):
+        """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is
+        seen; sound files get no prompt."""
+        cap = train.DATASETS / "mixcap"
+        (cap / "images").mkdir(parents=True)
+        (cap / "images" / "i.png").write_bytes(b"png")
+        clip(cap / "clips" / "loud.mp4", 121, sound=True)
+        clip(cap / "clips" / "mute.mp4", 121)
+        (cap / "audio").mkdir()
+        (cap / "audio" / "s.wav").write_bytes(b"wav")
+        targets = train.caption_targets("mixcap", False)
+        self.assertEqual([t["mode"] for t in targets], ["image", "clips", "sound"])
+        self.assertEqual([train.caption_prompt(targets[1], f) for f in targets[1]["files"]], ["audio", "video"])
+        self.assertEqual([t["mode"] for t in train.caption_targets("chars", False)], ["image"])
 
 @unittest.skipIf(train is None, "train.py runs on the pod, with Python 3.11 or newer")
 class Runs(unittest.TestCase):
@@ -494,6 +508,19 @@ class Runs(unittest.TestCase):
         self.assertTrue((run / "prompts.txt").read_text().splitlines()[2].startswith("mxr, waves break"), out)
         self.assertIn("2 of the 4 steps of each pass over the data have sound", out)
         self.assertTrue((train.LORAS / "x1" / "x1.comfy.safetensors").is_symlink(), out)
+    def test_caption_a_mixed_folder(self):
+        """The dry run lists the stills and clips to caption, and the sound files whose captions are written by hand."""
+        cap = train.DATASETS / "mixcap2"
+        (cap / "images").mkdir(parents=True)
+        (cap / "images" / "i.png").write_bytes(b"png")
+        clip(cap / "clips" / "c.mp4", 121, sound=True)
+        (cap / "audio").mkdir()
+        (cap / "audio" / "s.wav").write_bytes(b"wav")
+        out, rc = self.run_train("caption", "mixcap2", "--trigger", "w", "--dry-run")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 file(s), 2 to caption", out)
+        self.assertIn("1 sound file(s) without a caption", out)
+        self.assertIn(": s.wav", out)
 
 if __name__ == "__main__":
     unittest.main()
