@@ -1043,6 +1043,15 @@ class EndToEnd(unittest.TestCase):
                            input=input)
         return r.stdout + r.stderr, r.returncode
 
+    def test_setup_names_a_hugging_face_token_given_as_the_runpod_key(self):
+        """A Hugging Face token at the Runpod key prompt: setup says what it is and where it goes, and stores nothing."""
+        out, rc = self.run_pod("setup", "-y", "--key", "hf_" + "a" * 34)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("Hugging Face token", out, out)
+        self.assertIn("setup --hf-token", out, out)
+        cfg = os.path.join(self.env["HOME"], ".ainvfx-runpod", "config.json")
+        self.assertFalse(os.path.exists(cfg) and "hf_" in open(cfg).read(), "the token is not stored")
+
     def whole_session(self):
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)

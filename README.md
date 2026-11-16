@@ -47,7 +47,7 @@ python pod.py down               # pulls, then terminates: billing stops
 
 - **Python 3.8 or newer.** Windows: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`. macOS and Linux usually have it (`python3 --version`).
 - **Git**, to clone and update this repository. GitHub's "Download ZIP" button works too.
-- **A Runpod API key.** In the console: Account, Credentials, API Keys, Create API Key. Choose *Restricted*, set **api.runpod.io/graphql** to **Read / Write** and leave **api.runpod.ai** on **None**. `setup` stores the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide.
+- **A Runpod API key.** In the console: Account, Credentials, API Keys, Create API Key. Choose *Restricted*, set **api.runpod.io/graphql** to **Read / Write** and leave **api.runpod.ai** on **None**. `setup` stores the key in `~/.ainvfx-runpod/config.json`, readable by your account only. Never paste it in a chat or a slide. `setup` asks for this key first; a Hugging Face token (it starts with `hf_`) goes in with `setup --hf-token`, and `setup` says so if you paste one at the key prompt.
 - **`ssh`**, optional: only `pod.py ssh` uses it.
 
 ## Commands

@@ -1413,6 +1413,9 @@ def cmd_setup(args):
         key = getpass.getpass("   API key: ").strip()
     if not key:
         die("empty key")
+    if key.startswith("hf_"):
+        die("this is a Hugging Face token (it starts with hf_), not a Runpod API key. Run `python pod.py setup` "
+            "again with the Runpod key; the token goes in after, with `python pod.py setup --hf-token`.")
     cfg["api_key"] = key
     say("   checking the key...")
     try:
