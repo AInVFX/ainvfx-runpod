@@ -221,7 +221,7 @@ The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods, except `lt
 
 ### Clips of several lengths
 
-The trainer reads every clip at 25 frames per second: from a clip filmed at 50 fps, it keeps every second frame. The `ltx`, `ltx_av` and `ltx_iclora` recipes take the first 121 frames of each clip (4.8 seconds) and leave out a shorter clip, and the trainer's log does not say so. So before any GPU time, `train` reads the length of every clip. It says how many clips the trainer will leave out, names the first ones with their frames at 25 fps, and stops when no clip is long enough. A clip without its caption stops it too, since the trainer would stop on that clip.
+The trainer reads every clip at 25 frames per second: from a clip filmed at 50 fps, it keeps every second frame. The `ltx`, `ltx_av` and `ltx_iclora` recipes take the first 121 frames of each clip (4.8 seconds) and leave out a shorter clip, and the trainer's log does not say so. So before any GPU time, `train` reads the length of every clip. It says how many clips the trainer will leave out, names the first ones with their frames at 25 fps, and stops when no clip is long enough. A clip filmed slower than 24 fps is a special case: the trainer keeps every frame, numbers them at 25 fps and stops at number 121, so from a 16 fps clip it reads 78 frames. These recipes then leave that clip out, whatever its length, and `train` says so. A clip without its caption stops it too, since the trainer would stop on that clip.
 
 To keep shorter clips with `ltx` or `ltx_av`, have each clip read whole, up to 121 frames. Save this dataset config as `/workspace/dataset/mychar_full.toml`, with your folder's name in it, then give it to the run: `train ltx mychar_v1 --dataset mychar_full.toml`.
 

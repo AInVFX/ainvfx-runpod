@@ -257,6 +257,10 @@ class Units(unittest.TestCase):
         self.assertEqual(train.frames_at(97, 50.0, 25.0), 49)
         self.assertEqual(train.frames_at(121, 30.0, 25.0), 101)
         self.assertEqual(train.frames_at(60, 12.0, 25.0), 60, "a slower source keeps every frame")
+        self.assertEqual(train.frames_at(300, 16.0, 25.0, 121), 78, "numbered at 25 fps, frame 121 comes after 78")
+        self.assertEqual(train.frames_at(60, 12.0, 25.0, 121), 59)
+        self.assertEqual(train.frames_at(150, 26.0, 25.0, 121), 150, "within 1 fps of the rate: read as it is")
+        self.assertEqual(train.frames_at(300, 50.0, 25.0, 121), 150, "a faster source: its own count, cut by head later")
         head, full = dict(train.LTX_CLIPS), dict(frame_extraction="full", max_frames=121)
         self.assertEqual([train.frames_kept(head, n) for n in (97, 121, 300)], [0, 121, 121])
         self.assertEqual([train.frames_kept(full, n) for n in (5, 97, 100, 300)], [1, 97, 97, 121])
@@ -299,6 +303,23 @@ class Units(unittest.TestCase):
             train.check_blocks("ltx_av", train.dataset_blocks(train.make_config("ltx_av", sound), "v"), "v")
         self.assertIn("1 clip(s) have no sound", out.getvalue())
         self.assertIn(": b.mp4", out.getvalue())
+        slow = train.DATASETS / "slow"                      # 300 frames at 16 fps: head stops at the frame numbered 121
+        clip(slow / "a.mp4", 300, fps=16.0, caption="w, a")
+        clip(slow / "b.mp4", 150, caption="w, b")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            train.check_blocks("ltx", train.dataset_blocks(train.make_config("ltx", slow), "w"), "w")
+        self.assertIn("a.mp4 (78)", out.getvalue())
+        self.assertIn("1 of them run slower than 25 fps", out.getvalue())
+        self.assertIn("a.mp4 (16 fps)", out.getvalue())
+        mixed = train.DATASETS / "slowmix" / "clips"        # read whole, the same clip gives its 121 frames
+        clip(mixed / "a.mp4", 300, fps=16.0, sound=True, caption="w, a")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            train.check_blocks("ltx_mix", train.dataset_blocks(train.make_config("ltx_mix", mixed.parent), "x"), "x")
+        self.assertIn("1 of 121 frames", out.getvalue())
+        self.assertNotIn("run slower", out.getvalue())
+
     def test_a_mixed_dataset(self):
         """ltx_mix: one block per kind with its own cache; the clips read whole up to 121 frames; the blocks with sound
         repeated until 30% of the steps have sound; the settings of ltx_av with the two flags of a mixed run."""

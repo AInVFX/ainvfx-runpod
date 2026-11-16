@@ -590,12 +590,17 @@ def clip_probe(path):
         return None
 
 
-def frames_at(frames, fps, rate):
-    """The frames a clip gives at the block's frame rate, counted as the trainer counts them: it drops frames to reach
-    the rate only when the source's rate, rounded up, is more than 1 away from it; a slower source keeps every frame."""
-    if not fps or fps <= rate or abs(math.ceil(fps) - rate) <= 1:
+def frames_at(frames, fps, rate, end=None):
+    """The frames a clip gives at the block's frame rate, counted as the trainer counts them. Within 1 fps of the rate
+    (the source's rate rounded up), every frame is read as it is. A faster source loses frames to reach the rate. A
+    slower source keeps every frame, and the trainer numbers them at the block's rate: with `end`, the longest length
+    "head" asks for, it stops at the frame numbered `end`, so it reads fewer frames than that."""
+    if not fps or abs(math.ceil(fps) - rate) <= 1:
         return frames
-    return int((frames - 1) * rate / fps) + 1
+    step = rate / fps
+    if step < 1:
+        return int((frames - 1) * step) + 1
+    return frames if end is None else min(frames, math.ceil(end / step))
 
 
 def frame_length(n):
@@ -628,12 +633,16 @@ def check_clips(where, block, files, av_run):
         return None, None
     rate, full = float(block.get("target_fps") or CLIP_FPS), block.get("frame_extraction", "head") == "full"
     source, most = block.get("source_fps"), frames_kept(block, 10 ** 9)
-    rows, unread = [], []
+    end = None if full else max(block.get("target_frames", [1]))     # "head" stops reading at its longest length
+    rows, unread, slow = [], [], []
     for f in files:
         probe = clip_probe(f)
         if probe:
-            n = frames_at(probe[0], float(source or probe[1]), rate)
+            fps = float(source or probe[1])
+            n = frames_at(probe[0], fps, rate, end)
             rows.append((f.name, n, frames_kept(block, n), probe[2]))
+            if not frames_kept(block, n) and frames_kept(block, frames_at(probe[0], fps, rate)):
+                slow.append("{} ({:g} fps)".format(f.name, fps))
         else:
             unread.append(f.name)
 
@@ -661,6 +670,10 @@ def check_clips(where, block, files, av_run):
             where, rate, len(kept), len(files), most))
         if out:
             say("  {} clip(s) give fewer frames, and the trainer leaves them out: {}".format(len(out), named(out)))
+        if slow:
+            say("  {} of them run slower than {:g} fps: the trainer numbers their frames at {:g} fps and stops at frame "
+                "{}, before the clip gives enough. Have each read whole (README, \"Clips of several lengths\"): "
+                "{}".format(len(slow), rate, rate, end, named(slow)))
     if unread:
         say("  {} file(s) could not be read as clips, and the trainer leaves them out: {}".format(
             len(unread), named(unread)))
