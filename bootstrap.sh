@@ -86,7 +86,7 @@ ln -sfn "$LOG" $ROOT/ainvfx-bootstrap.log
 exec > >(tee -a "$LOG") 2>&1
 
 say()  { echo "[AINVFX] $*"; }
-warn() { echo "[AINVFX] WARNING: $*"; }
+warn() { echo "[AINVFX] Warning: $*"; }
 now()  { date +%s.%N; }
 secs() { awk -v a="$1" -v b="$2" 'BEGIN {printf "%.3f", b - a}'; }        # seconds from $1 to $2
 mbps() { awk -v b="$1" -v t="$2" 'BEGIN {if (t < 0.001) t = 0.001; printf "%d", b / 1e6 / t}'; }
@@ -223,7 +223,7 @@ if mark not in src:
     lines = src.split("\n")
     hits = [i for i, line in enumerate(lines) if line.strip() == anchor]
     if not hits:
-        sys.exit("[AINVFX] WARNING: trainer: the sampling fix found nothing to change: the fork's code differs")
+        sys.exit("[AINVFX] Warning: trainer: the sampling fix found nothing to change: the fork's code differs")
     for i in reversed(hits):
         pad = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
         lines[i + 1:i + 1] = [pad + 'if getattr(args, "gradient_checkpointing", False):  ' + mark,
@@ -280,7 +280,7 @@ if [ -n "${HF_TOKEN:-}" ]; then
   WHO=$(curl -s --max-time 15 -w '\n%{http_code}' -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/api/whoami-v2 2>/dev/null)
   case "$(printf '%s\n' "$WHO" | tail -n 1)" in
     200) HF_USER=$(printf '%s\n' "$WHO" | sed '$d' | python3 -c "import json, sys; print(json.load(sys.stdin).get('name', ''))" 2>/dev/null) ;;
-    401) warn "HUGGING FACE REFUSES THIS TOKEN (401): it is ignored, so the gated files will be skipped. Create a new Read token (huggingface.co, Settings, Access Tokens) and store it again as the Runpod secret huggingface_token"
+    401) warn "Hugging Face refuses this token (401): it is ignored, so the gated files will be skipped. Create a new Read token (huggingface.co, Settings, Access Tokens) and store it again as the Runpod secret huggingface_token"
          unset HF_TOKEN ;;
   esac
 fi
@@ -324,7 +324,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   say "GPU: $GPU_NAME, $GPU_MEM, $DRV_FULL"
   DRV=$(echo "$DRV_FULL" | cut -d. -f1)
   if [ -n "$DRV" ] && [ "$DRV" -lt 580 ] 2>/dev/null; then
-    warn "DRIVER $DRV IS OLDER THAN 580: CUDA 13 kernels will not run, int8 models will be slow. Terminate this pod and create another."
+    warn "the driver $DRV is older than 580: CUDA 13 kernels will not run, int8 models will be slow. Terminate this pod and create another."
   fi
 else
   warn "nvidia-smi NOT FOUND: no GPU visible. Terminate this pod and create another."
@@ -338,7 +338,7 @@ if [ "$HEALTHCHECK" = "1" ]; then
   RD=$(mbps 2147483648 "$(secs "$T0" "$T1")")
   rm -f $ROOT/.probe
   say "disk: write $WR MB/s · read $RD MB/s"
-  [ "$RD" -lt 300 ] 2>/dev/null && warn "DISK READ UNDER 300 MB/s: models will load slowly. Consider another pod."
+  [ "$RD" -lt 300 ] 2>/dev/null && warn "disk read under 300 MB/s: models will load slowly. Consider another pod."
 else
   say "disk measurement skipped (AINVFX_HEALTHCHECK=0)"
 fi
@@ -428,10 +428,10 @@ except Exception:
     vram = ""
 print("[AINVFX] torch", torch.__version__, "cuda", cu, "GPU", (torch.cuda.get_device_name(0) if ok else "NOT VISIBLE") + vram)
 if not ok:
-    print("[AINVFX] WARNING: THE GPU IS NOT VISIBLE FROM PYTORCH. Terminate this pod and create another.")
+    print("[AINVFX] Warning: the GPU is not visible from PyTorch. Terminate this pod and create another.")
     sys.exit(1)
 if tuple(int(x) for x in cu.split(".")[:2]) < (13, 0):
-    print("[AINVFX] WARNING: CUDA", cu, "under 13.0: int8 kernels off, everything slow.")
+    print("[AINVFX] Warning: CUDA", cu, "under 13.0: int8 kernels off, everything slow.")
 PY
     then
       date -u +'%F %T' > "$MARK"
@@ -491,7 +491,7 @@ if curl -fs "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
     warn "the proxy address does not answer yet ($PROXY): it can take a minute after COMFYUI UP"
   fi
 else
-  warn "COMFYUI DID NOT START within 3 minutes: read $ROOT/comfy.log (JupyterLab or ssh)"
+  warn "ComfyUI did not start within 3 minutes: read $ROOT/comfy.log (JupyterLab or ssh)"
 fi
 else   # models mode: the environment the first run built
   if [ -f $VENV/bin/activate ]; then
@@ -682,7 +682,7 @@ PY
       # the speed judgement, once, on the first file over 1 GB (small files measure latency, not speed)
       if [ "$SPEED_JUDGED" = "0" ] && [ "$BYTES" -gt 1000000000 ]; then
         SPEED_JUDGED=1
-        [ "$SPEED" -lt 50 ] 2>/dev/null && warn "DOWNLOAD UNDER 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
+        [ "$SPEED" -lt 50 ] 2>/dev/null && warn "download under 50 MB/s: the models of this profile could take over 20 minutes. Consider another pod."
       fi
     else
       case "$(hf_state "$repo" "$path")" in
@@ -711,7 +711,7 @@ if [ "$MODE" = "models" ]; then
   exit 0
 fi
 if wants_trainer; then
-  install_trainers || warn "THE TRAINERS ARE NOT INSTALLED (the lines above say why). ComfyUI works; bash $SELF trainer tries again"
+  install_trainers || warn "the trainers are not installed (the lines above say why). ComfyUI works; bash $SELF trainer tries again"
 fi
 
 # ---------------------------------------------------------------- 5. self-test, then READY
@@ -789,7 +789,7 @@ t0 = time.time()
 try:
     pid = call("/prompt", {"prompt": prompt, "client_id": "ainvfx-bootstrap"})["prompt_id"]
 except Exception as e:
-    print("[AINVFX] WARNING: SELFTEST could not queue the test image:", str(e)[:300]); sys.exit(0)
+    print("[AINVFX] Warning: SELFTEST could not queue the test image:", str(e)[:300]); sys.exit(0)
 while time.time() - t0 < 300:
     time.sleep(2)
     try:
@@ -801,13 +801,13 @@ while time.time() - t0 < 300:
         if st.get("status_str") == "error":
             msgs = [m for m in st.get("messages", []) if m and m[0] == "execution_error"]
             detail = msgs[-1][1].get("exception_message", "?")[:300] if msgs else "?"
-            print("[AINVFX] WARNING: SELFTEST FAILED:", detail); sys.exit(0)
+            print("[AINVFX] Warning: SELFTEST failed:", detail); sys.exit(0)
         outs = [i for o in h.get("outputs", {}).values() for i in o.get("images", [])]
         if outs:
             print("[AINVFX] SELFTEST OK · MOSS-Image %d x %d, 25 steps, in %.1f s (models loaded from disk) · output/%s"
                   % (W, H, time.time() - t0, outs[0].get("filename")))
             sys.exit(0)
-print("[AINVFX] WARNING: SELFTEST did not finish within 5 minutes: read /workspace/comfy.log")
+print("[AINVFX] Warning: SELFTEST did not finish within 5 minutes: read /workspace/comfy.log")
 PY
 fi
 

@@ -63,7 +63,7 @@ BOOT = [  # the scripted bootstrap log: (seconds after creation, line)
 # bootstrap.sh on a host whose network times out on every PyTorch route (seen on 6 Oct 2026):
 # the log stops at a FAILED line and the pod stays up; READY never comes.
 BOOT_FAILED = BOOT[:7] + [
-    (3, "[AINVFX] WARNING: PyTorch download from https://download.pytorch.org/whl/cu130 failed (the lines above name the file)"),
+    (3, "[AINVFX] Warning: PyTorch download from https://download.pytorch.org/whl/cu130 failed (the lines above name the file)"),
     (3, "[AINVFX] PyTorch: trying PyPI (attempt 1 of 2): the same CUDA 13.0 build, with the NVIDIA libraries from PyPI"),
     (4, "[AINVFX] PyTorch: trying PyPI (attempt 2 of 2): the same CUDA 13.0 build, with the NVIDIA libraries from PyPI"),
     (4, "[AINVFX] FAILED: PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above)."),
@@ -1251,7 +1251,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("[RUNPOD] create container runpod/pytorch", out, out)
         self.assertIn("the host is fetching the pod's image", out, out)
         self.assertIn("[RUNPOD] image download: 3 layers", out, out)
-        self.assertIn("WARNING: NO CONTAINER", out, out)
+        self.assertIn("Warning: no container", out, out)
         self.assertIn("3 done · 0 extracting · 0 downloading", out, "the final summary once every layer is done")
         self.assertIn("[RUNPOD] start container for runpod/pytorch", out, out)
         self.assertIn("[AINVFX] step 1/5 health check", out, out)

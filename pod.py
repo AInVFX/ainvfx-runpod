@@ -1207,7 +1207,7 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
                 and (datetime.now(timezone.utc) - created).total_seconds() > STALL_MINUTES * 60):
             st["stall_told"] = True
             dc = pod_summary(current)[1]
-            out("WARNING: NO CONTAINER {} AFTER CREATION (status {}, {}). The host is still fetching the image, or "
+            out("Warning: no container {} after creation (status {}, {}). The host is still fetching the image, or "
                 "does not respond; the console (Pods > your pod) shows its log and any maintenance notice. "
                 "The pod bills meanwhile. Usual answer:  python pod.py down <pod>  then  python pod.py up  again, "
                 "usually in another data center.".format(fmt_since(created), st["status"],

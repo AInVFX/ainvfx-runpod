@@ -298,7 +298,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh). Every line it 
 | `TRAINERS OK` | With `train`: the trainers and the `train` command are ready |
 | `SELFTEST OK` | MOSS-Image made a test image: a thank-you poster with this repository's address. It needs the `image` profile |
 | `READY` | The pod is ready. The line gives the ComfyUI and JupyterLab links |
-| `WARNING` | Something is wrong or slow, such as an old driver or a slow disk. The line says what to do |
+| `Warning:` | Something is wrong or slow, such as an old driver or a slow disk. The line says what to do |
 | `ACTION NEEDED` | Gated files did not come (below) |
 | `FAILED` | The pod cannot work on that machine. It stays up so the log can be read, and it bills |
 
@@ -309,7 +309,7 @@ The log is also written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log`, so t
 - **`FAILED` in the log.** The pod cannot work on that machine: Python, PyTorch or ComfyUI could not be installed, or PyTorch cannot see the GPU. The line says which. Terminate the pod and create another (`python pod.py down`, then `up`): it lands on another machine. `up` stops on that line.
 - **`ACTION NEEDED` in the log.** Some gated files did not come. Logged in to Hugging Face with the account the log names, click "Agree and access repository" on each page listed. Then fetch them on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal or after `python pod.py ssh`. A pod without a token needs one first (`setup --hf-token`), then a new pod.
 - **The trainers did not install.** The log says why. `bash /tmp/ainvfx-bootstrap.sh trainer` tries again on the same pod.
-- **No container after 8 minutes.** `up` prints a warning in capitals: the host is still fetching the image, or does not respond. The pod bills meanwhile. Run `python pod.py down`, then `up` again, usually in another data center.
+- **No container after 8 minutes.** `up` prints a warning: the host is still fetching the image, or does not respond. The pod bills meanwhile. Run `python pod.py down`, then `up` again, usually in another data center.
 - **A blank "403" page from the Connect button.** Press Enter in the address bar. ComfyUI refuses a page opened by a click from another site (a protection against sites that would control it), never an address typed or opened by `pod.py open`.
 - **GitHub unreachable at start.** The start command falls back to Runpod's own `/start.sh`: the pod still starts SSH and JupyterLab, so you can read the error.
 - **Any other error after the pod exists.** `pod.py` prints a message that names the pod, never a traceback. `python pod.py list` shows your pods, `down` terminates one. `AINVFX_DEBUG=1` prints the full trace for a bug report.
