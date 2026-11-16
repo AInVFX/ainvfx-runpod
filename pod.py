@@ -12,7 +12,8 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py push [pod] FILES   copy files into the pod's input folder; --dataset NAME for training
   python pod.py push [pod] URL     the pod downloads a file or a folder page itself; --frames 480-600, --into NAME
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
-  python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here
+  python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here;
+                                   --when-done waits first for the training run in progress on the pod to end
   python pod.py ssh [pod]          a terminal on the pod
   python pod.py list               every pod of your account
   python pod.py doctor             check this machine and the configuration
@@ -131,6 +132,13 @@ DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 WEB_ADDRESS = re.compile(r"https?://", re.I)
 POD_INPUT = os.environ.get("AINVFX_POD_INPUT", "/workspace/ComfyUI/input")     # where a pod keeps ComfyUI's input folder
 POD_DATASET = os.environ.get("AINVFX_POD_DATASET", "/workspace/dataset")       # and its training datasets
+# train.py keeps the record of its run in ComfyUI's output folder, so the pod serves it through its proxy, as its log.
+RUN_VIEW = "/view?filename=.job.json&subfolder=train&type=output"
+RUN_ACTIVE = ("starting", "running")                       # the record's states of a run in progress (train.py's ACTIVE)
+RUN_POLL = max(1, env_num("AINVFX_RUN_POLL", "60"))        # `down --when-done`: seconds between two looks at the run
+RUN_STALE = env_num("AINVFX_RUN_STALE", "300")             # a run in progress marks its record every 30 s: one whose
+                                                           # record stands still this long has died without a word
+RUN_NOTE = env_num("AINVFX_RUN_NOTE", "600")               # seconds between two "in progress" lines of the wait
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -2414,8 +2422,90 @@ def pull(rec):
     return count
 
 
+def read_run(pod_id):
+    """The record train.py keeps of its run, read through the pod's own ComfyUI: {} when the pod holds none.
+    ApiError when ComfyUI does not answer, or answers something else than a record."""
+    url = pod_url(pod_id) + RUN_VIEW
+    try:
+        data = request("GET", url, timeout=10, raw=True)
+    except ApiError as e:
+        if e.code == 404 and comfy_alive(pod_id):         # ComfyUI answers and has no such file: no run on this pod
+            return {}
+        raise
+    try:
+        run = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        run = None
+    if not isinstance(run, dict):
+        raise ApiError(0, "not the record of a run", url)
+    return run
+
+
+def run_in_progress(run, still):
+    """True while a run's record says the run is in progress. `still` is how long the record has not changed, in
+    seconds: train.py marks the record of a run in progress every 30 seconds (`beat`), so a record that stands still
+    for RUN_STALE seconds is of a run that died without a word (a pod restart). A record without that mark, written
+    by train.py before 1.6.1, is believed."""
+    return run.get("state") in RUN_ACTIVE and not ("beat" in run and still > RUN_STALE)
+
+
+def run_label(run):
+    """A run's name from its record, with its stage when the run has several: "mychar_v1, stage 2 of 3"."""
+    stages = run.get("stages") or [{}]
+    i = min(int(run.get("stage") or 0), len(stages) - 1)
+    name = str(stages[i].get("name") or "?")
+    return name if len(stages) == 1 else "{}, stage {} of {}".format(name, i + 1, len(stages))
+
+
+def wait_for_run(cfg, rec):
+    """`down --when-done`: returns when the training run in progress on the pod has ended, or when the pod itself is
+    gone. One look at the run's record every RUN_POLL seconds; a look that the pod does not answer is tried again."""
+    pod_id, name = rec["id"], rec.get("name") or rec["id"]
+    start = moved = time.time()
+    last = said = None
+    noted = 0
+    while True:
+        now = time.time()
+        try:
+            run = read_run(pod_id)
+        except ApiError:
+            run = None
+        if run is None:
+            try:
+                gone = pod_status(get_pod(cfg, pod_id)) in FINAL
+            except ApiError as e:
+                gone = e.code == 404
+            if gone:
+                say("The pod {} is no longer running.".format(name))
+                return
+            note = "the pod does not answer"
+        else:
+            if run != last:
+                last, moved = run, now
+            if not run_in_progress(run, now - moved):
+                if not run.get("stages"):                 # deleted on the pod: unknown never reads as "terminate now"
+                    die("the run's record is gone from {}: the pod keeps running and billing. Look at it "
+                        "(`python pod.py open`), then `python pod.py down`.".format(name))
+                elif run.get("state") in RUN_ACTIVE:
+                    say("The run {} gives no sign of life for {} s: it ended without a word (a pod restart?).".format(
+                        run_label(run), RUN_STALE))
+                else:
+                    say("The run {} has ended ({}).".format(run_label(run), run.get("state") or "?"))
+                return
+            note = "{}: in progress".format(run_label(run))
+        if said is None:
+            say("Waiting for the training run on {} to end, with a look every {} s. Ctrl+C stops the wait; the pod "
+                "keeps running and billing.".format(name, RUN_POLL))
+        if note != said or now - noted >= RUN_NOTE:
+            say("  {} (waited {})".format(note, fmt_duration((now - start) / 3600)))
+            said, noted = note, now
+        time.sleep(RUN_POLL)
+
+
 def cmd_down(args):
     cfg = load_config()
+    if args.all and args.when_done:
+        die("--when-done waits for the training run of one pod: name that pod, without --all.")
     if args.all:
         targets = list((cfg.get("pods") or {}).items())
         if not targets:
@@ -2423,10 +2513,19 @@ def cmd_down(args):
     else:
         targets = [which_pod(cfg, args.profile)]
     names = ", ".join(r.get("name") or r["id"] for _, r in targets)
-    if not confirm("Terminate {} now? The disk is erased, billing stops. [Y/n] ".format(names), args.yes):
+    if args.when_done:                                    # nothing to wait for must never read as "terminate now"
+        run = read_run(targets[0][1]["id"])
+        if not run_in_progress(run, 0):
+            die("no training run in progress on {}{}. --when-done waits for a run that has started: the first run of "
+                "a recipe downloads its base files before it starts. `python pod.py down` terminates now.".format(
+                    names, ": {} has ended ({})".format(run_label(run), run.get("state")) if run.get("stages") else ""))
+    when = "when its training run ends" if args.when_done else "now"
+    if not confirm("Terminate {} {}? The disk is erased, billing stops. [Y/n] ".format(names, when), args.yes):
         say("Kept running. Remember: a pod bills until terminated.")
         return
     for tag, rec in targets:
+        if args.when_done:
+            wait_for_run(cfg, rec)
         if not args.no_pull:
             say("{} file(s) pulled into {}".format(pull(rec), outputs_of(rec)))
         try:
@@ -2595,6 +2694,9 @@ def main():
     p = command("down", cmd_down, "pull, then terminate")
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
+    p.add_argument("--when-done", action="store_true",
+                   help="wait for the training run in progress on the pod to end, then pull and terminate; this "
+                        "computer stays on and online meanwhile")
     p.add_argument("-y", "--yes", action="store_true")
     command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
     command("list", cmd_list, "every pod of the account, and which ones are recorded here", pod=False)

@@ -433,6 +433,12 @@ class Handler(BaseHTTPRequestHandler):
                 if STATE["no_proxy_log"]:
                     return self.problem(404, "no such file")
                 data = "\n".join(l for _, l in visible_lines(pod)).encode()
+            elif q.get("type") == ["output"] and q.get("filename") == [".job.json"] and q.get("subfolder") == ["train"]:
+                runs = STATE["runs"]                # the run's record at each look, the last one for good: a record,
+                run = runs.pop(0) if len(runs) > 1 else runs[0] if runs else None   # None (no file), "down" (no ComfyUI)
+                if not isinstance(run, dict):
+                    return self.problem(502 if run else 404, "bad gateway" if run else "no such file")
+                data = json.dumps(run).encode()
             else:
                 data = b"\x89PNG fake image bytes"
             self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
@@ -628,6 +634,20 @@ class Helpers(unittest.TestCase):
             os.environ["TZ"] = zone
             self.assertEqual(pod.local_place(), expected, zone)
         os.environ.pop("TZ", None)
+
+    def test_a_run_in_progress(self):
+        """A run is in progress while its record says so and keeps moving. A record that stands still longer than
+        RUN_STALE is of a run that died; one without the mark of life is believed; an ended run, or no record, is not
+        in progress."""
+        run = {"state": "running", "beat": 1.0, "stage": 1, "stages": [{"name": "jar_a"}, {"name": "jar_b"}]}
+        self.assertTrue(pod.run_in_progress(run, pod.RUN_STALE))
+        self.assertFalse(pod.run_in_progress(run, pod.RUN_STALE + 1))
+        self.assertTrue(pod.run_in_progress({"state": "starting"}, 100 * pod.RUN_STALE))
+        for ended in ({}, {"state": "done", "beat": 1.0}, {"state": "failed"}, {"state": "stopped"}):
+            self.assertFalse(pod.run_in_progress(ended, 0), ended)
+        self.assertEqual(pod.run_label(run), "jar_b, stage 2 of 2")
+        self.assertEqual(pod.run_label({"stages": [{"name": "jar"}]}), "jar")
+        self.assertEqual(pod.run_label({}), "?")
 
     def test_resume_point_is_a_few_seconds_before_the_event(self):
         self.assertEqual(pod.resume_point("2026-10-05T03:40:12.123Z"), "2026-10-05T03:40:07Z")
@@ -1021,7 +1041,7 @@ class EndToEnd(unittest.TestCase):
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
                       "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
-                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": []})
+                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": [], "runs": []})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -1121,6 +1141,50 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("JupyterLab did not answer", out, out)
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
+    def test_down_when_done_waits_for_the_run(self):
+        """`down --when-done` asks first, then waits while the run's record says in progress, through a look that the
+        pod does not answer and a change of stage; when the run has ended it pulls, then terminates. A run whose record
+        stands still has died without a word: the same end. With no run in progress it stops, and terminates nothing."""
+        self.env.update(AINVFX_RUN_POLL="1", AINVFX_RUN_STALE="2")
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        for profile in ("image", "3d"):
+            out, rc = self.run_pod("up", profile, "-y", "--wait", "1", timeout=90)
+            self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("down", "--all", "--when-done", "-y")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("name that pod, without --all", out, out)
+        ended = {"state": "done", "stage": 0, "stages": [{"name": "jar"}]}
+        for runs, said in (([], "no training run in progress on"), ([ended], "jar has ended (done)")):
+            STATE["runs"] = runs                                      # no record on the pod, then an ended run's
+            out, rc = self.run_pod("down", "image", "--when-done", "-y")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn(said, out, out)
+            self.assertIn("`python pod.py down` terminates now", out, out)
+            self.assertFalse(STATE["pods"]["fakepod1"].get("deleted"), out)
+
+        def run(state, stage, beat):
+            return {"state": state, "stage": stage, "beat": beat, "stages": [{"name": "jar_a"}, {"name": "jar_b"}]}
+        STATE["runs"] = [run("running", 0, 1.0)]
+        out, rc = self.run_pod("down", "image", "--when-done", input="n\n")
+        self.assertIn("when its training run ends? The disk is erased", out, out)
+        self.assertIn("Kept running", out, out)
+        STATE["outfiles"] = {"train/jar_b/jar_b.safetensors": b"fake lora weights"}
+        STATE["runs"] = [run("running", 0, 1.0), run("running", 0, 1.5), "down", run("running", 1, 2.0), run("done", 1, 3.0)]
+        out, rc = self.run_pod("down", "image", "--when-done", "-y", timeout=60)
+        self.assertEqual(rc, 0, out)
+        steps = ["Waiting for the training run", "jar_a, stage 1 of 2: in progress", "the pod does not answer",
+                 "jar_b, stage 2 of 2: in progress", "The run jar_b, stage 2 of 2 has ended (done).",
+                 "jar_b.safetensors", "file(s) pulled", "Terminated"]
+        self.assertEqual(sorted(steps, key=out.index), steps, out)
+        self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
+        self.assertIn("jar_b.safetensors", [f for _, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs], out)
+        STATE["runs"] = [run("running", 0, 7.0)]                      # the record never moves again
+        out, rc = self.run_pod("down", "3d", "--when-done", "-y", timeout=60)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("gives no sign of life for 2 s", out, out)
+        self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
 
     def test_push_from_a_web_address(self):
         """`push URL`: the pod downloads by itself. The code that pod.py sends runs for real in the fake kernel, against

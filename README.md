@@ -62,7 +62,7 @@ python pod.py down               # pulls, then terminates: billing stops
 | `push [pod] FILES` | Copies files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training |
 | `push [pod] URL` | The pod downloads a web address itself: one file, or every file that a folder page lists. `--frames 480-600` keeps the frames of that range, `--into NAME` names the folder under ComfyUI's input. With `--dataset NAME`, the files go to `/workspace/dataset/NAME` |
 | `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/` |
-| `down [pod]` | Pulls, terminates, then gives the pod's cost and the credit left. `--all` for every pod recorded here, `--no-pull` to skip the download |
+| `down [pod]` | Pulls, terminates, then gives the pod's cost and the credit left. `--all` for every pod recorded here, `--no-pull` to skip the download, `--when-done` to wait first for the training run in progress on the pod ([A first run](#a-first-run)) |
 | `ssh [pod]` | A terminal on the pod |
 | `list` | Every pod of your account, and which ones this computer knows |
 | `doctor` | Checks Python, ssh, the API key and the settings |
@@ -195,6 +195,7 @@ train zimage mychar_v1 --dataset mychar         # trains in the background; its 
 - **During the run**, Ctrl+C stops the display, never the run. `train log` shows it again, `train status` says where it stands, `train stop` stops it. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
 - **Every 250 steps**, a checkpoint and test images (samples) land in `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI to refresh it). Judge the samples, not the loss curve: stop when they stop improving.
 - **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats.
+- **To stop paying when the run ends**, once the run has started, leave `python pod.py down --when-done` running on your computer. It looks at the run once a minute. When the run has ended, it pulls the output folder, then terminates the pod. Your computer must stay on, awake and online until then. Ctrl+C stops the wait and leaves the pod running. A run that failed or was stopped ends the wait too, so stop the wait before you stop a run to launch another. A run whose process died without a word, after a pod restart, is seen after 5 minutes without a sign of life.
 
 ### Options of a run
 

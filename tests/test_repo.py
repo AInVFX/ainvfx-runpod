@@ -5,7 +5,7 @@
 
 A value written in two files drifts when only one of them changes: a default in settings.env and in bootstrap.sh, a
 size in models.json and in README.md, a model file in models.json and in the self-test, the share-link rule in pod.py
-and in bootstrap.sh. Each test names one such pair, so a change that forgets the other file fails here, before any pod
+and in bootstrap.sh, the record of a training run in train.py and in pod.py. Each test names one such pair, so a change that forgets the other file fails here, before any pod
 is created.
 """
 import json
@@ -166,6 +166,18 @@ class Repo(unittest.TestCase):
 
 
     @unittest.skipUnless(shutil.which("sed"), "needs sed, as on the pod")
+    def test_pod_py_reads_a_run_as_train_py_records_it(self):
+        """`down --when-done` reads from outside the pod the record train.py keeps of its run: the same file, the same
+        states of a run in progress, and several marks of life missed before a run counts as dead."""
+        train = read("train.py")
+        self.assertIn('RUNS = COMFY / "output" / "train"', train)
+        self.assertIn('JOB = RUNS / ".job.json"', train)
+        self.assertEqual(pod.RUN_VIEW, "/view?filename=.job.json&subfolder=train&type=output")
+        active = re.search(r"^ACTIVE = \((.*)\)", train, re.M).group(1)
+        self.assertEqual(tuple(re.findall(r'"(\w+)"', active)), pod.RUN_ACTIVE)
+        beat = float(re.search(r'^BEAT = float\(os\.environ\.get\("AINVFX_BEAT", "(\d+)"\)\)', train, re.M).group(1))
+        self.assertGreaterEqual(pod.RUN_STALE, 5 * beat, "a run is not called dead for one late mark")
+
     def test_bootstrap_sh_reads_a_share_link_as_pod_py_does(self):
         """A models list on Google Drive, Dropbox or GitHub: pod.py reads it to size the disk, then the pod downloads
         it. Both turn the share link into the same link to the file itself."""
