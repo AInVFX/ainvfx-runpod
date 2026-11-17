@@ -17,6 +17,8 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here;
                                    --when-done waits first for the training run in progress on the pod to end
   python pod.py ssh [pod]          a terminal on the pod
+  python pod.py train [pod] ...    the pod's train command, run from here: train caption, train <recipe>,
+                                   train log, train status, train stop (the same words as on the pod)
   python pod.py list               every pod of your account
   python pod.py doctor             check this machine and the configuration
 
@@ -135,6 +137,7 @@ DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 WEB_ADDRESS = re.compile(r"https?://", re.I)
 POD_INPUT = os.environ.get("AINVFX_POD_INPUT", "/workspace/ComfyUI/input")     # where a pod keeps ComfyUI's input folder
 POD_DATASET = os.environ.get("AINVFX_POD_DATASET", "/workspace/dataset")       # and its training datasets
+POD_TRAIN = os.environ.get("AINVFX_POD_TRAIN", "/usr/local/bin/train")         # and the train command bootstrap.sh writes
 POD_MODELS = os.environ.get("AINVFX_POD_MODELS", "/workspace/ComfyUI/models")  # and its model folders
 # ComfyUI's own model folders (folder_paths.py at v0.45.4), and the other names people give some of them
 MODEL_FOLDERS = ("audio_encoders", "background_removal", "checkpoints", "classifiers", "clip_vision", "configs",
@@ -2407,21 +2410,28 @@ def ws_messages(sock):
                 parts = []
 
 
-def kernel_run(rec, code, on_line):
-    """Run `code` in a new Python kernel of the pod's JupyterLab; each line it prints goes to on_line. The kernel is
-    removed at the end, also on Ctrl+C, which stops what it was doing."""
+class LinkBroken(ApiError):
+    """The link to the pod's JupyterLab broke; `started` says whether the code had been sent to the kernel."""
+    started = False
+
+
+def kernel_run(rec, code, on_line, on_text=None, keep_running=False):
+    """Run `code` in a new Python kernel of the pod's JupyterLab; each line it prints goes to on_line, or, with
+    on_text, each piece of text as it comes. The kernel is removed at the end, also on Ctrl+C, which stops what it
+    was doing. With keep_running, a link that breaks before the code ends leaves the kernel on the pod, so the code
+    goes on there, as a command does in JupyterLab's terminal when its browser tab closes."""
     pod_id = rec["id"]
     if not comfy_alive(pod_id):
         die("the pod does not answer yet: wait for READY (`python pod.py status`).")
     token = jupyter_token(proxy_log(pod_id))
     if not token:
-        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A download "
-            "from a web address runs through JupyterLab.")
+        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab, which this "
+            "command goes through.")
     base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
     kernel = request("POST", base + "/api/kernels", body={}, headers=hdrs, timeout=60).get("id")
     if not kernel:
         die("JupyterLab did not start a kernel on the pod. Try again in a minute.")
-    sock, msg_id = None, uuid.uuid4().hex
+    sock, msg_id, sent, ended, interrupted = None, uuid.uuid4().hex, False, False, False
     try:
         sock = ws_connect(re.sub(r"^http", "ws", base) + "/api/kernels/{}/channels".format(kernel),
                           dict(hdrs, **{"User-Agent": "ainvfx-runpod/" + VERSION}))
@@ -2431,6 +2441,7 @@ def kernel_run(rec, code, on_line):
             "parent_header": {}, "metadata": {}, "channel": "shell", "buffers": [],
             "content": {"code": code, "silent": False, "store_history": False, "user_expressions": {},
                         "allow_stdin": False, "stop_on_error": True}}))
+        sent = True
         pending = ""
         for text in ws_messages(sock):
             try:
@@ -2440,27 +2451,37 @@ def kernel_run(rec, code, on_line):
             if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
                 continue
             kind, content = msg.get("msg_type") or (msg.get("header") or {}).get("msg_type"), msg.get("content") or {}
-            if kind == "stream":
+            if kind == "stream" and on_text:
+                on_text(content.get("text", ""))
+            elif kind == "stream":
                 pending += content.get("text", "")
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
                     on_line(line)
             elif kind == "error":
+                ended = True
                 raise ApiError(0, "the pod's Python stopped: {}: {}".format(content.get("ename"), content.get("evalue")), base)
             elif kind == "status" and content.get("execution_state") == "idle":
+                ended = True
                 break
         if pending:
             on_line(pending)
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     except (OSError, ConnectionError) as e:
-        raise ApiError(0, "the link to the pod broke ({}). Run the command again: it skips the files already there."
-                       .format(e), base)
+        broken = LinkBroken(0, "the link to the pod broke ({}). Run the command again: it skips the files already "
+                               "there.".format(e), base)
+        broken.started = sent
+        raise broken
     finally:
         if sock is not None:
             sock.close()
-        try:
-            request("DELETE", base + "/api/kernels/" + kernel, headers=hdrs, timeout=30)
-        except ApiError:
-            pass
+        if ended or interrupted or not (keep_running and sent):
+            try:
+                request("DELETE", base + "/api/kernels/" + kernel, headers=hdrs, timeout=30)
+            except ApiError:
+                pass
 
 
 def push_url(args, url, models=None):
@@ -2759,6 +2780,148 @@ def cmd_ssh(args):
     sys.exit(subprocess.call(cmd))
 
 
+# ----------------------------------------------------------------------------- train, from this computer
+# `python pod.py train ...` is the pod's own `train` command, run with the same words in a kernel of the pod's
+# JupyterLab, as if typed in its terminal: Ctrl+C acts as it does there (a run that has started goes on, in a session
+# of its own), and a link that breaks leaves the command running on the pod. Every TRAIN_ALIVE seconds without
+# output, a sign of life (\x1e) keeps the link open; the last line gives the exit code.
+TRAIN_ALIVE = 20
+TRAIN_CODE = r"""
+import codecs, os, select, signal, subprocess, sys
+exe, argv, alive = ARGS["exe"], ARGS["argv"], ARGS["alive"]
+try:                                       # loaded here: after fork, the child only calls it
+    import ctypes
+    _prctl = ctypes.CDLL("libc.so.6").prctl
+except Exception:
+    _prctl = None
+def _with_kernel():
+    if _prctl:
+        _prctl(1, int(signal.SIGTERM))     # PR_SET_PDEATHSIG: the command ends when this kernel does
+if not os.path.exists(exe):
+    print("This pod has no train command: its profile does not train (train, image+train, video+train, all), or "
+          "the trainers did not install (the pod's log says why; bash /tmp/ainvfx-bootstrap.sh trainer tries again).")
+    code = 2
+else:
+    p = subprocess.Popen([exe] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         preexec_fn=_with_kernel, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+    text = codecs.getincrementaldecoder("utf-8")("replace")
+    while True:
+        if not select.select([p.stdout], [], [], alive)[0]:
+            sys.stdout.write("\x1e")
+            sys.stdout.flush()
+            continue
+        chunk = os.read(p.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        sys.stdout.write(text.decode(chunk))
+        sys.stdout.flush()
+    sys.stdout.write(text.decode(b"", True))
+    code = p.wait()
+sys.stdout.write("\x1eainvfx-exit %d\n" % code)
+sys.stdout.flush()
+"""
+
+
+def train_code(words, exe=None, alive=None):
+    """The code a pod's kernel runs for `python pod.py train WORDS`: its values first, as JSON, then TRAIN_CODE."""
+    values = {"exe": exe or POD_TRAIN, "argv": list(words), "alive": alive or TRAIN_ALIVE}
+    return "import json\nARGS = json.loads({!r})\n".format(json.dumps(values)) + TRAIN_CODE
+
+
+def show_text(text):
+    """Print text as it comes, flushed; a character this terminal cannot show becomes ?, never an error."""
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        sys.stdout.write(text.encode(enc, "replace").decode(enc, "replace"))
+    sys.stdout.flush()
+
+
+class TrainOutput:
+    """The output of the pod's `train`, shown as it comes: a line shows once it ends, with \n or with the \r of a
+    progress bar. The signs of life never show, and the exit code is kept apart, even when its line comes in two
+    pieces. The output ends with a new line, so what follows never starts in the middle of one."""
+    MARK = re.compile(r"\x1eainvfx-exit (-?\d+)\n")
+
+    def __init__(self, write=show_text):
+        self.out, self.held, self.code, self.last = write, "", None, "\n"
+
+    def write(self, text):
+        self.out(text)
+        self.last = text[-1]
+
+    def feed(self, text):
+        text = self.held + text
+        cut = max(text.rfind("\n"), text.rfind("\r"))
+        self.held = text[cut + 1:]
+        self.show(text[:cut + 1])
+
+    def show(self, text):
+        m = self.MARK.search(text)
+        if m:
+            self.code = int(m.group(1))
+            text = text[:m.start()] + text[m.end():]
+        text = text.replace("\x1e", "")
+        if text:
+            self.write(text)
+
+    def finish(self):
+        held, self.held = self.held, ""
+        self.show(held)
+        if self.last != "\n":
+            self.write("\n")
+
+
+def train_target(pods, words):
+    """(the pod named or None, the words for the pod's `train`): a first word that names a pod recorded here, by its
+    tag, its name or its id, is the pod; any other word is the train command's own."""
+    if words:
+        ref = words[0].strip().replace("+", "-")
+        if ref in pods or any(ref in (r.get("id"), r.get("name")) for r in pods.values()):
+            return words[0], words[1:]
+    return None, words
+
+
+def exit_status(code):
+    """A shell's exit status for train's code: a process ended by signal N gives 128 + N."""
+    return 128 - code if code < 0 else code
+
+
+def cmd_train(args):
+    cfg = load_config()
+    ref, words = train_target(cfg.get("pods") or {}, list(args.words))
+    _, rec = which_pod(cfg, ref)
+    if words[:1] == ["stop"] and not {"-y", "--yes"} & set(words[1:]):
+        try:
+            answer = input("Stop the training run on {}? Its checkpoints stay. [y/N] ".format(rec.get("name")))
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            say("Nothing stopped.")
+            return
+        words.append("--yes")
+    out = TrainOutput()
+    try:
+        kernel_run(rec, train_code(words), None, on_text=out.feed, keep_running=True)
+    except KeyboardInterrupt:
+        out.finish()
+        say("\nStopped here, as Ctrl+C does in the pod's terminal. A run that had started goes on: "
+            "`python pod.py train status` says where it stands.")
+        sys.exit(130)
+    except LinkBroken as e:
+        out.finish()
+        if not e.started:
+            die("the link to the pod broke before train started there: run the command again.")
+        die("the link to the pod broke; the command goes on there. Do not run it again: in a few minutes, "
+            "`python pod.py train status` says where the run stands, `python pod.py train log` shows it.")
+    out.finish()
+    if out.code is None:
+        die("the link to the pod closed before train ended; the command goes on there. In a few minutes, "
+            "`python pod.py train status` says where the run stands.")
+    sys.exit(exit_status(out.code))
+
+
 def cmd_doctor(args):
     cfg = load_config()
     say("ainvfx-runpod {} · Python {} on {}".format(VERSION, sys.version.split()[0], platform.platform()))
@@ -2859,10 +3022,16 @@ def main():
                         "computer stays on and online meanwhile")
     p.add_argument("-y", "--yes", action="store_true")
     command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
+    command("train", cmd_train, "the pod's train command, run from here with the same words", pod=False).add_argument(
+        "words", nargs=argparse.REMAINDER, help="[pod], then what the pod's train takes: `python pod.py train --help`")
     command("list", cmd_list, "every pod of the account, and which ones are recorded here", pod=False)
     command("doctor", cmd_doctor, "check this machine and the configuration", pod=False)
 
-    args = ap.parse_args()
+    words = sys.argv[1:]
+    if words[:1] == ["train"]:                # every word after `train` is for the pod's train command, --help too
+        args = argparse.Namespace(cmd="train", func=cmd_train, words=words[1:])
+    else:
+        args = ap.parse_args()
     # `push image file.png` and `push file.png` both work: a first argument that is a file or a web address is one
     if args.cmd == "push" and args.profile and (is_web(args.profile) or Path(args.profile).expanduser().exists()):
         args.files.insert(0, args.profile)

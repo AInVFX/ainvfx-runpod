@@ -1026,6 +1026,115 @@ class Helpers(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------------- end to end
+    @unittest.skipIf(os.name == "nt", "the kernel code runs on a Linux pod")
+    def test_train_code_runs_the_pods_train_and_gives_its_exit_code(self):
+        """The code a pod's kernel runs for `python pod.py train`, run here against a stand-in train: a character cut
+        between two writes arrives whole, signs of life come during a silence and never show, a progress bar passes,
+        and the exit code comes back (a signal as 128 + N). A pod without train says so, with code 2."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        fake = os.path.join(tmp, "train")
+        with open(fake, "w") as f:
+            f.write("#!%s\nimport os, signal, sys, time\nout = sys.stdout.buffer\nargs = sys.argv[1:]\n"
+                    "if args[:1] == ['sig']:\n    os.kill(os.getpid(), signal.SIGTERM)\n"
+                    "out.write(b'args: ' + ' '.join(args).encode() + b'\\n'); out.flush()\n"
+                    "out.write('caf\\u00e9\\n'.encode()[:4]); out.flush(); time.sleep(0.8)\n"
+                    "out.write('caf\\u00e9\\n'.encode()[4:]); out.write(b' 50%%\\r 100%%\\r'); out.flush()\n"
+                    "sys.exit(3 if args[:1] == ['fail'] else 0)\n" % sys.executable)
+        os.chmod(fake, 0o755)
+
+        def run(words, exe=fake):
+            r = subprocess.run([sys.executable, "-c", pod.train_code(words, exe=exe, alive=0.2)], capture_output=True,
+                               timeout=60)
+            raw, shown = r.stdout.decode("utf-8"), []
+            out = pod.TrainOutput(shown.append)
+            for k in range(0, len(raw), 5):                      # in small pieces, as stream messages may come
+                out.feed(raw[k:k + 5])
+            out.finish()
+            return raw, "".join(shown), out.code
+        raw, shown, code = run(["caption", "my data", "--trigger", "x"])
+        self.assertEqual(code, 0, raw)
+        self.assertGreater(raw.count("\x1e"), 1, "signs of life during the silence")
+        self.assertEqual(shown, "args: caption my data --trigger x\ncaf\u00e9\n 50%\r 100%\r\n")
+        self.assertEqual(run(["fail"])[2], 3)
+        self.assertEqual(pod.exit_status(run(["sig"])[2]), 128 + signal.SIGTERM)
+        raw, shown, code = run(["log"], exe=os.path.join(tmp, "absent"))
+        self.assertEqual(code, 2, raw)
+        self.assertIn("This pod has no train command", shown)
+
+    def test_a_broken_link_leaves_the_pods_train_running(self):
+        """kernel_run(keep_running=True), as `python pod.py train` calls it: a link that breaks leaves the kernel on the
+        pod, so the command goes on there; Ctrl+C removes it, as it stops a command in the pod's terminal. Without
+        keep_running (push from a web address), a broken link removes it too."""
+        from unittest import mock
+        calls = []
+
+        def fake_request(method, url, **kw):
+            calls.append(method)
+            return {"id": "k1"} if method == "POST" else {}
+
+        def broken(sock):
+            raise ConnectionError("the connection closed")
+            yield                                                # a generator, as ws_messages is
+
+        def ctrl_c(sock):
+            raise KeyboardInterrupt
+            yield
+        with mock.patch.object(pod, "comfy_alive", return_value=True), \
+                mock.patch.object(pod, "proxy_log", return_value=["READY · https://p-8888.proxy/lab?token=t"]), \
+                mock.patch.object(pod, "request", side_effect=fake_request), \
+                mock.patch.object(pod, "ws_connect", return_value=mock.Mock()), mock.patch.object(pod, "ws_send"):
+            with mock.patch.object(pod, "ws_messages", side_effect=broken):
+                with self.assertRaises(pod.LinkBroken) as cm:
+                    pod.kernel_run({"id": "p"}, "code", None, on_text=lambda t: None, keep_running=True)
+                self.assertTrue(cm.exception.started)
+                self.assertEqual(calls, ["POST"], "the kernel stays")
+                calls.clear()
+                with self.assertRaises(pod.LinkBroken):
+                    pod.kernel_run({"id": "p"}, "code", lambda line: None)
+                self.assertEqual(calls, ["POST", "DELETE"])
+            calls.clear()
+            with mock.patch.object(pod, "ws_connect", side_effect=OSError("no route")):     # before the code is sent
+                with self.assertRaises(pod.LinkBroken) as cm:
+                    pod.kernel_run({"id": "p"}, "code", None, on_text=lambda t: None, keep_running=True)
+                self.assertFalse(cm.exception.started)
+                self.assertEqual(calls, ["POST", "DELETE"], "a kernel that never got the code is removed")
+            calls.clear()
+            with mock.patch.object(pod, "ws_messages", side_effect=ctrl_c):
+                with self.assertRaises(KeyboardInterrupt):
+                    pod.kernel_run({"id": "p"}, "code", None, on_text=lambda t: None, keep_running=True)
+                self.assertEqual(calls, ["POST", "DELETE"], "Ctrl+C removes the kernel")
+
+    def test_train_takes_its_pod_from_its_first_word(self):
+        """`python pod.py train`: a first word that names a pod recorded here (its tag, with + or -, its name or its id)
+        picks that pod; any other first word (a recipe, a command, --help) goes to the pod's train command as it is."""
+        pods = {"image-train": {"id": "abc123", "name": "ainvfx-image-train-1"}, "train": {"id": "def456", "name": "t2"}}
+        self.assertEqual(pod.train_target(pods, ["image+train", "caption", "d"]), ("image+train", ["caption", "d"]))
+        self.assertEqual(pod.train_target(pods, ["train", "ltx_mix", "r"]), ("train", ["ltx_mix", "r"]))
+        self.assertEqual(pod.train_target(pods, ["def456", "log"]), ("def456", ["log"]))
+        self.assertEqual(pod.train_target(pods, ["ltx_mix", "r"]), (None, ["ltx_mix", "r"]))
+        self.assertEqual(pod.train_target(pods, ["--help"]), (None, ["--help"]))
+        self.assertEqual(pod.train_target({}, []), (None, []))
+
+    def test_train_output_shows_progress_and_keeps_the_exit_code_apart(self):
+        """The pod's train output comes in pieces: a progress line that ends with \\r shows as soon as it ends, the signs
+        of life (\\x1e) never show, and the exit code is read even when its line comes in two pieces."""
+        shown = []
+        out = pod.TrainOutput(shown.append)
+        out.feed("caching\n 10%\r 20")
+        self.assertEqual("".join(shown), "caching\n 10%\r")
+        out.feed("%\r\x1e\x1edone\n\x1eainvfx-ex")
+        out.feed("it 3\n")
+        out.finish()
+        self.assertEqual("".join(shown), "caching\n 10%\r 20%\rdone\n")
+        self.assertEqual(out.code, 3)
+        shown.clear()
+        out = pod.TrainOutput(shown.append)
+        out.feed("50%\r\x1eainvfx-exit 0\n")                    # output that ends on a progress bar
+        out.finish()
+        self.assertEqual("".join(shown), "50%\r\n", "what follows starts on a new line")
+
+
 class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1186,6 +1295,43 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("gives no sign of life for 2 s", out, out)
         self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
+
+    def test_train_runs_the_pods_train_command_from_here(self):
+        """`python pod.py train ...` runs the pod's own train command with the same words, through JupyterLab: the code
+        runs for real in the fake kernel, against a stand-in train command. Its output shows here, without the signs of
+        life or the exit line; its exit code comes back; --help reaches the pod's command; a first word that names a
+        recorded pod picks that pod; `train stop` asks here first, then passes --yes; a pod without train says so."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        fake = os.path.join(self.home, "train")
+        with open(fake, "w") as f:
+            f.write("#!%s\nimport sys\nprint('args:', ' '.join(sys.argv[1:]))\nprint(' 50%%', end='\\r')\n"
+                    "sys.exit(3 if sys.argv[1:2] == ['fail'] else 0)\n" % sys.executable)
+        os.chmod(fake, 0o755)
+        self.env["AINVFX_POD_TRAIN"] = fake
+        out, rc = self.run_pod("train", "caption", "mydata", "--trigger", "myword")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("args: caption mydata --trigger myword", out, out)
+        self.assertNotIn("ainvfx-exit", out, out)
+        self.assertNotIn("\x1e", out, out)
+        out, rc = self.run_pod("train", "fail")
+        self.assertEqual(rc, 3, out)
+        out, rc = self.run_pod("train", "--help")
+        self.assertIn("args: --help", out, out)
+        out, rc = self.run_pod("train", "image", "recipes")
+        self.assertIn("args: recipes", out, out)
+        out, rc = self.run_pod("train", "stop", input="n\n")
+        self.assertNotIn("args:", out, out)
+        self.assertIn("Nothing stopped", out, out)
+        out, rc = self.run_pod("train", "stop", input="y\n")
+        self.assertIn("args: stop --yes", out, out)
+        self.env["AINVFX_POD_TRAIN"] = os.path.join(self.home, "no-train")
+        out, rc = self.run_pod("train", "log")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("no train command", out, out)
 
     def test_push_from_a_web_address(self):
         """`push URL`: the pod downloads by itself. The code that pod.py sends runs for real in the fake kernel, against

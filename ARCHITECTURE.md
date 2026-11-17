@@ -141,11 +141,12 @@ On the pod:
 | Host and money | `pod_machine`, `maintenance_of`, `host_check`, `account_money` | The two GraphQL reads |
 | Logs | `log_stream`, `follow_logs`, `ImagePull` | `ImagePull` turns Docker's layer lines into one progress line |
 | Creation | `create_pod`, `try_create` | |
-| Commands | `cmd_setup`, `cmd_up`, `cmd_status`, `cmd_logs`, `cmd_open`, `cmd_push`, `cmd_pull`, `cmd_down`, `cmd_list`, `cmd_ssh`, `cmd_doctor` | |
+| Commands | `cmd_setup`, `cmd_up`, `cmd_status`, `cmd_logs`, `cmd_open`, `cmd_push`, `cmd_pull`, `cmd_down`, `cmd_list`, `cmd_ssh`, `cmd_train`, `cmd_doctor` | |
 | Files | `jupyter_tree`, `jupyter_upload`, `push_dataset`, `model_folder`, `push_to_models`, `push_models`, `history_files`, `fetch_to`, `pull` | Downloads go through a `.part` file |
 | A training run, seen from outside the pod | `read_run`, `run_in_progress`, `run_label`, `wait_for_run` | `down --when-done`: one read of the job record a minute |
 | Push from a web address | `is_web`, `hf_url`, `index_links`, `frame_split`, `frames_in_range`, `hf_host`, `HfRedirect`, `open_url`, `remote_push`, `remote_code`, `ws_connect`, `ws_send`, `ws_messages`, `kernel_run`, `push_url` | `index_links` to `remote_push` run on the pod as well: `remote_code` sends their source |
-| Entry | `main` | argparse |
+| Train from this computer | `TRAIN_ALIVE`, `TRAIN_CODE`, `train_code`, `show_text`, `TrainOutput`, `train_target`, `exit_status`, `cmd_train` | The pod's `train` runs in a kernel through `kernel_run(on_text=, keep_running=True)`, its output shown as it comes. Ctrl+C removes the kernel, which stops the command as in the pod's terminal; a broken link (`LinkBroken`) leaves the kernel, so the command goes on; a training run, in a session of its own, outlives both |
+| Entry | `main` | argparse; `train` and every word after it skip it, so `train --help` reaches the pod |
 
 ### `bootstrap.sh`, in file order
 
