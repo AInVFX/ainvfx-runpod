@@ -175,6 +175,7 @@ python pod.py push --to diffusion_models https://example.org/models/my_model.saf
 - **The folder** is one of ComfyUI's own: `loras`, `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`, `controlnet`, `latent_upscale_models`, `clip_vision` and the others of its `models` folder. `lora`, `checkpoint`, `diffusion_model`, `unet`, `text_encoder` and `clip` name them too. A custom node's own folder works (`--to sam3`), with a note; one subfolder too (`--to loras/ltx`).
 - **A web address** can be a file, a Hugging Face file page or download link, `hf://owner/repo/path` (`hf://datasets/owner/repo/path` for a dataset, `@revision` after the repository for another branch), or a Google Drive, Dropbox or GitHub share link of one file. The file keeps its name.
 - **A gated Hugging Face file** comes down when your token is stored (`setup --hf-token`) and its licence is accepted on that account. The pod sends the token to huggingface.co only.
+- **A file from your computer** goes up at the speed of your connection, with a progress line every 10 seconds: megabytes sent, speed, time left. A web address is faster, since the pod downloads it itself.
 - **Run it again** after an interruption: a file already there with the same size is skipped.
 - **Then, in ComfyUI**, press R: the file appears in its loader's list.
 

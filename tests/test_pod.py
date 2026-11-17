@@ -1538,6 +1538,22 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("--set takes AINVFX_KEY=value", out, out)
         self.assertEqual(len(STATE["posts"]), 2, "nothing created")
 
+    def test_a_model_file_going_up_shows_its_progress(self):
+        """A model file larger than one request goes up in chunks, and `push --to` says how far it is: megabytes sent,
+        speed and time left."""
+        self.env.update(AINVFX_UPLOAD_CHUNK="1024", AINVFX_UPLOAD_NOTE="0")
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        big = os.path.join(self.home, "big.safetensors")
+        with open(big, "wb") as f:
+            f.write(os.urandom(5000))
+        out, rc = self.run_pod("push", "--lora", big)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"MB/s · about .+ left")
+        self.assertIn("1 file(s) sent", out)
+
     def test_hugging_face_addresses_and_model_folders(self):
         """A Hugging Face file page becomes its download address, as does hf://[datasets/]owner/repo[@revision]/path;
         other addresses stay as they are. The token goes to Hugging Face's own site only, never to its storage

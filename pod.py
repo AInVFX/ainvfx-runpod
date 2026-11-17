@@ -128,6 +128,7 @@ SKIP_NAMES = {"_output_images_will_be_put_here"}               # the empty place
 TRAIN_RESERVE_GB = 70
 UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per request through JupyterLab, far under the
                                                               # proxy's limit
+UPLOAD_NOTE = env_num("AINVFX_UPLOAD_NOTE", "10")           # seconds between two progress lines of a model file going up
 TEXT_SUFFIXES = (".txt", ".toml", ".json", ".jsonl", ".md", ".csv")
 DATASET_SKIP = {"__MACOSX", "Thumbs.db", "desktop.ini"}       # left behind, as every hidden name
 DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -1991,11 +1992,12 @@ def dataset_plan(paths):
     return plan
 
 
-def jupyter_upload(base, hdrs, path, local, data=None):
+def jupyter_upload(base, hdrs, path, local, data=None, progress=None):
     """One file through JupyterLab's contents API. A file that fits one request is written by one PUT, which Jupyter
     writes atomically; a larger one goes in chunks into <name>.part (chunk 1 starts it, -1 ends it), renamed over
     the target at the end: an interrupted upload never leaves a half file under the real name, and the trainers
-    skip a .part file. Not a hidden name: JupyterLab refuses to create one."""
+    skip a .part file. Not a hidden name: JupyterLab refuses to create one. After each chunk, `progress` receives
+    the bytes sent so far."""
     def put(target, chunk, number=None):
         model = {"type": "file", "format": "base64", "name": target.rsplit("/", 1)[-1], "path": target,
                  "content": base64.b64encode(chunk).decode("ascii")}
@@ -2014,6 +2016,8 @@ def jupyter_upload(base, hdrs, path, local, data=None):
             chunk = f.read(UPLOAD_CHUNK)
             last = f.tell() >= size
             put(part, chunk, -1 if last else number)
+            if progress:
+                progress(f.tell())
             if last:
                 break
             number += 1
@@ -2082,8 +2086,19 @@ def push_models(rec, folder, paths):
     for i in range(1, len(parts) + 1):     # every level, as push --dataset does: a folder already there is kept
         request("PUT", base + "/api/contents/" + urllib.parse.quote("/".join(parts[:i])), body={"type": "directory"},
                 headers=hdrs, timeout=60)
-    sent = kept = 0
+    sent = kept = done = 0
     t0, total = time.time(), sum(f.stat().st_size for f in paths)
+    todo = sum(f.stat().st_size for f in paths if there.get(f.name) != f.stat().st_size)
+    noted = [t0]
+
+    def progress(n):       # n: the bytes of this push sent so far; a line every UPLOAD_NOTE seconds while a file goes up
+        now = time.time()
+        if now - noted[0] >= UPLOAD_NOTE:
+            rate = max(n / max(now - t0, 1e-9), 1e-9)
+            say("   {:.0f} of {:.0f} MB · {:.1f} MB/s · about {} left".format(n / 1e6, todo / 1e6, rate / 1e6,
+                                                                       fmt_duration((todo - n) / rate / 3600)))
+            noted[0] = now
+
     for f in paths:
         size = f.stat().st_size
         if there.get(f.name) == size:
@@ -2091,10 +2106,11 @@ def push_models(rec, folder, paths):
             continue
         say("  {}  ({:.1f} MB) -> models/{}/".format(f.name, size / 1e6, folder))
         try:
-            jupyter_upload(base, hdrs, dest + "/" + f.name, f)
+            jupyter_upload(base, hdrs, dest + "/" + f.name, f, progress=lambda n, before=done: progress(before + n))
         except ApiError as e:
             die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
         sent += 1
+        done += size
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> models/{}".format(sent, kept, total / 1e6,
                                                                               time.time() - t0, folder))
     say("Done. In ComfyUI, press R to refresh the model lists.")
