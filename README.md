@@ -60,6 +60,7 @@ python pod.py down               # pulls, then terminates: billing stops
 | `logs [pod]` | Follows the log again until `READY` |
 | `open [pod]` | Opens ComfyUI in your browser |
 | `push [pod] FILES` | Copies files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training |
+| `push --lora [pod] FILE` | Puts a model file into ComfyUI's `models/loras`, from your computer or a web address. `--to FOLDER` names any other model folder: `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`... ([Models to a pod](#models-to-a-pod)) |
 | `push [pod] URL` | The pod downloads a web address itself: one file, or every file that a folder page lists. `--frames 480-600` keeps the frames of that range, `--into NAME` names the folder under ComfyUI's input. With `--dataset NAME`, the files go to `/workspace/dataset/NAME` |
 | `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/` |
 | `down [pod]` | Pulls, terminates, then gives the pod's cost and the credit left. `--all` for every pod recorded here, `--no-pull` to skip the download, `--when-done` to wait first for the training run in progress on the pod ([A first run](#a-first-run)) |
@@ -140,6 +141,7 @@ Some repositories are **gated**: Hugging Face serves their files only to an acco
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
 - **Files from a web address**: `python pod.py push URL`. The pod downloads them itself, so nothing passes through your own connection ([Files from a web address](#files-from-a-web-address)).
 - **A training dataset in**: `python pod.py push --dataset NAME FOLDER` ([Training a LoRA](#training-a-lora)).
+- **A model file in**, at the last minute: `python pod.py push --lora FILE` or `--to FOLDER`, from your computer or a web address ([Models to a pod](#models-to-a-pod)).
 - **Results out**: the Assets panel in ComfyUI, or `python pod.py pull`. It downloads every file of the pod's output folder that you do not have yet, subfolders kept: images, videos, 3D files, and files a node saves without showing them, such as a trained LoRA. Results go to `outputs/<pod name>/` next to the script, or to the folder named in the `AINVFX_OUTPUTS` environment variable. Without JupyterLab, `pull` gets only the files that ComfyUI's history lists. `down` runs the same pull first.
 - **Many files at once**: JupyterLab, from the link of the `READY` line. Its terminal is under File, New, Terminal.
 
@@ -157,6 +159,24 @@ python pod.py push https://example.org/plates/shot_010/ --frames 480-600 --into 
 - **`--into NAME`** names the folder under ComfyUI's input. Without it, a folder keeps its own name and a single file goes to the top of the input folder.
 - **Run it again** after an interruption: files already there with the same size are skipped.
 - The download runs through the pod's JupyterLab, so the pod must be `READY`.
+- **A Hugging Face file** works too: its page (`.../blob/main/...`), its download link (`.../resolve/main/...`) or `hf://owner/repo/path`.
+
+### Models to a pod
+
+`--to FOLDER` puts model files into that folder of ComfyUI's `models`, and `--lora` is short for `--to loras`. A file on your computer goes up through the pod's JupyterLab; a web address is downloaded by the pod itself. With a pod's name, the options come first: `python pod.py push --lora my-pod FILE`.
+
+```bash
+python pod.py push --lora outputs/my-pod/train/mychar_v1/mychar_v1.comfy.safetensors      # a LoRA you trained
+python pod.py push --lora https://huggingface.co/AInVFX/ainvfx-fluid/blob/main/ltx-2.5/ainvfx-fluid.safetensors
+python pod.py push --to vae hf://Comfy-Org/MOSS-Image/vae/flux2-vae.safetensors
+python pod.py push --to diffusion_models https://example.org/models/my_model.safetensors
+```
+
+- **The folder** is one of ComfyUI's own: `loras`, `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`, `controlnet`, `latent_upscale_models`, `clip_vision` and the others of its `models` folder. `lora`, `checkpoint`, `diffusion_model`, `unet`, `text_encoder` and `clip` name them too. A custom node's own folder works (`--to sam3`), with a note; one subfolder too (`--to loras/ltx`).
+- **A web address** can be a file, a Hugging Face file page or download link, `hf://owner/repo/path` (`hf://datasets/owner/repo/path` for a dataset, `@revision` after the repository for another branch), or a Google Drive, Dropbox or GitHub share link of one file. The file keeps its name.
+- **A gated Hugging Face file** comes down when your token is stored (`setup --hf-token`) and its licence is accepted on that account. The pod sends the token to huggingface.co only.
+- **Run it again** after an interruption: a file already there with the same size is skipped.
+- **Then, in ComfyUI**, press R: the file appears in its loader's list.
 
 ## Training a LoRA
 
@@ -194,7 +214,7 @@ train zimage mychar_v1 --dataset mychar         # trains in the background; its 
 - **Read every caption before training.** JupyterLab opens the `.txt` files under `workspace/dataset/mychar`. The caption model makes mistakes, and a wrong word is learned like the others. `train caption` ends with the words found in most captions: a word that describes the style goes in `--avoid`, then `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`. For `ltx_av`, `--audio` adds what is heard to each clip's caption: the caption model hears nothing and guesses the sound from the picture, so read those lines too.
 - **During the run**, Ctrl+C stops the display, never the run. `train log` shows it again, `train status` says where it stands, `train stop` stops it. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
 - **Every 250 steps**, a checkpoint and test images (samples) land in `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI to refresh it). Judge the samples, not the loss curve: stop when they stop improving.
-- **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats.
+- **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats. On another pod, `python pod.py push --lora <its .comfy.safetensors file>` puts it back into ComfyUI's LoRA list.
 - **To stop paying when the run ends**, once the run has started, leave `python pod.py down --when-done` running on your computer. It looks at the run once a minute. When the run has ended, it pulls the output folder, then terminates the pod. Your computer must stay on, awake and online until then. Ctrl+C stops the wait and leaves the pod running. A run that failed or was stopped ends the wait too, so stop the wait before you stop a run to launch another. A run whose process died without a word, after a pod restart, is seen after 5 minutes without a sign of life.
 
 ### Options of a run

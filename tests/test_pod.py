@@ -13,6 +13,7 @@ them). Each test's docstring names the incident it reproduces.
 """
 import base64, hashlib, itertools, json, os, re, shutil, signal, struct, subprocess, sys, tempfile, threading, time, unittest
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1247,6 +1248,51 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn("no pong", ks)
         self.assertGreater(ks.count("started"), 6, ks)
 
+    def test_push_a_model_into_comfyuis_folders(self):
+        """`push --to FOLDER` and `push --lora`: a local file goes up through JupyterLab into ComfyUI's models/FOLDER, in
+        chunks, renamed at the end; a second push skips it; an alias names ComfyUI's own folder; a web address is
+        downloaded by the pod into that folder; a custom node's folder is accepted with a note; a folder, a path out of
+        models/, custom_nodes and the options of the other pushes are refused."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        models = os.path.join(self.home, "pod_models")
+        self.env.update(AINVFX_POD_MODELS=models, AINVFX_UPLOAD_CHUNK="64")
+        site = "http://127.0.0.1:%d/web/" % self.port
+        lora = os.path.join(self.home, "jar_v1-step00000250.comfy.safetensors")
+        with open(lora, "wb") as f:
+            f.write(bytes(range(256)) + b"L" * 44)
+        out, rc = self.run_pod("push", "--lora", lora)
+        self.assertEqual(rc, 0, out)
+        jfs, top = STATE["jfs"], "workspace/ComfyUI/models/"
+        self.assertEqual(bytes(jfs[top + "loras/jar_v1-step00000250.comfy.safetensors"]), bytes(range(256)) + b"L" * 44)
+        self.assertEqual([p for p in jfs if p.endswith(".part")], [], "the chunks are renamed over the name")
+        self.assertIn("1 file(s) sent, 0 unchanged", out, out)
+        self.assertIn("press R to refresh the model lists", out, out)
+        out, rc = self.run_pod("push", "--to", "lora", "image", lora)          # an alias, the pod named, the file there
+        self.assertEqual(rc, 0, out)
+        self.assertIn("0 file(s) sent, 1 unchanged", out, out)
+        out, rc = self.run_pod("push", "--to", "vae", site + "shot/shot_0100.exr")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(os.listdir(os.path.join(models, "vae"))), ["shot_0100.exr"], out)
+        with open(os.path.join(models, "vae", "shot_0100.exr"), "rb") as f:
+            self.assertEqual(f.read(), WEB_FILES["shot_0100.exr"])
+        out, rc = self.run_pod("push", "--to", "sam3", lora)                    # a custom node's own folder
+        self.assertEqual(rc, 0, out)
+        self.assertIn("not one of ComfyUI's own model folders", out, out)
+        self.assertIn(top + "sam3/jar_v1-step00000250.comfy.safetensors", jfs)
+        for cmd, says in ((("--to", "../input", lora), "--to takes a folder"),
+                          (("--to", "custom_nodes", lora), "AINVFX_CUSTOM_NODES"),
+                          (("--lora", self.home), "is a folder"),
+                          (("--lora", "--frames", "1-2", site + "shot/"), "--frames go with the other pushes"),
+                          (("--lora", "--dataset", "x", lora), "--dataset, --into and --frames"),
+                          (("--lora", site + "shot/shot_0100.exr", lora), "one web address")):
+            out, rc = self.run_pod("push", *cmd)
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn(says, out, out)
+
     def test_push_dataset_through_jupyterlab(self):
         """A training dataset goes up through JupyterLab: subfolders kept, captions without BOM nor CR, a large file
         in chunks then renamed over its name (no .part left), hidden files left behind; a second push sends the
@@ -1491,6 +1537,38 @@ class EndToEnd(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("--set takes AINVFX_KEY=value", out, out)
         self.assertEqual(len(STATE["posts"]), 2, "nothing created")
+
+    def test_hugging_face_addresses_and_model_folders(self):
+        """A Hugging Face file page becomes its download address, as does hf://[datasets/]owner/repo[@revision]/path;
+        other addresses stay as they are. The token goes to Hugging Face's own site only, never to its storage
+        hosts, and a redirect away from it drops the token. Folder names: ComfyUI's own, and the aliases."""
+        page = "https://huggingface.co/AInVFX/ainvfx-fluid/blob/main/ltx-2.5/ainvfx-fluid.safetensors"
+        file = page.replace("/blob/", "/resolve/")
+        self.assertEqual(pod.hf_url(page), file)
+        self.assertEqual(pod.hf_url(file), file)
+        self.assertEqual(pod.hf_url(file + "?download=true"), file + "?download=true")
+        self.assertEqual(pod.hf_url("hf://AInVFX/ainvfx-fluid/ltx-2.5/ainvfx-fluid.safetensors"), file)
+        self.assertEqual(pod.hf_url("hf://Lightricks/LTX-2.5@v1.0/loras/a.safetensors"),
+                         "https://huggingface.co/Lightricks/LTX-2.5/resolve/v1.0/loras/a.safetensors")
+        self.assertEqual(pod.hf_url("hf://datasets/AInVFX/ainvfx-fluid/README.md"),
+                         "https://huggingface.co/datasets/AInVFX/ainvfx-fluid/resolve/main/README.md")
+        self.assertEqual(pod.hf_url("https://huggingface.co/datasets/AInVFX/ainvfx-fluid/blob/main/clips/a.mp4"),
+                         "https://huggingface.co/datasets/AInVFX/ainvfx-fluid/resolve/main/clips/a.mp4")
+        for other in ("https://example.org/me/repo/blob/main/x.safetensors", "https://github.com/me/r/blob/main/m.json"):
+            self.assertEqual(pod.hf_url(other), other)
+        self.assertTrue(pod.is_web("hf://a/b/c.safetensors") and pod.is_web(page))
+        self.assertFalse(pod.is_web("hf_lora.safetensors"))
+        self.assertTrue(pod.hf_host(file) and pod.hf_host("https://hf.co/a/b/resolve/main/c"))
+        for host in ("https://cas-bridge.xethub.hf.co/x?sig=1", "https://cdn-lfs.hf.co/x", "http://127.0.0.1:9/web/"):
+            self.assertFalse(pod.hf_host(host), host)
+        req = urllib.request.Request(file, headers={"Authorization": "Bearer hf_x"})
+        away = pod.HfRedirect().redirect_request(req, None, 302, "Found", {}, "https://cas-bridge.xethub.hf.co/x?sig=1")
+        self.assertIsNone(away.get_header("Authorization"))
+        stay = pod.HfRedirect().redirect_request(req, None, 307, "Moved", {}, "https://huggingface.co/a/b/resolve/main/c")
+        self.assertEqual(stay.get_header("Authorization"), "Bearer hf_x")
+        self.assertEqual(pod.FOLDER_ALIASES["lora"], "loras")
+        self.assertEqual(pod.FOLDER_ALIASES["unet"], "diffusion_models")
+        self.assertTrue(set(pod.FOLDER_ALIASES.values()) <= set(pod.MODEL_FOLDERS))
 
     def test_own_models_list(self):
         """A pod of 13 Oct 2026 with a Google Drive link: a share link becomes the file's own

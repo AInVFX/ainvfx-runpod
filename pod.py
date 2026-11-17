@@ -11,6 +11,8 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py open [pod]         open ComfyUI in your browser
   python pod.py push [pod] FILES   copy files into the pod's input folder; --dataset NAME for training
   python pod.py push [pod] URL     the pod downloads a file or a folder page itself; --frames 480-600, --into NAME
+  python pod.py push --lora [pod] FILE|URL   a model file into ComfyUI's models/loras; --to FOLDER for any other
+                                   model folder (vae, diffusion_models, text_encoders...)
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
   python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here;
                                    --when-done waits first for the training run in progress on the pod to end
@@ -51,7 +53,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest"   # the branch that follows each release
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -132,6 +134,17 @@ DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 WEB_ADDRESS = re.compile(r"https?://", re.I)
 POD_INPUT = os.environ.get("AINVFX_POD_INPUT", "/workspace/ComfyUI/input")     # where a pod keeps ComfyUI's input folder
 POD_DATASET = os.environ.get("AINVFX_POD_DATASET", "/workspace/dataset")       # and its training datasets
+POD_MODELS = os.environ.get("AINVFX_POD_MODELS", "/workspace/ComfyUI/models")  # and its model folders
+# ComfyUI's own model folders (folder_paths.py at v0.45.4), and the other names people give some of them
+MODEL_FOLDERS = ("audio_encoders", "background_removal", "checkpoints", "classifiers", "clip_vision", "configs",
+                 "controlnet", "datasets", "detection", "diffusers", "diffusion_models", "embeddings",
+                 "frame_interpolation", "geometry_estimation", "gligen", "hypernetworks", "latent_upscale_models",
+                 "loras", "model_patches", "optical_flow", "photomaker", "style_models", "text_encoders",
+                 "upscale_models", "vae", "vae_approx")
+FOLDER_ALIASES = {"lora": "loras", "checkpoint": "checkpoints", "diffusion_model": "diffusion_models",
+                  "unet": "diffusion_models", "text_encoder": "text_encoders", "clip": "text_encoders",
+                  "upscale_model": "upscale_models", "latent_upscale_model": "latent_upscale_models",
+                  "embedding": "embeddings", "model_patch": "model_patches", "controlnets": "controlnet"}
 # train.py keeps the record of its run in ComfyUI's output folder, so the pod serves it through its proxy, as its log.
 RUN_VIEW = "/view?filename=.job.json&subfolder=train&type=output"
 RUN_ACTIVE = ("starting", "running")                       # the record's states of a run in progress (train.py's ACTIVE)
@@ -238,6 +251,23 @@ def parse_profiles(text, names=None):
         die("unknown profile(s): {}. Known: {}, joined by + (image+3d), or all.".format(
             ", ".join(unknown), ", ".join(order)))
     return [p for p in order if p in parts]
+
+
+def is_web(src):
+    """True for an address the pod downloads itself: http(s)://, or hf:// (a Hugging Face file)."""
+    return bool(WEB_ADDRESS.match(src)) or src.lower().startswith("hf://")
+
+
+def hf_url(src):
+    """A Hugging Face address as the file itself. A file page (.../blob/<revision>/<path>) becomes its download
+    address (.../resolve/<revision>/<path>); hf://[datasets/]<owner>/<repo>[@<revision>]/<path>, the form of
+    huggingface_hub, becomes one too, on main by default. Any other address comes back as it is."""
+    m = re.match(r"hf://((?:datasets/|spaces/)?)([^/@]+)/([^/@]+)(?:@([^/]+))?/(.+)$", src, re.I)
+    if m:
+        return "https://huggingface.co/{}{}/{}/resolve/{}/{}".format(m.group(1), m.group(2), m.group(3),
+                                                                  m.group(4) or "main", m.group(5))
+    return re.sub(r"^(https?://(?:www\.)?(?:huggingface|hf)\.co/(?:datasets/|spaces/)?[^/]+/[^/]+)/blob/", r"\1/resolve/",
+                  src, flags=re.I)
 
 
 def direct_url(url):
@@ -1812,7 +1842,9 @@ def multipart(fields, filefield, path):
 
 
 def cmd_push(args):
-    if any(WEB_ADDRESS.match(f) for f in args.files):
+    if args.to:
+        return push_to_models(args)
+    if any(is_web(f) for f in args.files):
         if len(args.files) != 1:
             die("push takes local files, or one web address: one command for each")
         return push_url(args, args.files[0])
@@ -1993,6 +2025,81 @@ def jupyter_upload(base, hdrs, path, local, data=None):
     request("PATCH", base + "/api/contents/" + urllib.parse.quote(part), body={"path": path}, headers=hdrs, timeout=60)
 
 
+def model_folder(name):
+    """The folder of ComfyUI's models that `push --to NAME` writes into: one of ComfyUI's own (loras, vae,
+    diffusion_models...), another name people give one of them (lora, unet, clip...), or a custom node's own folder;
+    one subfolder at most (loras/ltx). Never a path that leaves models/."""
+    parts = name.strip("/").split("/")
+    if not 1 <= len(parts) <= 2 or not all(DATASET_NAME.fullmatch(p) for p in parts):
+        die("--to takes a folder of ComfyUI's models, such as loras, vae or diffusion_models (got \"{}\")".format(name))
+    parts[0] = FOLDER_ALIASES.get(parts[0].lower(), parts[0])
+    if parts[0] == "custom_nodes":
+        die("--to sends model files into ComfyUI's models; a custom node goes in with --set AINVFX_CUSTOM_NODES=<git URL>")
+    if parts[0] not in MODEL_FOLDERS:
+        say("{} is not one of ComfyUI's own model folders: a custom node may read it (its README says).".format(parts[0]))
+    return "/".join(parts)
+
+
+def push_to_models(args):
+    """`push --to FOLDER` (or --lora): model files into ComfyUI's models/FOLDER, from this computer through the pod's
+    JupyterLab, or one web address that the pod downloads itself."""
+    if args.dataset or args.into or args.frames:
+        die("--to sends model files: --dataset, --into and --frames go with the other pushes")
+    folder = model_folder(args.to)
+    if any(is_web(f) for f in args.files):
+        if len(args.files) != 1:
+            die("push takes local files, or one web address: one command for each")
+        return push_url(args, args.files[0], folder)
+    files = [Path(f).expanduser() for f in args.files]
+    for f in files:
+        if not f.exists():
+            die("file not found: {}".format(f))
+        if f.is_dir():
+            die("{} is a folder: --to sends model files, each one named on the command line".format(f))
+    _, rec = which_pod(load_config(), args.profile)
+    return push_models(rec, folder, files)
+
+
+def push_models(rec, folder, paths):
+    """Model files into ComfyUI's models/<folder>/, through the pod's JupyterLab, in chunks renamed at the end; a
+    file already there with the same size is skipped."""
+    pod_id = rec["id"]
+    if not comfy_alive(pod_id):
+        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
+    token = jupyter_token(proxy_log(pod_id))
+    if not token:
+        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A model file "
+            "from this computer goes up through JupyterLab; a web address does not need it.")
+    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    try:      # JupyterLab's root is / on Runpod's current images, /workspace on older ones
+        top = "workspace/ComfyUI" if request("GET", base + "/api/contents/workspace?content=0", headers=hdrs,
+                                             timeout=30).get("type") == "directory" else "ComfyUI"
+    except ApiError:
+        top = "ComfyUI"
+    dest = "{}/models/{}".format(top, folder)
+    there = dict(jupyter_tree(base, hdrs, dest) or [])
+    parts = dest.split("/")
+    for i in range(1, len(parts) + 1):     # every level, as push --dataset does: a folder already there is kept
+        request("PUT", base + "/api/contents/" + urllib.parse.quote("/".join(parts[:i])), body={"type": "directory"},
+                headers=hdrs, timeout=60)
+    sent = kept = 0
+    t0, total = time.time(), sum(f.stat().st_size for f in paths)
+    for f in paths:
+        size = f.stat().st_size
+        if there.get(f.name) == size:
+            kept += 1
+            continue
+        say("  {}  ({:.1f} MB) -> models/{}/".format(f.name, size / 1e6, folder))
+        try:
+            jupyter_upload(base, hdrs, dest + "/" + f.name, f)
+        except ApiError as e:
+            die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
+        sent += 1
+    say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> models/{}".format(sent, kept, total / 1e6,
+                                                                              time.time() - t0, folder))
+    say("Done. In ComfyUI, press R to refresh the model lists.")
+
+
 def push_dataset(rec, name, paths):
     """Files and folders into /workspace/dataset/<name>/, through the pod's JupyterLab with the token of the READY
     line. Captions and configs go cleaned (clean_text); a file already there with the same size is skipped, except
@@ -2100,6 +2207,33 @@ def frames_in_range(names, first, last):
     return [n for num, _, n in seq if first <= num <= last], pattern, seq[0][0], seq[-1][0]
 
 
+def hf_host(url):
+    """Runs on the pod as well. True when the address is Hugging Face's own site, the only one that receives the
+    pod's HF_TOKEN; its storage hosts (cas-bridge.xethub.hf.co, cdn-lfs.hf.co) take signed links instead."""
+    return (urllib.parse.urlsplit(url).hostname or "").lower() in ("huggingface.co", "www.huggingface.co", "hf.co")
+
+
+class HfRedirect(urllib.request.HTTPRedirectHandler):
+    """Runs on the pod as well. Follows a redirect, and drops the token when it leaves Hugging Face's own site, as
+    curl does: a download then moves to a storage host with a signed link, which a second credential can break."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
+        if new is not None and not hf_host(newurl):
+            new.headers.pop("Authorization", None)
+            new.unredirected_hdrs.pop("Authorization", None)
+        return new
+
+
+def open_url(u, timeout=120):
+    """Runs on the pod as well. Opens u; an address on Hugging Face's own site gets the pod's HF_TOKEN, so a gated
+    file whose licence the account accepted comes down. A token Runpod left unresolved ({{ ... }}) is ignored."""
+    hdrs = {"User-Agent": "Mozilla/5.0 (compatible; ainvfx-runpod)"}
+    token = os.environ.get("HF_TOKEN", "")
+    if token and "{{" not in token and hf_host(u):
+        hdrs["Authorization"] = "Bearer " + token
+    return urllib.request.build_opener(HfRedirect).open(urllib.request.Request(u, headers=hdrs), timeout=timeout)
+
+
 def remote_push(url, base, into, frames):
     """Runs on the pod. Downloads `url` under `base`: one file, or every file a folder page lists (into base/<into>,
     by default the folder's own name), or with `frames` (first, last) the frames of that range. Eight downloads at a
@@ -2107,13 +2241,12 @@ def remote_push(url, base, into, frames):
     line that pod.py reads: AINVFX_PUSH_DONE {json} or AINVFX_PUSH_ERROR message."""
     import concurrent.futures
     import threading
-    agent = {"User-Agent": "Mozilla/5.0 (compatible; ainvfx-runpod)"}
 
     def fail(msg):
         print("AINVFX_PUSH_ERROR " + msg, flush=True)
 
     def get(u, timeout=120):
-        return urllib.request.urlopen(urllib.request.Request(u, headers=agent), timeout=timeout)
+        return open_url(u, timeout)
     url = direct_url(url)
     try:
         r = get(url)
@@ -2183,7 +2316,8 @@ def remote_push(url, base, into, frames):
 def remote_code(url, base, into, frames):
     """The Python that the pod runs for `push URL`: the functions above, then the call."""
     parts = ["import json\nimport os\nimport re\nimport time\nimport urllib.parse\nimport urllib.request"]
-    parts += [inspect.getsource(f) for f in (direct_url, index_links, frame_split, frames_in_range, remote_push)]
+    parts += [inspect.getsource(f) for f in (direct_url, index_links, frame_split, frames_in_range, hf_host, HfRedirect,
+                                             open_url, remote_push)]
     parts.append("remote_push({!r}, {!r}, {!r}, {!r})".format(url, base, into, frames))
     return "\n\n".join(parts) + "\n"
 
@@ -2313,9 +2447,10 @@ def kernel_run(rec, code, on_line):
             pass
 
 
-def push_url(args, url):
+def push_url(args, url, models=None):
     """`push URL`: the pod downloads one file, a folder page's files, or a frame range of them, into ComfyUI's input
-    folder (or /workspace/dataset/NAME with --dataset)."""
+    folder (or /workspace/dataset/NAME with --dataset, or ComfyUI's models/FOLDER with --to)."""
+    url = hf_url(url)
     frames = None
     if args.frames:
         m = re.fullmatch(r"(\d+)-(\d+)", args.frames)
@@ -2328,7 +2463,10 @@ def push_url(args, url):
         if name and not DATASET_NAME.fullmatch(name):
             die("{} takes a folder name: letters, digits, _ . or - (got \"{}\")".format(opt.strip(), name))
     _, rec = which_pod(load_config(), args.profile)
-    base, into = (POD_DATASET, args.dataset) if args.dataset else (POD_INPUT, args.into)
+    if models:
+        base, into = POD_MODELS, models
+    else:
+        base, into = (POD_DATASET, args.dataset) if args.dataset else (POD_INPUT, args.into)
     say("The pod downloads {}".format(url))
     got = {}
 
@@ -2348,6 +2486,8 @@ def push_url(args, url):
         got["files"] - got["kept"], got["kept"], got["bytes"] / 1e6, got["seconds"], got["dest"]))
     if args.dataset:
         say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(args.dataset))
+    elif models:
+        say("Done. In ComfyUI, press R to refresh the model lists.")
     else:
         say("Done. In ComfyUI, press R to refresh the lists of the loading nodes.")
 
@@ -2682,9 +2822,13 @@ def main():
     command("status", cmd_status, "status, GPU, cost, address, log")
     command("open", cmd_open, "open ComfyUI in the browser")
     command("pull", cmd_pull, "download the outputs")
-    p = command("push", cmd_push, "upload files into the pod's input folder, or a training dataset")
+    p = command("push", cmd_push, "upload files into the pod's input folder, a training dataset, or a model folder")
     p.add_argument("files", nargs="+", help="local files, or one web address that the pod downloads itself: a file, "
-                                            "or a folder page that lists its files")
+                                            "a folder page that lists its files, a Hugging Face file page, or "
+                                            "hf://owner/repo/path")
+    p.add_argument("--to", metavar="FOLDER", help="send model files into this folder of ComfyUI's models: loras, vae, "
+                                                  "diffusion_models, text_encoders, checkpoints, upscale_models...")
+    p.add_argument("--lora", action="store_const", const="loras", dest="to", help="the same as --to loras")
     p.add_argument("--dataset", metavar="NAME", help="send these files and folders into /workspace/dataset/NAME, "
                                                      "for training (through the pod's JupyterLab)")
     p.add_argument("--frames", metavar="FIRST-LAST", help="with a folder's web address: only the frames of this "
@@ -2704,7 +2848,7 @@ def main():
 
     args = ap.parse_args()
     # `push image file.png` and `push file.png` both work: a first argument that is a file or a web address is one
-    if args.cmd == "push" and args.profile and (WEB_ADDRESS.match(args.profile) or Path(args.profile).expanduser().exists()):
+    if args.cmd == "push" and args.profile and (is_web(args.profile) or Path(args.profile).expanduser().exists()):
         args.files.insert(0, args.profile)
         args.profile = None
     try:
