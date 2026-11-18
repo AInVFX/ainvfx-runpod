@@ -195,7 +195,7 @@ The `train` profile makes the pod a training machine too. After ComfyUI, it inst
 | `ltx_av` | the picture and the sound together, on LTX 2.5 | clips with sound | 70 GB | 1,500 · 1e-4 · 32 |
 | `ltx_mix` | the look, the motion and the sound together, on LTX 2.5 | stills, clips and sound files | 70 GB | 1,500 · 1e-4 · 32 |
 
-A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip with its caption. The trainer reads each clip at 25 fps and takes its first 121 frames: it leaves out a shorter clip ([Clips of several lengths](#clips-of-several-lengths)). **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names. **Stills, clips and sound**: up to three sub-folders, `images/`, `clips/` and `audio/` ([Stills, clips and sound in one run](#stills-clips-and-sound-in-one-run)).
+A dataset is one folder. **Images**: each image with its caption, a `.txt` file of the same name. **Clips**: each clip with its caption. The trainer reads each clip at 25 fps and takes its first 121 frames: it leaves out a shorter clip ([Clips of several lengths](#clips-of-several-lengths)). Files of any size and shape go in one folder ([Sizes and lengths](#sizes-and-lengths)). **Pairs**: a `targets` folder (the results, with their captions) and a `control` folder (what the model is given: the image to edit, or the control clip), with the same file names. **Stills, clips and sound**: up to three sub-folders, `images/`, `clips/` and `audio/` ([Stills, clips and sound in one run](#stills-clips-and-sound-in-one-run)).
 
 ### A first run
 
@@ -243,6 +243,33 @@ train ltx_iclora fx_s1 --dataset fx/low.toml \
 ```
 
 The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods; `ltx_mix` follows the trainer's guide for mixed audio and video training, with the settings of `ltx_av`. The `moss` recipe follows the MOSS-Image guide of sd-scripts. Both run to the end on an RTX PRO 6000: `moss` makes about 1.4 steps a second on 1024 x 768 images; `ltx_mix` takes about 3.3 seconds a step on 121-frame clips at 960 x 544, its model in fp8 taking 22.4 GB once loaded and 27 GB at the first step. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
+
+### Sizes and lengths
+
+`train` writes each run's dataset config from its recipe, so a folder of files needs no setting. A recipe's size and length are where our runs start, proven on RTX PRO 6000 pods: the trainer takes others.
+
+| Recipe | It trains at | Clips |
+|---|---|---|
+| `zimage`, `qwen_edit` | 1024 x 1024 | |
+| `moss` | 1024 x 1024, with 1,024 pixels at most on a side | |
+| `ltx_images` | 1024 x 576 | |
+| `ltx`, `ltx_av` | 960 x 544 | the first 121 frames, read at 25 fps |
+| `ltx_iclora` | 1024 x 576, its control clip at half that | the first 121 frames, read at 25 fps |
+| `ltx_mix` | 960 x 544 | whole, up to 121 frames, read at 25 fps |
+
+- **A size is a number of pixels, and each file keeps its shape.** The trainer sorts the files into buckets: sizes of about that many pixels, one per shape, landscape, portrait or square. A file goes to the bucket nearest its shape, is resized to fill it, then cropped at the centre. With `ltx`, a 16:9 clip trains at 960 x 544, a 9:16 clip at 544 x 960 and a 4:3 clip at 832 x 608. So one folder holds files of any size and shape, and you crop none.
+- **A file smaller than its bucket is enlarged**, and trains soft. Use files at the training size or larger.
+- **A clip filmed faster than 25 fps loses frames**: from 50 fps, the trainer keeps every second frame. A clip at 24 fps is read as it is.
+
+To train at another size, length or frame rate, copy the run's `dataset.toml`, change the copy and give it to the next run with `--dataset`. Three settings do it:
+
+| Setting | What it takes |
+|---|---|
+| `resolution` | the size, as a width and a height. The trainer rounds each bucket down to multiples of 32 on LTX 2.5 (64 for `ltx_iclora`) and of 16 on Z-Image and Qwen-Image-Edit |
+| `target_frames` | the clips' length, as 8k + 1 frames: `[33]`, `[121]`, `[321]`. A shorter clip is left out. For `ltx_iclora`, give `reference_frames` the same number |
+| `target_fps` | the frame rate the clips are read at, as a decimal. With `50.0`, clips filmed at 50 fps are read as they are, and train at that rate. Use one `[[datasets]]` block per frame rate, each with its own `cache_directory` |
+
+The GPU's memory limits a size. A clip costs (width / 32) x (height / 32) x ((frames - 1) / 8 + 1) tokens: 8,160 at 960 x 544 x 121. Our recipes stay near 8,000, so a larger frame takes shorter clips: 1920 x 1088 x 33 costs 10,200. The chain of [Options of a run](#options-of-a-run) trains three such sizes, one after the other.
 
 ### Clips of several lengths
 
