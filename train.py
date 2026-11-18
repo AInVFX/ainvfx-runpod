@@ -223,12 +223,21 @@ as into over under near behind against while during their his her they them he s
 
 
 # ----------------------------------------------------------------------------- small helpers
+VIA = os.environ.get("AINVFX_TRAIN_VIA", "")   # "python pod.py " when the words came from a computer (pod.py train)
+
+
+def as_typed(msg):
+    """A message as its reader types it: when the command came through `python pod.py train`, every train command
+    that the message names starts with those words too."""
+    return re.sub(r"(`|A run:  |\()train ", lambda m: m.group(1) + VIA + "train ", str(msg)) if VIA else msg
+
+
 def say(msg=""):
-    print(msg, flush=True)
+    print(as_typed(msg), flush=True)
 
 
 def die(msg, code=2):
-    print("\nERROR: " + msg, file=sys.stderr, flush=True)
+    print("\nERROR: " + as_typed(msg), file=sys.stderr, flush=True)
     sys.exit(code)
 
 

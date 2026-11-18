@@ -56,7 +56,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest"   # the branch that follows each release
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -1858,14 +1858,21 @@ def cmd_push(args):
         return push_url(args, args.files[0])
     if args.frames or args.into:
         die("--frames and --into go with a web address: python pod.py push https://... --into NAME")
+    if args.dataset and not DATASET_NAME.fullmatch(args.dataset):
+        name = args.files[0].rstrip("/\\") if len(args.files) == 1 else ""
+        if Path(args.dataset).expanduser().exists() and DATASET_NAME.fullmatch(name):   # the two were swapped
+            die("--dataset takes the dataset's name first, then your folder. The other way round:\n"
+                "  python pod.py push --dataset {} {}".format(name, args.dataset))
+        die("--dataset takes a folder name, the one the dataset has on the pod: letters, digits, _ . or - (got \"{}\"). "
+            "Your folder comes after it: python pod.py push --dataset mysubject path/to/mysubject/".format(args.dataset))
     files = [Path(f).expanduser() for f in args.files]
     for f in files:
         if not f.exists():
-            die("file not found: {}".format(f))
+            die("file not found: {}{}".format(f, ". With --dataset, the name comes first, then your folder: python pod.py "
+                                              "push --dataset {} path/to/your/folder/".format(args.dataset)
+                                              if args.dataset else ""))
         if f.is_dir() and not args.dataset:
             die("{} is a folder: ComfyUI's input takes files; a training dataset goes with --dataset NAME".format(f))
-    if args.dataset and not DATASET_NAME.fullmatch(args.dataset):
-        die("--dataset takes a folder name: letters, digits, _ . or - (got \"{}\")".format(args.dataset))
     _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
     if args.dataset:
         return push_dataset(rec, args.dataset, files)
@@ -2175,7 +2182,7 @@ def push_dataset(rec, name, paths):
             say("   {}/{} files · {:.0f} of {:.0f} MB".format(k, len(plan), done / 1e6, total / 1e6))
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
         sent, kept, total / 1e6, time.time() - t0, name))
-    say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(name))
+    say("Next:  python pod.py train caption {} --trigger <word>   (README: Training a LoRA)".format(name))
 
 # --------------------------------------------------------------------------- push from a web address
 # `push URL` makes the pod download by itself: nothing passes through the user's connection. pod.py starts a kernel in
@@ -2529,7 +2536,7 @@ def push_url(args, url, models=None):
     say("{} file(s) downloaded, {} unchanged, {:.1f} MB in {:.0f} s -> {}".format(
         got["files"] - got["kept"], got["kept"], got["bytes"] / 1e6, got["seconds"], got["dest"]))
     if args.dataset:
-        say("Next, in a terminal on the pod:  train caption {} --trigger <word>   (README: Training a LoRA)".format(args.dataset))
+        say("Next:  python pod.py train caption {} --trigger <word>   (README: Training a LoRA)".format(args.dataset))
     elif models:
         say("Done. In ComfyUI, press R to refresh the model lists.")
     else:
@@ -2871,7 +2878,7 @@ if not os.path.exists(exe):
     code = 2
 else:
     p = subprocess.Popen([exe] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         preexec_fn=_with_kernel, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+                         preexec_fn=_with_kernel, env=dict(os.environ, PYTHONUNBUFFERED="1", AINVFX_TRAIN_VIA="python pod.py "))
     text = codecs.getincrementaldecoder("utf-8")("replace")
     while True:
         if not select.select([p.stdout], [], [], alive)[0]:

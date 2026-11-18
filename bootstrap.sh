@@ -61,7 +61,7 @@ PY="${AINVFX_PYTHON:-3.13}"
 TORCH="${AINVFX_TORCH:-torch torchvision torchaudio}"
 TORCH_INDEX="${AINVFX_TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 # The release this script belongs to, logged at start: pod.py's VERSION (tests/test_repo.py checks they agree).
-TOOLKIT_VERSION="1.7.2"
+TOOLKIT_VERSION="1.7.3"
 # models.json, custom_nodes.json and train.py come from the folder this script came from: the branch latest, which
 # follows each release and which the template names, a release tag, or a branch or fork given in AINVFX_REPO_RAW.
 REPO_RAW="${AINVFX_REPO_RAW:-https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest}"
@@ -253,7 +253,7 @@ install_trainers() {   # both trainers, train.py and the train command; returns 
   done
   printf '#!/usr/bin/env bash\n# ainvfx-runpod: the training command of this pod (README.md, "Training a LoRA")\nexec %q %q "$@"\n' \
     "$MUSUBI/.venv/bin/python" "$ROOT/ainvfx/train.py" > /usr/local/bin/train && chmod +x /usr/local/bin/train
-  say "TRAINERS OK in $(secs "$t0" "$(now)" | cut -d. -f1) s · in a terminal on this pod: train recipes"
+  say "TRAINERS OK in $(secs "$t0" "$(now)" | cut -d. -f1) s · from your computer: python pod.py train recipes"
 }
 
 if [ "$MODE" = "models" ]; then

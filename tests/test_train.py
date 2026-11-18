@@ -402,6 +402,19 @@ class Units(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             train.check_blocks("ltx", train.dataset_blocks(text, "t.toml"), "t.toml")
         self.assertIn("holds sounds, and the ltx recipe trains on clips", err.getvalue())
+    def test_a_message_names_commands_as_its_reader_types_them(self):
+        """Through `python pod.py train`, the pod's messages name every train command with those words; in the pod's own
+        terminal they stay as they are."""
+        msg = "No run on this pod yet. `train recipes` lists the recipes. A run:  train <recipe> (train <recipe> -h)"
+        self.assertEqual(train.as_typed(msg), msg)
+        old, train.VIA = train.VIA, "python pod.py "
+        try:
+            self.assertEqual(train.as_typed(msg), "No run on this pod yet. `python pod.py train recipes` lists the recipes. "
+                             "A run:  python pod.py train <recipe> (python pod.py train <recipe> -h)")
+            self.assertEqual(train.as_typed("the trainer, a train of thought"), "the trainer, a train of thought")
+        finally:
+            train.VIA = old
+
     def test_the_caption_prompt_of_each_kind(self):
         """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is
         seen; sound files get no prompt."""

@@ -1404,6 +1404,20 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("JupyterLab did not answer", out, out)
         self.assertTrue(STATE["pods"]["fakepod3"].get("deleted"), out)
 
+    def test_push_dataset_names_two_arguments_given_the_other_way_round(self):
+        """`push --dataset` takes the name first, then the folder. A folder given first is named, with the command the
+        right way round, before any lookup; a folder that does not exist says where the name goes."""
+        folder = os.path.join(self.home, "mysubject")
+        os.makedirs(folder)
+        out, rc = self.run_pod("push", "--dataset", folder, "mysubject/")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("the dataset's name first, then your folder", out, out)
+        self.assertIn("python pod.py push --dataset mysubject " + folder, out, out)
+        out, rc = self.run_pod("push", "--dataset", "mysubject", os.path.join(self.home, "nowhere"))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("file not found", out, out)
+        self.assertIn("the name comes first, then your folder", out, out)
+
     def test_train_runs_the_pods_train_command_from_here(self):
         """`python pod.py train ...` runs the pod's own train command with the same words, through JupyterLab: the code
         runs for real in the fake kernel, against a stand-in train command. Its output shows here, without the signs of
