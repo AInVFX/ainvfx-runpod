@@ -56,7 +56,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 REPO_RAW = "https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/latest"   # the branch that follows each release
 DEFAULT_MODELS_URL = REPO_RAW + "/models.json"
 TEMPLATE_ID = "4i789znkrd"   # the public template "AInVFX bootcamp ComfyUI": image, ports, start command
@@ -2884,6 +2884,7 @@ else:
         sys.stdout.write(text.decode(chunk))
         sys.stdout.flush()
     sys.stdout.write(text.decode(b"", True))
+    p.stdout.close()
     code = p.wait()
 sys.stdout.write("\x1eainvfx-exit %d\n" % code)
 sys.stdout.flush()
