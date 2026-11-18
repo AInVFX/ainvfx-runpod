@@ -102,6 +102,7 @@ STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "upl
          "pull_seconds": 0,       # scripted seconds the image pull lasts before the container starts
          "history_3d": False,     # the history also reports a GLB under "3d", and a temp preview
          "outfiles": None,        # the pod's output folder as {relative path: bytes}; None = JupyterLab off
+         "refuse": {},            # {relative path: how many more downloads of that file fail (-1: every one)}
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
 
@@ -558,6 +559,10 @@ class Handler(BaseHTTPRequestHandler):
             rel = path[len(root) + 1:] if path.startswith(root + "/") else None
             if rel not in files:
                 return self.problem(404, "no such file")
+            left = STATE["refuse"].get(rel, 0)
+            if left:                                       # this download fails; the listing still names the file
+                STATE["refuse"][rel] = left - 1 if left > 0 else left
+                return self.problem(500, "the file did not come")
             data = files[rel]
             self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
             self.wfile.write(data); return
@@ -1158,7 +1163,7 @@ class EndToEnd(unittest.TestCase):
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
                       "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
-                      "history_3d": False, "outfiles": None, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": [], "runs": []})
+                      "history_3d": False, "outfiles": None, "refuse": {}, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": [], "runs": []})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -1335,6 +1340,69 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(here("jar_step250.png"), out)
         self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
+
+    def test_down_keeps_a_pod_whose_files_did_not_all_come(self):
+        """Terminating a pod erases its disk, so the pull that comes first tries again what did not come, three times
+        in all. After a training run, a pod whose files did not all come is kept, and says so; so is one whose
+        JupyterLab does not answer, the only way to a run's files. Plain `down` then asks first, and no answer keeps
+        the pod; -y terminates without them. A file that this computer cannot write (a folder stands in its place)
+        is skipped like one that the pod does not give, and stops nothing."""
+        self.env.update(AINVFX_RUN_POLL="1", AINVFX_RUN_STALE="60", AINVFX_PULL_EVERY="600", AINVFX_PULL_RETRY="0")
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        for profile in ("image", "3d", "video"):
+            out, rc = self.run_pod("up", profile, "-y", "--wait", "1", timeout=90)
+            self.assertEqual(rc, 0, out)
+        lora, sample = "train/jar/jar.safetensors", "train/jar/sample/jar_step0.png"
+        STATE["outfiles"] = {lora: b"fake lora weights", sample: b"a sample"}
+        outputs = os.path.join(self.home, "outputs")
+
+        def ended():
+            return [{"state": state, "stage": 0, "beat": beat, "stages": [{"name": "jar"}]}
+                    for state, beat in (("running", 1.0), ("done", 2.0))]
+
+        def here():
+            return sorted(f for _, _, fs in os.walk(outputs) for f in fs)
+        STATE["runs"], STATE["refuse"] = ended(), {lora: 2}           # the LoRA comes at the third try
+        out, rc = self.run_pod("down", "image", "--when-done", "-y", timeout=60)
+        self.assertEqual(rc, 0, out)
+        steps = ["skipped " + lora, "try 2 of 3", "try 3 of 3", "jar.safetensors  (", "3 file(s) pulled", "Terminated"]
+        self.assertEqual(sorted(steps, key=out.index), steps, out)
+        self.assertLessEqual({"jar.safetensors", "jar_step0.png"}, set(here()), out)
+        self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
+        shutil.rmtree(outputs)
+        STATE["runs"], STATE["refuse"] = ended(), {lora: -1}          # the LoRA never comes: the pod is kept
+        out, rc = self.run_pod("down", "3d", "--when-done", "-y", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("Not pulled from", out, out)
+        self.assertIn(lora + ". The pod keeps running and billing", out, out)
+        self.assertNotIn("Terminated", out, out)
+        self.assertFalse(STATE["pods"]["fakepod2"].get("deleted"), out)
+        self.assertIn("jar_step0.png", here(), "what came stays here: " + out)
+        self.assertNotIn("jar.safetensors", here(), out)
+        out, rc = self.run_pod("down", "3d", input="\n", timeout=60)  # yes to `down`, then no word on the missing file
+        self.assertIn("without them? They are erased with the pod", out, out)
+        self.assertIn("Kept running", out, out)
+        self.assertFalse(STATE["pods"]["fakepod2"].get("deleted"), out)
+        STATE["refuse"] = {}                                          # the pod gives the file; this computer cannot write it
+        folder = [d for d in os.listdir(outputs) if os.path.isdir(os.path.join(outputs, d, "train"))][0]
+        os.makedirs(os.path.join(outputs, folder, *lora.split("/")))
+        out, rc = self.run_pod("down", "3d", "-y", timeout=60)
+        self.assertEqual(rc, 0, out)
+        steps = ["skipped " + lora, "Not pulled from", "Terminated"]
+        self.assertEqual(sorted(steps, key=out.index), steps, out)
+        self.assertNotIn("unexpected error", out, out)
+        self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
+        self.assertEqual([f for f in here() if f.endswith(".part")], [], "no half file stays: " + out)
+        STATE["runs"], STATE["outfiles"] = ended(), None              # JupyterLab off after a run: nothing came
+        out, rc = self.run_pod("down", "video", "--when-done", "-y", timeout=60)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("the output folder (the pod's JupyterLab did not answer)", out, out)
+        self.assertFalse(STATE["pods"]["fakepod3"].get("deleted"), out)
+        out, rc = self.run_pod("down", "video", "-y", timeout=60)     # plain down: as before, with its own words
+        self.assertEqual(rc, 0, out)
+        self.assertIn("JupyterLab did not answer", out, out)
+        self.assertTrue(STATE["pods"]["fakepod3"].get("deleted"), out)
 
     def test_train_runs_the_pods_train_command_from_here(self):
         """`python pod.py train ...` runs the pod's own train command with the same words, through JupyterLab: the code

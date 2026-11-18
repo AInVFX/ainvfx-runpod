@@ -158,6 +158,8 @@ RUN_STALE = env_num("AINVFX_RUN_STALE", "300")             # a run in progress m
                                                            # record stands still this long has died without a word
 RUN_NOTE = env_num("AINVFX_RUN_NOTE", "600")               # seconds between two "in progress" lines of the wait
 PULL_EVERY = max(0, env_num("AINVFX_PULL_EVERY", "300"))   # `down --when-done`: seconds between two pulls during the wait
+PULL_TRIES = 3                                             # `down`: how many times its last pull tries what did not come
+PULL_RETRY = max(0, env_num("AINVFX_PULL_RETRY", "20"))    # and the seconds between two tries
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -1928,9 +1930,10 @@ def safe_rel(rel):
     return "/".join(parts)
 
 
-def jupyter_tree(base, hdrs, root):
+def jupyter_tree(base, hdrs, root, unlisted=None):
     """[(relative path, size)] of every file under `root`, through JupyterLab's contents API (one folder per
-    request), hidden names left out; None when `root` is not a folder there."""
+    request), hidden names left out; None when `root` is not a folder there. A sub-folder that cannot be listed is
+    named in `unlisted`, when that list is given: its files are not in the answer."""
     def listing(path):
         return request("GET", base + "/api/contents/" + urllib.parse.quote(path) + "?content=1", headers=hdrs, timeout=60)
 
@@ -1951,6 +1954,8 @@ def jupyter_tree(base, hdrs, root):
                     todo.append(listing(path))
                 except ApiError as err:
                     say("  could not list {} ({})".format(path[len(root) + 1:], err.code or err.detail[:60]))
+                    if unlisted is not None:
+                        unlisted.append(path[len(root) + 1:] + "/")
             elif e.get("type") in ("file", "notebook"):
                 rel = safe_rel(path[len(root) + 1:])
                 if rel:
@@ -1958,12 +1963,12 @@ def jupyter_tree(base, hdrs, root):
     return sorted(files)
 
 
-def jupyter_files(pod_id, token):
+def jupyter_files(pod_id, token, unlisted=None):
     """(root, [(relative path, size)]) for every file under the pod's output folder, through JupyterLab;
     (None, []) when JupyterLab does not answer or has no output folder."""
     base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
     for root in OUTPUT_DIRS:
-        files = jupyter_tree(base, hdrs, root)
+        files = jupyter_tree(base, hdrs, root, unlisted)
         if files is not None:
             return root, files
     return None, []
@@ -2533,35 +2538,42 @@ def push_url(args, url, models=None):
 
 def fetch_to(url, target, headers=None, timeout=600):
     """Download url into target through a .part file, so an interrupted download never leaves a half file.
-    Returns the size in bytes."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    Returns the size in bytes. What fails on this computer (a full disk, a file that another program holds open) is
+    an ApiError as what fails on the network is: the failure of one file, which its caller can skip."""
     part = target.with_name(target.name + ".part")
     hdrs = {"Accept": "*/*"}
     hdrs.update(headers or {})
     r = request("GET", url, headers=hdrs, timeout=timeout, stream=True)
     size = 0
     try:
-        with r, open(part, "wb") as f:
-            for chunk in iter(lambda: r.read(1 << 20), b""):
-                f.write(chunk)
-                size += len(chunk)
+        with r:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(part, "wb") as f:
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    f.write(chunk)
+                    size += len(chunk)
+        os.replace(str(part), str(target))
     except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as e:
         try:
             part.unlink()
         except OSError:
             pass
         raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
-    os.replace(str(part), str(target))
     return size
 
 
-def pull(rec):
+def pull(rec, report=None):
     """Every file of the pod's output folder not here yet, into outputs/<pod name>/, subfolders kept. Returns
-    the number of files downloaded."""
+    the number of files downloaded. A file that does not come is skipped: the next pull takes it. With `report`, a
+    dict, the pull also says what it could not bring: `failed`, the files skipped and the folders not listed;
+    `answered`, whether the pod's ComfyUI answered; `listed`, whether JupyterLab gave the output folder, the only
+    way to the files of a training run."""
     pod_id, dest = rec["id"], outputs_of(rec)
     comfy = comfy_alive(pod_id)
     token = jupyter_token(proxy_log(pod_id)) if comfy else None
-    count, listed, root = 0, set(), None
+    count, listed, root, failed = 0, set(), None, []
+    if report is not None:
+        report.update(failed=failed, answered=comfy, listed=False)
 
     def get(rel, url, size=None, headers=None):
         nonlocal count
@@ -2571,13 +2583,16 @@ def pull(rec):
         try:
             n = fetch_to(url, target, headers=headers)
         except ApiError as e:
-            say("  skipped {} ({})".format(rel, e.code or e.detail[:60]))
+            say("  skipped {} ({})".format(rel, e.code or e.detail[:100]))
+            failed.append(rel)
             return
         count += 1
         say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), n / 1e6))
 
     if token:
-        root, files = jupyter_files(pod_id, token)
+        root, files = jupyter_files(pod_id, token, failed)
+        if report is not None:
+            report["listed"] = root is not None
         for rel, size in files:
             listed.add(rel)
             get(rel, pod_url(pod_id, JUPYTER_PORT) + "/files/" + urllib.parse.quote(root + "/" + rel), size,
@@ -2637,8 +2652,9 @@ def run_label(run):
 
 
 def wait_for_run(cfg, rec, pull_every=None):
-    """`down --when-done`: returns when the training run in progress on the pod has ended, or when the pod itself is
-    gone. One look at the run's record every RUN_POLL seconds; a look that the pod does not answer is tried again.
+    """`down --when-done`: returns when the training run in progress on the pod has ended (True), or when the pod
+    itself is gone (False). One look at the run's record every RUN_POLL seconds; a look that the pod does not answer
+    is tried again.
     With pull_every, the new files of the pod's output folder come every pull_every seconds while the run goes on
     (its samples, checkpoints and loss logs), so they are here as the run makes them; a pull that fails is tried again
     at the next one, and never ends the wait."""
@@ -2660,7 +2676,7 @@ def wait_for_run(cfg, rec, pull_every=None):
                 gone = e.code == 404
             if gone:
                 say("The pod {} is no longer running.".format(name))
-                return
+                return False
             note = "the pod does not answer"
         else:
             if run != last:
@@ -2674,7 +2690,7 @@ def wait_for_run(cfg, rec, pull_every=None):
                         run_label(run), RUN_STALE))
                 else:
                     say("The run {} has ended ({}).".format(run_label(run), run.get("state") or "?"))
-                return
+                return True
             note = "{}: in progress".format(run_label(run))
         if said is None:
             say("Waiting for the training run on {} to end, with a look every {} s{}. Ctrl+C stops the wait; the pod "
@@ -2694,6 +2710,27 @@ def wait_for_run(cfg, rec, pull_every=None):
                     say("  {} new file(s) in {}".format(count, outputs_of(rec)))
             pulled = time.time()
         time.sleep(RUN_POLL)
+
+
+def pull_before_down(rec, run_ended):
+    """The pull that comes before a pod is terminated, since its disk is erased with it. What did not come is tried
+    again, PULL_TRIES times in all, PULL_RETRY seconds apart. Returns what is still missing: the files skipped and,
+    after a training run (run_ended), the whole output folder when the pod or its JupyterLab did not answer."""
+    count, missing = 0, []
+    for attempt in range(PULL_TRIES):
+        if attempt:
+            say("  not everything came: try {} of {}{}".format(
+                attempt + 1, PULL_TRIES, " in {} s".format(PULL_RETRY) if PULL_RETRY else ""))
+            time.sleep(PULL_RETRY)
+        report = {}
+        count += pull(rec, report)
+        missing = list(report["failed"])
+        if run_ended and not (report["answered"] and report["listed"]):
+            missing = ["the output folder (the pod's JupyterLab did not answer)"]
+        if not missing:
+            break
+    say("{} file(s) pulled into {}".format(count, outputs_of(rec)))
+    return missing
 
 
 def cmd_down(args):
@@ -2718,10 +2755,24 @@ def cmd_down(args):
         say("Kept running. Remember: a pod bills until terminated.")
         return
     for tag, rec in targets:
-        if args.when_done:
-            wait_for_run(cfg, rec, None if args.no_pull else PULL_EVERY)
-        if not args.no_pull:
-            say("{} file(s) pulled into {}".format(pull(rec), outputs_of(rec)))
+        ended = args.when_done and wait_for_run(cfg, rec, None if args.no_pull else PULL_EVERY)
+        missing = [] if args.no_pull else pull_before_down(rec, ended)
+        if missing:                                           # terminating erases them: never without a word
+            name = rec.get("name") or rec["id"]
+            what = "Not pulled from {}: {}{}.".format(name, ", ".join(missing[:4]), " and {} more".format(
+                len(missing) - 4) if len(missing) > 4 else "")
+            if args.when_done:
+                die("{} The pod keeps running and billing, so that nothing is lost. `python pod.py down` tries again, "
+                    "and asks before it terminates without them.".format(what))
+            say(what)
+            if not args.yes:
+                try:
+                    answer = input("Terminate {} without them? They are erased with the pod. [y/N] ".format(name))
+                except EOFError:
+                    answer = ""
+                if answer.strip().lower() not in ("y", "yes"):
+                    say("Kept running. Remember: a pod bills until terminated.")
+                    continue
         try:
             spent = pod_spent(get_pod(cfg, rec["id"]), rec)
         except ApiError:
@@ -3036,8 +3087,8 @@ def main():
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("--when-done", action="store_true",
                    help="wait for the training run in progress on the pod to end, pulling its new files every {} "
-                        "min meanwhile, then terminate; this computer stays on and online until then".format(
-                            max(1, round(PULL_EVERY / 60))))
+                        "min meanwhile, then terminate; this computer stays on and online until then. A pod whose "
+                        "files did not all come is kept".format(max(1, round(PULL_EVERY / 60))))
     p.add_argument("-y", "--yes", action="store_true")
     command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
     command("train", cmd_train, "the pod's train command, run from here with the same words", pod=False).add_argument(
