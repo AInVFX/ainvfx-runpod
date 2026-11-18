@@ -15,7 +15,8 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
                                    model folder (vae, diffusion_models, text_encoders...)
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
   python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here;
-                                   --when-done waits first for the training run in progress on the pod to end
+                                   --when-done waits first for the training run in progress on the pod to end,
+                                   pulling its new files every 5 minutes meanwhile
   python pod.py ssh [pod]          a terminal on the pod
   python pod.py train [pod] ...    the pod's train command, run from here: train caption, train <recipe>,
                                    train log, train status, train stop (the same words as on the pod)
@@ -156,6 +157,7 @@ RUN_POLL = max(1, env_num("AINVFX_RUN_POLL", "60"))        # `down --when-done`:
 RUN_STALE = env_num("AINVFX_RUN_STALE", "300")             # a run in progress marks its record every 30 s: one whose
                                                            # record stands still this long has died without a word
 RUN_NOTE = env_num("AINVFX_RUN_NOTE", "600")               # seconds between two "in progress" lines of the wait
+PULL_EVERY = max(0, env_num("AINVFX_PULL_EVERY", "300"))   # `down --when-done`: seconds between two pulls during the wait
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -2634,13 +2636,17 @@ def run_label(run):
     return name if len(stages) == 1 else "{}, stage {} of {}".format(name, i + 1, len(stages))
 
 
-def wait_for_run(cfg, rec):
+def wait_for_run(cfg, rec, pull_every=None):
     """`down --when-done`: returns when the training run in progress on the pod has ended, or when the pod itself is
-    gone. One look at the run's record every RUN_POLL seconds; a look that the pod does not answer is tried again."""
+    gone. One look at the run's record every RUN_POLL seconds; a look that the pod does not answer is tried again.
+    With pull_every, the new files of the pod's output folder come every pull_every seconds while the run goes on
+    (its samples, checkpoints and loss logs), so they are here as the run makes them; a pull that fails is tried again
+    at the next one, and never ends the wait."""
     pod_id, name = rec["id"], rec.get("name") or rec["id"]
     start = moved = time.time()
     last = said = None
     noted = 0
+    pulled = start                                # the first pull comes pull_every seconds after the wait starts
     while True:
         now = time.time()
         try:
@@ -2671,11 +2677,22 @@ def wait_for_run(cfg, rec):
                 return
             note = "{}: in progress".format(run_label(run))
         if said is None:
-            say("Waiting for the training run on {} to end, with a look every {} s. Ctrl+C stops the wait; the pod "
-                "keeps running and billing.".format(name, RUN_POLL))
+            say("Waiting for the training run on {} to end, with a look every {} s{}. Ctrl+C stops the wait; the pod "
+                "keeps running and billing.".format(name, RUN_POLL, "" if pull_every is None else
+                                                    ", and its new files pulled every {} min".format(
+                                                        max(1, round(pull_every / 60)))))
         if note != said or now - noted >= RUN_NOTE:
             say("  {} (waited {})".format(note, fmt_duration((now - start) / 3600)))
             said, noted = note, now
+        if run is not None and pull_every is not None and now - pulled >= pull_every:
+            try:
+                count = pull(rec)
+            except (ApiError, OSError) as e:          # the wait goes on: the next pull tries again
+                say("  pull skipped ({}); the next one tries again".format(e))
+            else:
+                if count:
+                    say("  {} new file(s) in {}".format(count, outputs_of(rec)))
+            pulled = time.time()
         time.sleep(RUN_POLL)
 
 
@@ -2702,7 +2719,7 @@ def cmd_down(args):
         return
     for tag, rec in targets:
         if args.when_done:
-            wait_for_run(cfg, rec)
+            wait_for_run(cfg, rec, None if args.no_pull else PULL_EVERY)
         if not args.no_pull:
             say("{} file(s) pulled into {}".format(pull(rec), outputs_of(rec)))
         try:
@@ -3018,8 +3035,9 @@ def main():
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("--when-done", action="store_true",
-                   help="wait for the training run in progress on the pod to end, then pull and terminate; this "
-                        "computer stays on and online meanwhile")
+                   help="wait for the training run in progress on the pod to end, pulling its new files every {} "
+                        "min meanwhile, then terminate; this computer stays on and online until then".format(
+                            max(1, round(PULL_EVERY / 60))))
     p.add_argument("-y", "--yes", action="store_true")
     command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
     command("train", cmd_train, "the pod's train command, run from here with the same words", pod=False).add_argument(

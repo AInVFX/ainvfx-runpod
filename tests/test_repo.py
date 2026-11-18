@@ -112,8 +112,8 @@ class Repo(unittest.TestCase):
             json.dump(lists, f)
         try:
             for label in ("image", "video", "video+texture", "all"):
-                out = subprocess.run([sys.executable, "-c", block, f.name, label], stdout=subprocess.PIPE,
-                                     universal_newlines=True, check=True).stdout.split()
+                out = subprocess.run([sys.executable, "-c", block, f.name, label], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.split()
                 once = [u for i, u in enumerate(out) if u not in out[:i]]   # bootstrap.sh then keeps each URL once
                 announced = pod.profile_nodes(pod.parse_profiles(label, names), pod.read_nodes(pod.Path(f.name).as_uri()))
                 self.assertEqual(once, announced, label)

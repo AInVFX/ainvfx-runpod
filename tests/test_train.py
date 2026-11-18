@@ -423,7 +423,7 @@ class Runs(unittest.TestCase):
         e = dict(os.environ, **(env or {}))
         e.pop("HF_TOKEN", None)
         r = subprocess.run([sys.executable, str(REPO / "train.py")] + list(args), capture_output=True, text=True, env=e,
-                           timeout=timeout)
+                           timeout=timeout, stdin=subprocess.DEVNULL)      # never the terminal the tests run in
         return r.stdout + r.stderr, r.returncode
 
     def test_a_zimage_run_end_to_end(self):
@@ -482,7 +482,8 @@ class Runs(unittest.TestCase):
         e = dict(os.environ, FAKE_SLEEP="60", AINVFX_BEAT="1")
         e.pop("HF_TOKEN", None)
         follower = subprocess.Popen([sys.executable, str(REPO / "train.py"), "zimage", "st1", "--dataset", "chars"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e)
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    env=e)
         try:
             for _ in range(100):
                 job = train.read_job() or {}
@@ -504,6 +505,8 @@ class Runs(unittest.TestCase):
         finally:
             if follower.poll() is None:
                 follower.kill()
+                follower.wait(timeout=30)
+            follower.stdout.close()
 
     def test_caption_lists_what_it_would_write(self):
         out, rc = self.run_train("caption", "chars", "--trigger", "mychr", "--dry-run")

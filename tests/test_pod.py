@@ -34,6 +34,11 @@ RULE_MODELS = {
 }
 
 
+def read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 def expected_disk_line(profiles, models=None):
     """The line `up` prints for these profiles and the disk it asks Runpod for, from the models list it reads."""
     spec = pod.profile_spec(profiles, models)
@@ -506,7 +511,8 @@ class Handler(BaseHTTPRequestHandler):
         mid = msg["header"]["msg_id"]
         send("status", "another-client", {"execution_state": "idle"})
         frame(b"hello", 0x9)
-        r = subprocess.run([sys.executable, "-c", msg["content"]["code"]], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, "-c", msg["content"]["code"]], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)                   # a kernel has no terminal
         opcode, pong = read_frame()
         STATE["kernels"].append("pong" if (opcode, pong) == (0xA, b"hello") else "no pong")
         if r.stdout:
@@ -1045,7 +1051,7 @@ class Helpers(unittest.TestCase):
 
         def run(words, exe=fake):
             r = subprocess.run([sys.executable, "-c", pod.train_code(words, exe=exe, alive=0.2)], capture_output=True,
-                               timeout=60)
+                               timeout=60, stdin=subprocess.DEVNULL)
             raw, shown = r.stdout.decode("utf-8"), []
             out = pod.TrainOutput(shown.append)
             for k in range(0, len(raw), 5):                      # in small pieces, as stream messages may come
@@ -1145,6 +1151,7 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def setUp(self):
         STATE.update({"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "uploads": [], "count": 0,
@@ -1169,8 +1176,10 @@ class EndToEnd(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def run_pod(self, *cmd, timeout=120, input=None):
+        """pod.py run as a user would, with `input` as what is typed. Without it, nothing is typed: the command reads an
+        empty input, never the terminal the tests run in, where a question would wait for an answer."""
         r = subprocess.run([sys.executable, POD_PY] + list(cmd), capture_output=True, text=True, env=self.env, timeout=timeout,
-                           input=input)
+                           input="" if input is None else input)
         return r.stdout + r.stderr, r.returncode
 
     def test_setup_names_a_hugging_face_token_given_as_the_runpod_key(self):
@@ -1180,7 +1189,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Hugging Face token", out, out)
         self.assertIn("setup --hf-token", out, out)
         cfg = os.path.join(self.env["HOME"], ".ainvfx-runpod", "config.json")
-        self.assertFalse(os.path.exists(cfg) and "hf_" in open(cfg).read(), "the token is not stored")
+        self.assertFalse(os.path.exists(cfg) and "hf_" in read_text(cfg), "the token is not stored")
 
     def whole_session(self):
         out, rc = self.run_pod("setup", "-y")
@@ -1295,6 +1304,37 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("gives no sign of life for 2 s", out, out)
         self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
+
+    def test_down_when_done_pulls_the_files_as_the_run_makes_them(self):
+        """`down --when-done` waits for the run, so it also brings the run's files as they come (samples, checkpoints,
+        the loss logs), every AINVFX_PULL_EVERY seconds. A sample written on the pod during the run is here before the
+        run ends; then the pod is terminated."""
+        self.env.update(AINVFX_RUN_POLL="1", AINVFX_RUN_STALE="60", AINVFX_PULL_EVERY="0")
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {"train/jar/sample/jar_step0.png": b"the first sample"}
+        STATE["runs"] = [{"state": "running", "stage": 0, "beat": float(i), "stages": [{"name": "jar"}]} for i in range(8)]
+        STATE["runs"].append({"state": "done", "stage": 0, "beat": 9.0, "stages": [{"name": "jar"}]})
+        proc = subprocess.Popen([sys.executable, POD_PY, "down", "image", "--when-done", "-y"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env)
+        outputs = os.path.join(self.home, "outputs")
+
+        def here(name):
+            return name in [f for _, _, fs in os.walk(outputs) for f in fs]
+        deadline = time.time() + 30
+        while not here("jar_step0.png") and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(here("jar_step0.png"), "the first sample comes during the wait")
+        STATE["outfiles"]["train/jar/sample/jar_step250.png"] = b"a later sample"      # written on the pod meanwhile
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, out)
+        steps = ["new files pulled every 1 min", "jar_step0.png", "jar_step250.png", "The run jar has ended (done).",
+                 "Terminated"]
+        self.assertEqual(sorted(steps, key=out.index), steps, out)
+        self.assertTrue(here("jar_step250.png"), out)
+        self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
 
     def test_train_runs_the_pods_train_command_from_here(self):
         """`python pod.py train ...` runs the pod's own train command with the same words, through JupyterLab: the code
@@ -2161,7 +2201,8 @@ class EndToEnd(unittest.TestCase):
         self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
         self.run_pod("setup", "-y")
         waiting = subprocess.Popen([sys.executable, POD_PY, "up", "video", "--gpu", "B200", "--retry", "-y", "--wait", "1"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   env=self.env)
         deadline = time.time() + 60
         while STATE["catalog_reads"] < 2 and time.time() < deadline:
             time.sleep(0.1)
@@ -2181,7 +2222,8 @@ class EndToEnd(unittest.TestCase):
         self.env.update(AINVFX_RETRY_EVERY="1", AINVFX_RETRY_NOTE="0")
         self.run_pod("setup", "-y")
         proc = subprocess.Popen([sys.executable, POD_PY, "up", "video", "--gpu", "B200", "--retry", "-y"],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env)
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env=self.env)
         deadline = time.time() + 60
         while STATE["catalog_reads"] < 3 and time.time() < deadline:
             time.sleep(0.1)
