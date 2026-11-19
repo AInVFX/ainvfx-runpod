@@ -218,6 +218,12 @@ CAPTION_PROMPTS = {
             "(style, shading, colours, rendering, objects) and what to keep (subject, pose, framing). Do not describe "
             "the images, do not add commentary, output only the instruction.",
 }
+# --avoid: an instruction to the caption model (a system message), then one request to rewrite a caption that still
+# uses a word. No code deletes a word from a caption: a sentence without its word is no sentence.
+AVOID_RULE = ("You write captions for a training dataset, in complete sentences. Never use these words, in any form "
+              "(singular, plural or any other): {}. Describe the picture with other words, or leave that detail out.")
+REWRITE = ("Rewrite this caption without the words {}, in any form. Keep every fact and complete sentences. Answer "
+           "with the caption only.\n\n{}")
 STOP_WORDS = set("""a an the and or of in on at to with from by for is are was were be been this that these those it its
 as into over under near behind against while during their his her they them he she we you very soft hard light dark""".split())
 
@@ -1309,12 +1315,47 @@ def caption_prompt(target, f):
     return "video" if probe and not probe[2] else "audio"
 
 
-def clean_caption(text, avoid):
-    text = " ".join(text.replace("\r", " ").split()).strip().strip("\"'")
-    for w in avoid:
-        text = re.sub(r"\b" + re.escape(w) + r"\b", "", text, flags=re.I)
-    text = re.sub(r"\s+([,.;:])", r"\1", text)
-    return re.sub(r"\s{2,}", " ", text).strip(" ,;")
+def clean_caption(text):
+    """A caption on one line, without the quotes a model can put around it."""
+    return " ".join(text.replace("\r", " ").split()).strip().strip("\"'")
+
+
+def avoided_in(text, avoid):
+    """The words of --avoid that a caption uses: whole words, in any case, and their plain plural."""
+    return [w for w in avoid if re.search(r"\b{}(?:e?s)?\b".format(re.escape(w)), text, re.I)]
+
+
+def model_on_disk(repo, cache_dir=None):
+    """True when Hugging Face's cache on this pod holds every weights file of the model."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        index = try_to_load_from_cache(repo, "model.safetensors.index.json", cache_dir=cache_dir)
+        if not isinstance(index, str):
+            return False
+        shards = set(json.loads(Path(index).read_text(encoding="utf-8"))["weight_map"].values())
+        return all(isinstance(try_to_load_from_cache(repo, s, cache_dir=cache_dir), str) for s in shards)
+    except Exception:                                     # no huggingface_hub here, or an unreadable index
+        return False
+
+
+def caption_model():
+    """The caption model, loaded once. Returns ask(messages), which gives the text the model writes for a chat: the one
+    place where the model is called, so that a test can give a stand-in."""
+    import torch                                          # the trainer's environment holds these
+    from qwen_vl_utils import process_vision_info
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    say("loading {}{}".format(CAPTION_MODEL, "" if model_on_disk(CAPTION_MODEL) else " (17.6 GB, downloaded this time)"))
+    model = Qwen3VLForConditionalGeneration.from_pretrained(CAPTION_MODEL, dtype=torch.bfloat16, device_map="cuda")
+    processor = AutoProcessor.from_pretrained(CAPTION_MODEL)
+
+    def ask(messages):
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        images, videos = process_vision_info(messages)
+        inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=160, do_sample=False)
+        return processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
+    return ask
 
 
 def word_report(files, trigger):
@@ -1332,13 +1373,13 @@ def word_report(files, trigger):
     say("A word in most captions that describes the style: add it to --avoid, then run again with --overwrite.")
 
 
-def caption_files(todo, trigger, avoid, max_words):
-    import torch                                          # the trainer's environment holds these
-    from qwen_vl_utils import process_vision_info
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-    say("loading {} (17.6 GB, downloaded the first time)".format(CAPTION_MODEL))
-    model = Qwen3VLForConditionalGeneration.from_pretrained(CAPTION_MODEL, dtype=torch.bfloat16, device_map="cuda")
-    processor = AutoProcessor.from_pretrained(CAPTION_MODEL)
+def caption_files(todo, trigger, avoid, max_words, ask=None):
+    """Writes the caption of each file, and prints it whole under the file's name. With words to avoid, the model is
+    told never to use them; a caption that still uses one is rewritten once, and when it still does, it is written
+    whole all the same. Returns those: [(caption file, [words])]."""
+    ask = ask or caption_model()
+    rule = [{"role": "system", "content": [{"type": "text", "text": AVOID_RULE.format(", ".join(avoid))}]}] if avoid else []
+    kept = []
     for k, (t, f) in enumerate(todo, 1):
         mode = caption_prompt(t, f)
         if mode in ("video", "audio"):
@@ -1353,16 +1394,19 @@ def caption_files(todo, trigger, avoid, max_words):
         else:
             content = [{"type": "image", "image": str(f), "max_pixels": 1024 * 1024}]
         prompt = CAPTION_PROMPTS[mode] + " Maximum {} words.".format(max_words)
-        messages = [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        images, videos = process_vision_info(messages)
-        inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt").to("cuda")
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=160, do_sample=False)
-        caption = "{}, {}".format(trigger, clean_caption(processor.batch_decode(
-            out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0], avoid))
+        text = clean_caption(ask(rule + [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]))
+        words = avoided_in(text, avoid)
+        if words:                                         # once: a rewrite of the text alone, every fact kept
+            text = clean_caption(ask(rule + [{"role": "user", "content": [
+                {"type": "text", "text": REWRITE.format(", ".join(words), text)}]}])) or text
+            words = avoided_in(text, avoid)
+            if words:
+                kept.append((f.with_suffix(".txt"), words))
+        caption = "{}, {}".format(trigger, text)
         f.with_suffix(".txt").write_text(caption + "\n", encoding="utf-8", newline="\n")
-        say("[{}/{}] {} -> {}".format(k, len(todo), f.name, caption[:110]))
+        say("[{}/{}] {}".format(k, len(todo), f.name))
+        say("  " + caption)
+    return kept
 
 
 def cmd_caption(argv):
@@ -1370,7 +1414,8 @@ def cmd_caption(argv):
                                 "none, with {}. Each caption starts with the trigger word.".format(CAPTION_MODEL))
     p.add_argument("datasets", nargs="+", help="folders of /workspace/dataset, or dataset configs (.toml)")
     p.add_argument("--trigger", required=True, help="the trigger word, at the start of every caption")
-    p.add_argument("--avoid", default="", help="words to take out, separated by commas: those that describe the style")
+    p.add_argument("--avoid", default="", help="words the captions must not use, separated by commas: those that "
+                                               "describe the style. The caption model is told to write without them")
     p.add_argument("--overwrite", action="store_true", help="write every caption again")
     p.add_argument("--audio", action="store_true", help="clips: say also what is heard (the ltx_av recipe)")
     p.add_argument("--max-words", type=int, default=60)
@@ -1383,6 +1428,7 @@ def cmd_caption(argv):
     seen = [t for t in targets if t["mode"] != "sound"]
     todo = [(t, f) for t in seen for f in t["files"] if a.overwrite or not caption_of(f)]
     unheard = [f for t in targets if t["mode"] == "sound" for f in t["files"] if not caption_of(f)]
+    kept = []
     say("{} file(s), {} to caption{}".format(sum(len(t["files"]) for t in seen), len(todo),
                                               "" if a.overwrite else " (the captions already written are kept; "
                                                                      "--overwrite writes them again)"))
@@ -1392,7 +1438,7 @@ def cmd_caption(argv):
     elif todo:
         if active_job():
             say("A training run is in progress: captioning shares the GPU with it.")
-        caption_files(todo, a.trigger, avoid, a.max_words)
+        kept = caption_files(todo, a.trigger, avoid, a.max_words)
     if unheard:
         say("{} sound file(s) without a caption. The caption model hears nothing, so write each yourself, in a .txt of "
             "the same name: the trigger word {}, then what is heard (a voice and its words, a place, a noise): {}".format(
@@ -1401,6 +1447,9 @@ def cmd_caption(argv):
     if a.dry_run:
         return 0
     word_report([f for t in targets for f in t["files"]], a.trigger)
+    if kept:
+        say("{} caption(s) still use a word of --avoid: {}. Edit each of them by hand before training.".format(
+            len(kept), ", ".join("{} ({})".format(f, ", ".join(w)) for f, w in kept)))
     say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
         "wrong word is learned like the others.".format(", ".join(
             "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))

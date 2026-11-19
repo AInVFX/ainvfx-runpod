@@ -9,7 +9,7 @@ whose `accelerate` runs the script it is given, fake musubi-tuner and sd-scripts
 write (checkpoints, ComfyUI copies, their arguments), the course's models.json with dummy base files, and datasets.
 `Units` tests the pure functions; `Runs` runs the real commands through subprocess, as on the pod.
 """
-import contextlib, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -61,6 +61,77 @@ class Container:
 
 def open(path):
     return Container(path)
+''', encoding="utf-8")
+(FAKE_AV / "torch.py").write_text('''"""A stand-in for PyTorch in the tests: what the caption code touches."""
+bfloat16 = "bfloat16"
+
+
+class no_grad:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+''', encoding="utf-8")
+(FAKE_AV / "qwen_vl_utils.py").write_text("def process_vision_info(messages):\n    return None, None\n", encoding="utf-8")
+(FAKE_AV / "transformers.py").write_text('''"""A stand-in for Qwen3-VL in the tests. Its first answer uses the word "scene"; with FAKE_CAPTION=obey it follows the
+instruction at once; asked to rewrite, it gives the caption with another word, or, with FAKE_CAPTION=stubborn, the same.
+FAKE_CAPTION_LOG names a file that receives every chat it is given."""
+import json
+import os
+
+FIRST = "A rocket stands in the scene, framed from above."
+
+
+class _Ids:
+    shape = (1, 0)
+
+
+class _Inputs(dict):
+    input_ids = _Ids()
+
+    def to(self, device):
+        return self
+
+
+class _Out:
+    def __init__(self, text):
+        self.text = text
+
+    def __getitem__(self, key):
+        return self
+
+
+class AutoProcessor:
+    @classmethod
+    def from_pretrained(cls, name):
+        return cls()
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        return messages
+
+    def __call__(self, text, images=None, videos=None, padding=True, return_tensors="pt"):
+        return _Inputs(messages=text[0])
+
+    def batch_decode(self, out, skip_special_tokens=True):
+        return [out.text]
+
+
+class Qwen3VLForConditionalGeneration:
+    @classmethod
+    def from_pretrained(cls, name, dtype=None, device_map=None):
+        return cls()
+
+    def generate(self, messages, max_new_tokens=0, do_sample=False):
+        if os.environ.get("FAKE_CAPTION_LOG"):
+            with open(os.environ["FAKE_CAPTION_LOG"], "a", encoding="utf-8") as f:
+                f.write(json.dumps(messages) + "\\n")
+        mode, asked = os.environ.get("FAKE_CAPTION", ""), messages[-1]["content"][-1]["text"]
+        if asked.startswith("Rewrite"):
+            caption = asked.rsplit("\\n\\n", 1)[1]
+            return _Out(caption if mode == "stubborn" else caption.replace("scene", "crater"))
+        ruled = any(m["role"] == "system" for m in messages)
+        return _Out(FIRST.replace("in the scene", "on the pad") if ruled and mode == "obey" else FIRST)
 ''', encoding="utf-8")
 sys.path.insert(0, str(FAKE_AV))
 os.environ["PYTHONPATH"] = os.pathsep.join([str(FAKE_AV)] + [p for p in [os.environ.get("PYTHONPATH")] if p])
@@ -435,6 +506,60 @@ class Units(unittest.TestCase):
         self.assertEqual([train.dataset_name(r) for r in ("x/images", str(train.DATASETS / "y" / "clips"), "c.toml", "./z")],
                          ["x", "y", "c.toml", "z"])
 
+    def test_avoid_is_an_instruction_to_the_caption_model(self):
+        """--avoid goes to the model as an instruction, never as a deletion: a caption that uses a word (or its plural) is
+        rewritten once; one that still uses it is written whole and returned, to be named. Without --avoid, nothing
+        changes. Each caption shows whole, under its file's name."""
+        folder = train.DATASETS / "avoid1"
+        folder.mkdir()
+        (folder / "a.png").write_bytes(b"png")
+        target = train.caption_targets("avoid1", False)[0]
+        todo, calls = [(target, folder / "a.png")], []
+
+        def model(*answers):
+            answers = list(answers)
+
+            def ask(messages):
+                calls.append(messages)
+                return answers.pop(0)
+            return ask
+
+        def caption(avoid, *answers):
+            calls.clear()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                kept = train.caption_files(todo, "trg", avoid, 60, ask=model(*answers))
+            return kept, (folder / "a.txt").read_text(), out.getvalue()
+        kept, text, out = caption([], "The scene is lit.")
+        self.assertEqual((kept, text, len(calls)), ([], "trg, The scene is lit.\n", 1))
+        self.assertEqual([m["role"] for m in calls[0]], ["user"])
+        self.assertEqual(out, "[1/1] a.png\n  trg, The scene is lit.\n")
+        kept, text, out = caption(["scene", "grain"], "The scenes are lit.", "The crater is lit.")
+        self.assertEqual((kept, text, len(calls)), ([], "trg, The crater is lit.\n", 2))
+        self.assertEqual(calls[0][0]["role"], "system")
+        self.assertIn("scene, grain", calls[0][0]["content"][0]["text"])
+        self.assertIn("The scenes are lit.", calls[1][-1]["content"][0]["text"])
+        kept, text, out = caption(["scene"], "The scene is lit.", "Lit, the Scene.")
+        self.assertEqual((kept, text), ([(folder / "a.txt", ["scene"])], "trg, Lit, the Scene.\n"))
+        self.assertEqual(train.clean_caption(' "the scene ,  is lit" '), "the scene , is lit")
+        self.assertEqual(train.avoided_in("Grainy scenes, a scenery", ["scene", "grain"]), ["scene"])
+
+    @unittest.skipIf(importlib.util.find_spec("huggingface_hub") is None, "huggingface_hub is in the trainer's environment")
+    def test_the_caption_model_on_disk(self):
+        """« downloaded this time » only when Hugging Face's cache lacks one of the model's weights files."""
+        cache = TMP / "hfcache"
+        snap = cache / "models--Qwen--Qwen3-VL-8B-Instruct" / "snapshots" / "abc123"
+        snap.mkdir(parents=True)
+        (snap.parent.parent / "refs").mkdir()
+        (snap.parent.parent / "refs" / "main").write_text("abc123")
+        self.assertFalse(train.model_on_disk(train.CAPTION_MODEL, cache_dir=str(cache)))
+        (snap / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "m-1.safetensors",
+                                                                                     "b": "m-2.safetensors"}}))
+        (snap / "m-1.safetensors").write_bytes(b"x")
+        self.assertFalse(train.model_on_disk(train.CAPTION_MODEL, cache_dir=str(cache)))
+        (snap / "m-2.safetensors").write_bytes(b"x")
+        self.assertTrue(train.model_on_disk(train.CAPTION_MODEL, cache_dir=str(cache)))
+
     def test_the_caption_prompt_of_each_kind(self):
         """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is
         seen; sound files get no prompt."""
@@ -563,6 +688,34 @@ class Runs(unittest.TestCase):
         self.assertIn("3 file(s), 0 to caption", out)
         out, rc = self.run_train("caption", "chars", "--trigger", "two words")
         self.assertNotEqual(rc, 0, out)
+
+    def test_caption_with_avoid_through_the_caption_model(self):
+        """train caption --avoid through the caption code, with a stand-in model: the instruction holds the words, the
+        captions written have none, each shows whole; a model that keeps a word gets the caption named at the end;
+        without --avoid, no instruction."""
+        folder = train.DATASETS / "avoid2"
+        folder.mkdir()
+        for stem in ("a", "b"):
+            (folder / (stem + ".png")).write_bytes(b"png")
+        log = TMP / "caption_chats.jsonl"
+        out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--avoid", "scene",
+                                 env={"FAKE_CAPTION_LOG": str(log)})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[1/2] a.png\n  av, A rocket stands in the crater, framed from above.\n", out)
+        self.assertEqual((folder / "b.txt").read_text(), "av, A rocket stands in the crater, framed from above.\n")
+        chats = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(chats), 4, "each caption: the first answer, then one rewrite")
+        self.assertIn("scene", chats[0][0]["content"][0]["text"])
+        out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--avoid", "scene", "--overwrite",
+                                 env={"FAKE_CAPTION": "stubborn"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 caption(s) still use a word of --avoid: {} (scene)".format(folder / "a.txt"), out)
+        self.assertEqual((folder / "a.txt").read_text(), "av, A rocket stands in the scene, framed from above.\n")
+        log.unlink()
+        out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--overwrite", env={"FAKE_CAPTION_LOG": str(log)})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([m["role"] for m in json.loads(log.read_text().splitlines()[0])], ["user"])
+        self.assertEqual(out.rstrip().splitlines()[-1].split("   ")[0], "Next:  train <recipe> <run> --dataset avoid2")
 
     def test_a_mixed_run_end_to_end(self):
         """ltx_mix through the command: its config of three blocks, the settings of ltx_av with the two flags of a mixed
