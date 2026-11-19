@@ -59,7 +59,7 @@ python pod.py down               # downloads, then terminates: billing stops
 | `status [pod]` | GPU, data center, cost so far, credit left, addresses, last log lines |
 | `logs [pod]` | Follows the log again until `READY` |
 | `open [pod]` | Opens ComfyUI in your browser |
-| `push [pod] FILES` | Sends files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training, and records your folder: the captions written on the pod come back into it |
+| `push [pod] FILES` | Sends files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training, and records your folder: the captions written on the pod are then downloaded into it |
 | `push --lora [pod] FILE` | Puts a model file into ComfyUI's `models/loras`, from your computer or a web address. `--to FOLDER` names any other model folder: `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`... ([Models to a pod](#models-to-a-pod)) |
 | `push [pod] URL` | The pod downloads a web address itself: one file, or every file that a folder page lists. `--frames 480-600` keeps the frames of that range, `--into NAME` names the folder under ComfyUI's input. With `--dataset NAME`, the files go to `/workspace/dataset/NAME` |
 | `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/`, and the text files of its datasets (captions and dataset configs) into `outputs/<pod name>/dataset/` |

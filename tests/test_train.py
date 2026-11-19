@@ -541,6 +541,19 @@ class Units(unittest.TestCase):
         self.assertIn("The scenes are lit.", calls[1][-1]["content"][0]["text"])
         kept, text, out = caption(["scene"], "The scene is lit.", "Lit, the Scene.")
         self.assertEqual((kept, text), ([(folder / "a.txt", ["scene"])], "trg, Lit, the Scene.\n"))
+
+        def refuses(messages):                              # the model answers for the picture, then fails on the rewrite
+            calls.append(messages)
+            if len(calls) > 1:
+                raise RuntimeError("text-only request refused\nby the stand-in")
+            return "The scene is lit."
+        calls.clear()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kept = train.caption_files(todo, "trg", ["scene"], 60, ask=refuses)
+        self.assertEqual((kept, (folder / "a.txt").read_text()), ([(folder / "a.txt", ["scene"])], "trg, The scene is lit.\n"))
+        self.assertEqual(out.getvalue(), "[1/1] a.png\n  trg, The scene is lit.\n  the request to rewrite this caption "
+                         "failed (text-only request refused): it is kept as first written\n")
         self.assertEqual(train.clean_caption(' "the scene ,  is lit" '), "the scene , is lit")
         self.assertEqual(train.avoided_in("Grainy scenes, a scenery", ["scene", "grain"]), ["scene"])
 
@@ -765,7 +778,7 @@ class Runs(unittest.TestCase):
         out, rc = self.run_train("prep", "zimage", "p2", "--dataset", "chars")
         out, rc = self.run_train("zimage", "p2", "--dataset", "chars", "--steps", "500")
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("the run p2 was prepared with other words: train prep zimage p2 --dataset chars", out)
+        self.assertIn("the run p2 was prepared with other words: `train prep zimage p2 --dataset chars`", out)
         out, rc = self.run_train("zimage", "p3", "--dataset", "chars", "--prompts", "x.txt")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("--prompts is gone: `train prep zimage p3 --dataset ...`", out)

@@ -1107,8 +1107,8 @@ def cmd_train(recipe, argv, prep=False):
         except (OSError, ValueError):
             saved = {}
         if (saved.get("recipe"), saved.get("stages"), saved.get("trigger")) != (recipe, stages, trigger):
-            die("the run {} was prepared with other words: train prep {}. Run it with the same words, or run train "
-                "prep again with the new ones.".format(stages[0]["name"], " ".join(
+            die("the run {} was prepared with other words: `train prep {}`. Run it with the same words, or run `train "
+                "prep` again with the new ones.".format(stages[0]["name"], " ".join(
                     shlex.quote(str(w)) for w in [saved.get("recipe")] + list(saved.get("words") or []))))
     plans = []
     for st in stages:
@@ -1475,8 +1475,8 @@ def word_report(files, trigger):
 
 def caption_files(todo, trigger, avoid, max_words, ask=None):
     """Writes the caption of each file, and prints it whole under the file's name. With words to avoid, the model is
-    told never to use them; a caption that still uses one is rewritten once, and when it still does, it is written
-    whole all the same. Returns those: [(caption file, [words])]."""
+    told never to use them; a caption that still uses one is rewritten once, and when it still does, or when that
+    request fails, it is written whole all the same. Returns those: [(caption file, [words])]."""
     ask = ask or caption_model()
     rule = [{"role": "system", "content": [{"type": "text", "text": AVOID_RULE.format(", ".join(avoid))}]}] if avoid else []
     kept = []
@@ -1496,9 +1496,13 @@ def caption_files(todo, trigger, avoid, max_words, ask=None):
         prompt = CAPTION_PROMPTS[mode] + " Maximum {} words.".format(max_words)
         text = clean_caption(ask(rule + [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]))
         words = avoided_in(text, avoid)
+        failed = None
         if words:                                         # once: a rewrite of the text alone, every fact kept
-            text = clean_caption(ask(rule + [{"role": "user", "content": [
-                {"type": "text", "text": REWRITE.format(", ".join(words), text)}]}])) or text
+            try:
+                text = clean_caption(ask(rule + [{"role": "user", "content": [
+                    {"type": "text", "text": REWRITE.format(", ".join(words), text)}]}])) or text
+            except Exception as e:                        # a request of its own: when it fails, the caption written
+                failed = (str(e).splitlines() or [type(e).__name__])[0][:120]   # from the picture stays, and is named
             words = avoided_in(text, avoid)
             if words:
                 kept.append((f.with_suffix(".txt"), words))
@@ -1506,6 +1510,8 @@ def caption_files(todo, trigger, avoid, max_words, ask=None):
         f.with_suffix(".txt").write_text(caption + "\n", encoding="utf-8", newline="\n")
         say("[{}/{}] {}".format(k, len(todo), f.name))
         say("  " + caption)
+        if failed:
+            say("  the request to rewrite this caption failed ({}): it is kept as first written".format(failed))
     return kept
 
 
@@ -1554,7 +1560,7 @@ def cmd_caption(argv):
         "wrong word is learned like the others.".format(", ".join(
             "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))
     next_line("train prep <recipe> <run> --dataset {}".format(dataset_name(a.datasets[0])),
-              "checks the dataset and shows the run's two files; train recipes lists the recipes")
+              "checks the dataset and shows the run's two files; `train recipes` lists the recipes")
     return 0
 
 
