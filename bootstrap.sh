@@ -43,7 +43,7 @@ set -uo pipefail
 MODE="${1:-all}"
 case "$MODE" in
   all|models|trainer) ;;
-  *) echo "usage: bash $0 [models|trainer]   (models: fetch the files still missing; trainer: install the trainers)"; exit 2 ;;
+  *) echo "usage: bash $0 [models|trainer]   (models: download the files still missing; trainer: install the trainers)"; exit 2 ;;
 esac
 if [ "$MODE" != "all" ]; then
   # A terminal opened on the pod may lack the pod's variables: read them from the container's first process.
@@ -164,7 +164,7 @@ access_summary() {   # the gated files that did not come, with the page of each 
   if [ -n "$NEED_REPOS" ]; then
     say "ACTION NEEDED · $WAITING gated file(s) wait for a licence that the Hugging Face account${HF_USER:+ $HF_USER} has not accepted. Logged in to huggingface.co with that account, open each page and click « Agree and access repository »:"
     print_links "$NEED_REPOS"
-    say "   then fetch them on this pod, without a new one: bash $SELF models   (in JupyterLab's terminal, or after python pod.py ssh)"
+    say "   then download them on this pod, without a new pod: bash $SELF models   (in JupyterLab's terminal, or after python pod.py ssh)"
     say "   a Read token works; a fine-grained token also needs its permission to read public gated repos"
   fi
   if [ -n "$NOTOKEN_REPOS" ]; then
@@ -196,7 +196,7 @@ install_repo() {   # install_repo <folder> <git url> <commit> <what uv installs,
     mkdir -p "$dir" && (cd "$dir" && git init --quiet && git remote add origin "$url") || return 1
   fi
   (cd "$dir" && git fetch --quiet --depth 1 origin "$commit" && git checkout --quiet --force FETCH_HEAD) \
-    || { warn "trainer: $url could not be fetched at ${commit:0:7}"; return 1; }
+    || { warn "trainer: $url could not be downloaded at ${commit:0:7}"; return 1; }
   [ -x "$py" ] || uv venv "$dir/.venv" --python 3.12 --quiet \
     || { warn "trainer: Python 3.12 could not be installed in $dir"; return 1; }
   # PyTorch first, from its own index; PyPI's Linux wheels of 2.8.0 are the same CUDA 12.8 build
@@ -241,7 +241,7 @@ install_trainers() {   # both trainers, train.py and the train command; returns 
     mv -f "$ROOT/ainvfx/train.py.new" "$ROOT/ainvfx/train.py"
   else
     rm -f "$ROOT/ainvfx/train.py.new"
-    [ -s "$ROOT/ainvfx/train.py" ] || { warn "trainer: train.py could not be fetched from $REPO_RAW"; return 1; }
+    [ -s "$ROOT/ainvfx/train.py" ] || { warn "trainer: train.py could not be downloaded from $REPO_RAW"; return 1; }
   fi
   say "trainer: musubi-tuner ${MUSUBI_COMMIT:0:7} (LTX 2.5, Z-Image, Qwen-Image-Edit) and sd-scripts ${SDSCRIPTS_COMMIT:0:7} (MOSS-Image), each in its own environment"
   install_repo "$MUSUBI" "$MUSUBI_URL" "$MUSUBI_COMMIT" -e . tensorboard qwen-vl-utils || return 1
@@ -285,9 +285,9 @@ if [ -n "${HF_TOKEN:-}" ]; then
   esac
 fi
 if [ -n "${HF_TOKEN:-}" ]; then
-  say "HF_TOKEN present${HF_USER:+, Hugging Face account $HF_USER}: the gated files of the profile come once that account has accepted their licence (the repos are named with the models plan)"
+  say "HF_TOKEN present${HF_USER:+, Hugging Face account $HF_USER}: the gated files of the profile download once that account has accepted their licence (the repos are named with the models plan)"
 else
-  say "no HF_TOKEN: the gated files of the profile will be skipped (their repos are named with the models plan); the public files come without it"
+  say "no HF_TOKEN: the gated files of the profile will be skipped (their repos are named with the models plan); the public files download without it"
 fi
 
 if [ "$MODE" != "models" ]; then   # steps 0 to 3; the models mode goes straight to step 4
@@ -353,7 +353,7 @@ fi
 say "uv $(uv --version 2>/dev/null | awk '{print $2}')"
 if [ ! -x $VENV/bin/python ]; then
   uv venv $VENV --python "$PY" --quiet || { sleep 10; uv venv $VENV --python "$PY" --quiet; } || {
-    fail "PYTHON $PY COULD NOT BE INSTALLED on this machine (the lines above). Terminate this pod and create a new one: it lands on another machine."
+    fail "PYTHON $PY COULD NOT BE INSTALLED on this machine (the lines above). Terminate this pod and create a new one: it runs on another machine."
     hold
   }
 fi
@@ -388,7 +388,7 @@ done
 MARK=$VENV/.ainvfx_install_${TAG}_py${PY}_$(printf '%s|%s|%s' "$TORCH" "$TORCH_INDEX" "$NODES" | cksum | cut -d' ' -f1)
 if [ ! -f "$MARK" ] || [ ! -f $COMFY/main.py ]; then
   install_torch || {
-    fail "PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above). Your settings are not the cause. Terminate this pod and create a new one, which lands on another machine: python pod.py down, then python pod.py up $PROFILE; or Terminate in the console, then deploy again from the template."
+    fail "PYTORCH COULD NOT BE DOWNLOADED on this machine: the network of this host timed out (the lines above). Your settings are not the cause. Terminate this pod and create a new one, which runs on another machine: python pod.py down, then python pod.py up $PROFILE; or Terminate in the console, then deploy again from the template."
     hold
   }
   # git init + fetch instead of git clone: works in a folder that already holds models (a restart)
@@ -436,7 +436,7 @@ PY
     then
       date -u +'%F %T' > "$MARK"
     else
-      fail "PYTORCH DOES NOT START, OR DOES NOT SEE THE GPU, on this machine (the lines above). Terminate this pod and create a new one: it lands on another machine."
+      fail "PYTORCH DOES NOT START, OR DOES NOT SEE THE GPU, on this machine (the lines above). Terminate this pod and create a new one: it runs on another machine."
       hold
     fi
   fi
@@ -498,7 +498,7 @@ else   # models mode: the environment the first run built
     # shellcheck disable=SC1091
     source $VENV/bin/activate
   else
-    warn "no environment in $VENV: this pod never finished its install, so the models cannot be fetched from here"
+    warn "no environment in $VENV: this pod never finished its install, so the models cannot be downloaded from here"
     exit 1
   fi
 fi   # end of steps 0 to 3

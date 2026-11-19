@@ -1291,7 +1291,7 @@ class EndToEnd(unittest.TestCase):
     def test_down_when_done_waits_for_the_run(self):
         """`down --when-done` asks first, then waits while the run's record says in progress, through a look that the
         pod does not answer and a change of stage; when the run has ended it pulls, then terminates. A run whose record
-        stands still has died without a word: the same end. With no run in progress it stops, and terminates nothing."""
+        stands still is of a run whose process stopped: the same end. With no run in progress it stops, and terminates nothing."""
         self.env.update(AINVFX_RUN_POLL="1", AINVFX_RUN_STALE="2")
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)
@@ -1322,14 +1322,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         steps = ["Waiting for the training run", "jar_a, stage 1 of 2: in progress", "the pod does not answer",
                  "jar_b, stage 2 of 2: in progress", "The run jar_b, stage 2 of 2 has ended (done).",
-                 "jar_b.safetensors", "file(s) pulled", "Terminated"]
+                 "jar_b.safetensors", "file(s) downloaded into", "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
         self.assertIn("jar_b.safetensors", [f for _, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs], out)
         STATE["runs"] = [run("running", 0, 7.0)]                      # the record never moves again
         out, rc = self.run_pod("down", "3d", "--when-done", "-y", timeout=60)
         self.assertEqual(rc, 0, out)
-        self.assertIn("gives no sign of life for 2 s", out, out)
+        self.assertIn("has not updated its record for 2 s", out, out)
         self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
 
     def test_down_when_done_pulls_the_files_as_the_run_makes_them(self):
@@ -1357,7 +1357,7 @@ class EndToEnd(unittest.TestCase):
         STATE["outfiles"]["train/jar/sample/jar_step250.png"] = b"a later sample"      # written on the pod meanwhile
         out, _ = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 0, out)
-        steps = ["new files pulled every 1 min", "jar_step0.png", "jar_step250.png", "The run jar has ended (done).",
+        steps = ["new files downloaded every 1 min", "jar_step0.png", "jar_step250.png", "The run jar has ended (done).",
                  "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(here("jar_step250.png"), out)
@@ -1391,7 +1391,7 @@ class EndToEnd(unittest.TestCase):
         STATE["runs"], STATE["refuse"] = ended(), {lora: 2}           # the LoRA comes at the third try
         out, rc = self.run_pod("down", "image", "--when-done", "-y", timeout=60)
         self.assertEqual(rc, 0, out)
-        steps = ["skipped " + lora, "try 2 of 3", "try 3 of 3", "jar.safetensors  (", "3 file(s) pulled", "Terminated"]
+        steps = ["skipped " + lora, "try 2 of 3", "try 3 of 3", "jar.safetensors  (", "3 file(s) downloaded into", "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertLessEqual({"jar.safetensors", "jar_step0.png"}, set(here()), out)
         self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
@@ -1399,7 +1399,7 @@ class EndToEnd(unittest.TestCase):
         STATE["runs"], STATE["refuse"] = ended(), {lora: -1}          # the LoRA never comes: the pod is kept
         out, rc = self.run_pod("down", "3d", "--when-done", "-y", timeout=60)
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("Not pulled from", out, out)
+        self.assertIn("Not downloaded from", out, out)
         self.assertIn(lora + ". The pod keeps running and billing", out, out)
         self.assertNotIn("Terminated", out, out)
         self.assertFalse(STATE["pods"]["fakepod2"].get("deleted"), out)
@@ -1414,7 +1414,7 @@ class EndToEnd(unittest.TestCase):
         os.makedirs(os.path.join(outputs, folder, *lora.split("/")))
         out, rc = self.run_pod("down", "3d", "-y", timeout=60)
         self.assertEqual(rc, 0, out)
-        steps = ["skipped " + lora, "Not pulled from", "Terminated"]
+        steps = ["skipped " + lora, "Not downloaded from", "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertNotIn("unexpected error", out, out)
         self.assertTrue(STATE["pods"]["fakepod2"].get("deleted"), out)
@@ -1487,7 +1487,7 @@ class EndToEnd(unittest.TestCase):
         python pod.py train caption the pod's captions come into outputs/<pod>/dataset/NAME/ and beside the files of that
         folder: a missing one is written, an identical one left, ones that differ replaced after one question only, and
         nothing replaced when no one answers. NAME/images names NAME; a .toml downloads nothing; a dataset sent from
-        elsewhere goes to outputs/ only; pull brings the datasets' text files, never media, an edit of the same size
+        elsewhere goes to outputs/ only; pull downloads the datasets' text files, never media, an edit of the same size
         included. The Next line stays last."""
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)
@@ -1779,14 +1779,14 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=120)
         self.assertNotIn("Traceback", out, out)
         self.assertIn("[RUNPOD] create container runpod/pytorch", out, out)
-        self.assertIn("the host is fetching the pod's image", out, out)
+        self.assertIn("the host is downloading the pod's image", out, out)
         self.assertIn("[RUNPOD] image download: 3 layers", out, out)
         self.assertIn("Warning: no container", out, out)
         self.assertIn("3 done · 0 extracting · 0 downloading", out, "the final summary once every layer is done")
         self.assertIn("[RUNPOD] start container for runpod/pytorch", out, out)
         self.assertIn("[AINVFX] step 1/5 health check", out, out)
         self.assertIn("READY", out, out)
-        self.assertEqual(out.count("the host is fetching the pod's image"), 1, "the explanation is printed once")
+        self.assertEqual(out.count("the host is downloading the pod's image"), 1, "the explanation is printed once")
         self.assertEqual(rc, 0, out)
         self.run_pod("down", "-y")
 

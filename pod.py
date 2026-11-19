@@ -9,16 +9,16 @@ One file, Python 3.8 or newer, standard library only. Windows, macOS and Linux.
   python pod.py status [pod]       GPU, data center, cost so far, ComfyUI address, last log lines
   python pod.py logs [pod]         follow the pod's log until READY
   python pod.py open [pod]         open ComfyUI in your browser
-  python pod.py push [pod] FILES   copy files into the pod's input folder; --dataset NAME for training
+  python pod.py push [pod] FILES   send files into the pod's input folder; --dataset NAME for training
   python pod.py push [pod] URL     the pod downloads a file or a folder page itself; --frames 480-600, --into NAME
   python pod.py push --lora [pod] FILE|URL   a model file into ComfyUI's models/loras; --to FOLDER for any other
                                    model folder (vae, diffusion_models, text_encoders...)
   python pod.py pull [pod]         download the pod's output folder into outputs/<pod name>/
-  python pod.py down [pod]         pull, then terminate (billing stops); --all for every pod recorded here;
+  python pod.py down [pod]         download, then terminate (billing stops); --all for every pod recorded here;
                                    --when-done waits first for the training run in progress on the pod to end,
-                                   pulling its new files every 5 minutes meanwhile
+                                   downloading its new files every 5 minutes meanwhile
   python pod.py ssh [pod]          a terminal on the pod
-  python pod.py train [pod] ...    the pod's train command, run from here: train caption, train <recipe>,
+  python pod.py train [pod] ...    the pod's train command, run from here: train caption, train prep, train <recipe>,
                                    train log, train status, train stop (the same words as on the pod)
   python pod.py list               every pod of your account
   python pod.py doctor             check this machine and the configuration
@@ -1202,7 +1202,7 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
     def done():
         if st["failed"]:
             say("\nThe pod reported FAILED (the line above): it cannot work on that machine, and it bills until "
-                "it is terminated. Terminate it and create another, which lands on another machine:\n"
+                "it is terminated. Terminate it and create another, which runs on another machine:\n"
                 "    python pod.py down    then    python pod.py up")
             return False
         return True
@@ -1231,7 +1231,7 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
             st["pull_shown"], st["pull_done"] = time.time(), True
             return
         if not st["pull_shown"]:
-            out("[RUNPOD] the host is fetching the pod's image from Docker Hub (several minutes; a host "
+            out("[RUNPOD] the host is downloading the pod's image from Docker Hub (several minutes; a host "
                 "that already has it starts the container within seconds)")
         st["pull_shown"] = time.time()
         out("[RUNPOD] " + pull.summary())
@@ -1258,7 +1258,7 @@ def follow_logs(cfg, pod_id, minutes=25, pod=None, created=None):
                 and (datetime.now(timezone.utc) - created).total_seconds() > STALL_MINUTES * 60):
             st["stall_told"] = True
             dc = pod_summary(current)[1]
-            out("Warning: no container {} after creation (status {}, {}). The host is still fetching the image, or "
+            out("Warning: no container {} after creation (status {}, {}). The host is still downloading the image, or "
                 "does not respond; the console (Pods > your pod) shows its log and any maintenance notice. "
                 "The pod bills meanwhile. Usual answer:  python pod.py down <pod>  then  python pod.py up  again, "
                 "usually in another data center.".format(fmt_since(created), st["status"],
@@ -1822,7 +1822,7 @@ def cmd_status(args):
         g = rt["gpus"][0]
         say("GPU in use: {}% · VRAM {}%".format(g.get("util", "?"), g.get("memoryUtil", "?")))
     elif st == "RUNNING" and pod.get("runtime") is None:
-        say("container: not started yet (the host is fetching the image, or has a problem): Runpod's system log below says which")
+        say("container: not started yet (the host is downloading the image, or has a problem): Runpod's system log below says which")
     say("ComfyUI: {}  ({})".format(pod_url(rec["id"]), "answers" if comfy_alive(rec["id"]) else "not answering yet"))
     say("JupyterLab: {}".format(pod_url(rec["id"], JUPYTER_PORT)))
     kind, host, port, user = pod_ssh(pod)
@@ -1902,7 +1902,7 @@ def cmd_push(args):
             request("POST", pod_url(rec["id"]) + "/upload/image", data=body, headers={"Content-Type": ctype}, timeout=600, raw=True)
             say("  {}  ({:.1f} MB) -> input/".format(f.name, f.stat().st_size / 1e6))
         except ApiError as e:
-            die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
+            die("sending {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
     say("Done. The files are in the lists of the Load Image and Load Video nodes.")
 
 
@@ -2041,7 +2041,7 @@ def dataset_plan(paths):
     seen = set()
     for _, rel in plan:
         if rel in seen:
-            die("two files would land on {} in the dataset: send one of them".format(rel))
+            die("two files would go to {} in the dataset: send one of them".format(rel))
         seen.add(rel)
     return plan
 
@@ -2311,7 +2311,7 @@ def push_models(rec, folder, paths):
         try:
             jupyter_upload(base, hdrs, dest + "/" + f.name, f, progress=lambda n, before=done: progress(before + n))
         except ApiError as e:
-            die("upload of {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
+            die("sending {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
         sent += 1
         done += size
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> models/{}".format(sent, kept, total / 1e6,
@@ -2361,7 +2361,7 @@ def push_dataset(rec, name, paths, tag):
             try:
                 jupyter_upload(base, hdrs, dest + "/" + rel, local, clean_text(local.read_bytes()) if text else None)
             except ApiError as e:
-                die("upload of {} failed: {}\n{}".format(rel, e.detail[:200], e.hint()))
+                die("sending {} failed: {}\n{}".format(rel, e.detail[:200], e.hint()))
             sent += 1
         done += size
         if time.time() - last >= 5:
@@ -2680,7 +2680,7 @@ def kernel_run(rec, code, on_line, on_text=None, keep_running=False):
         interrupted = True
         raise
     except (OSError, ConnectionError) as e:
-        broken = LinkBroken(0, "the link to the pod broke ({}). Run the command again: it skips the files already "
+        broken = LinkBroken(0, "the connection to the pod was lost ({}). Run the command again: it skips the files already "
                                "there.".format(e), base)
         broken.started = sent
         raise broken
@@ -2767,7 +2767,7 @@ def fetch_to(url, target, headers=None, timeout=600):
 
 def pull(rec, report=None):
     """Every file of the pod's output folder not here yet, into outputs/<pod name>/, subfolders kept. Returns
-    the number of files downloaded. A file that does not come is skipped: the next pull takes it. With `report`, a
+    the number of files downloaded. A file that is not downloaded is skipped: the next pull takes it. With `report`, a
     dict, the pull also says what it could not bring: `failed`, the files skipped and the folders not listed;
     `answered`, whether the pod's ComfyUI answered; `listed`, whether JupyterLab gave the output folder, the only
     way to the files of a training run."""
@@ -2814,7 +2814,7 @@ def pull(rec, report=None):
                 {"Authorization": "token " + token})
         count += pull_dataset_texts(pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}, dest, failed)
     if not comfy:
-        say("ComfyUI does not answer on the pod: nothing to pull through it.")
+        say("ComfyUI does not answer on the pod: nothing to download through it.")
         return count
     try:
         history = request("GET", pod_url(pod_id) + "/history", timeout=60)
@@ -2827,8 +2827,9 @@ def pull(rec, report=None):
             q = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": "output"})
             get(rel, pod_url(pod_id) + "/view?" + q)
     if not root:
-        say("JupyterLab did not answer: only the files in ComfyUI's history came back. A file saved before a ComfyUI "
-            "restart, or by a node that reports nothing, stays on the pod: fetch it from JupyterLab's file browser.")
+        say("JupyterLab did not answer: only the files in ComfyUI's history were downloaded. A file saved before a "
+            "ComfyUI restart, or by a node that reports nothing, stays on the pod: download it from JupyterLab's file "
+            "browser.")
     return count
 
 
@@ -2924,19 +2925,19 @@ def wait_for_run(cfg, rec, pull_every=None):
                 last, moved = run, now
             if not run_in_progress(run, now - moved):
                 if not run.get("stages"):                 # deleted on the pod: unknown never reads as "terminate now"
-                    die("the run's record is gone from {}: the pod keeps running and billing. Look at it "
+                    die("the run's record is gone from {}: the pod keeps running and billing. Check the pod "
                         "(`python pod.py open`), then `python pod.py down`.".format(name))
                 elif run.get("state") in RUN_ACTIVE:
-                    say("The run {} gives no sign of life for {} s: it ended without a word (a pod restart?).".format(
-                        run_label(run), RUN_STALE))
+                    say("The run {} has not updated its record for {} s: its process stopped, perhaps when the pod "
+                        "restarted.".format(run_label(run), RUN_STALE))
                 else:
                     say("The run {} has ended ({}).".format(run_label(run), run.get("state") or "?"))
                 return True
             note = "{}: in progress".format(run_label(run))
         if said is None:
-            say("Waiting for the training run on {} to end, with a look every {} s{}. Ctrl+C stops the wait; the pod "
+            say("Waiting for the training run on {} to end: a check every {} s{}. Ctrl+C stops the wait; the pod "
                 "keeps running and billing.".format(name, RUN_POLL, "" if pull_every is None else
-                                                    ", and its new files pulled every {} min".format(
+                                                    ", and its new files downloaded every {} min".format(
                                                         max(1, round(pull_every / 60)))))
         if note != said or now - noted >= RUN_NOTE:
             say("  {} (waited {})".format(note, fmt_duration((now - start) / 3600)))
@@ -2944,8 +2945,8 @@ def wait_for_run(cfg, rec, pull_every=None):
         if run is not None and pull_every is not None and now - pulled >= pull_every:
             try:
                 count = pull(rec)
-            except (ApiError, OSError) as e:          # the wait goes on: the next pull tries again
-                say("  pull skipped ({}); the next one tries again".format(e))
+            except (ApiError, OSError) as e:          # the wait continues: the next download tries again
+                say("  download skipped ({}); the next one tries again".format(e))
             else:
                 if count:
                     say("  {} new file(s) in {}".format(count, outputs_of(rec)))
@@ -2960,7 +2961,7 @@ def pull_before_down(rec, run_ended):
     count, missing = 0, []
     for attempt in range(PULL_TRIES):
         if attempt:
-            say("  not everything came: try {} of {}{}".format(
+            say("  some files were not downloaded: try {} of {}{}".format(
                 attempt + 1, PULL_TRIES, " in {} s".format(PULL_RETRY) if PULL_RETRY else ""))
             time.sleep(PULL_RETRY)
         report = {}
@@ -2970,7 +2971,7 @@ def pull_before_down(rec, run_ended):
             missing = ["the output folder (the pod's JupyterLab did not answer)"]
         if not missing:
             break
-    say("{} file(s) pulled into {}".format(count, outputs_of(rec)))
+    say("{} file(s) downloaded into {}".format(count, outputs_of(rec)))
     return missing
 
 
@@ -3001,7 +3002,7 @@ def cmd_down(args):
         missing = [] if args.no_pull else pull_before_down(rec, ended)
         if missing:                                           # terminating erases them: never without a word
             name = rec.get("name") or rec["id"]
-            what = "Not pulled from {}: {}{}.".format(name, ", ".join(missing[:4]), " and {} more".format(
+            what = "Not downloaded from {}: {}{}.".format(name, ", ".join(missing[:4]), " and {} more".format(
                 len(missing) - 4) if len(missing) > 4 else "")
             if args.when_done:
                 die("{} The pod keeps running and billing, so that nothing is lost. `python pod.py down` tries again, "
@@ -3029,7 +3030,7 @@ def cmd_down(args):
         except ApiError as e:
             if e.code != 404:
                 die("{}\n{}".format(e, e.hint()))
-            say("{}: already gone from Runpod.".format(rec.get("name")))
+            say("{}: no longer on Runpod.".format(rec.get("name")))
         remember_pod(cfg, tag, None)
     try:
         running = [p for p in list_pods(cfg) if pod_status(p) not in FINAL]
@@ -3313,21 +3314,23 @@ def cmd_train(args):
     except KeyboardInterrupt:
         out.finish()
         out.release()
-        say("\nStopped here, as Ctrl+C does in the pod's terminal. A run that had started goes on: "
-            "`python pod.py train status` says where it stands.")
+        say("\nStopped here, as Ctrl+C does in the pod's terminal. A run that had started continues: "
+            "`python pod.py train status` shows its state.")
         sys.exit(130)
     except LinkBroken as e:
         out.finish()
         out.release()
         if not e.started:
-            die("the link to the pod broke before train started there: run the command again.")
-        die("the link to the pod broke; the command goes on there. Do not run it again: in a few minutes, "
-            "`python pod.py train status` says where the run stands, `python pod.py train log` shows it.")
+            die("the connection to the pod was lost before train started there: run the command again.")
+        say("\nThe connection to the pod was lost, and the command continues on the pod: do not run it again. "
+            "`python pod.py train log` shows its log again, and `python pod.py train status` its state.")
+        sys.exit(1)
     out.finish()
     if out.code is None:
         out.release()
-        die("the link to the pod closed before train ended; the command goes on there. In a few minutes, "
-            "`python pod.py train status` says where the run stands.")
+        say("\nThe connection to the pod closed before train ended, and the command continues on the pod. "
+            "`python pod.py train status` shows its state in a few minutes.")
+        sys.exit(1)
     if out.code == 0 and not helped and words[:1] == ["caption"] and "--dry-run" not in words:
         try:
             download_captions(rec, caption_refs(words))
@@ -3421,7 +3424,7 @@ def main():
     command("status", cmd_status, "status, GPU, cost, address, log")
     command("open", cmd_open, "open ComfyUI in the browser")
     command("pull", cmd_pull, "download the outputs")
-    p = command("push", cmd_push, "upload files into the pod's input folder, a training dataset, or a model folder")
+    p = command("push", cmd_push, "send files into the pod's input folder, a training dataset, or a model folder")
     p.add_argument("files", nargs="+", help="local files, or one web address that the pod downloads itself: a file, "
                                             "a folder page that lists its files, a Hugging Face file page, or "
                                             "hf://owner/repo/path")
@@ -3434,13 +3437,13 @@ def main():
                                                           "range, found by the numbers in the file names (480-600)")
     p.add_argument("--into", metavar="NAME", help="with a web address: the folder under ComfyUI's input that "
                                                   "receives the files (default: the web folder's own name)")
-    p = command("down", cmd_down, "pull, then terminate")
+    p = command("down", cmd_down, "download, then terminate")
     p.add_argument("--all", action="store_true", help="every pod recorded here")
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("--when-done", action="store_true",
-                   help="wait for the training run in progress on the pod to end, pulling its new files every {} "
-                        "min meanwhile, then terminate; this computer stays on and online until then. A pod whose "
-                        "files did not all come is kept".format(max(1, round(PULL_EVERY / 60))))
+                   help="wait for the training run in progress on the pod to end, downloading its new files every {} "
+                        "min meanwhile, then terminate; this computer must stay on and online until then. A pod whose "
+                        "files were not all downloaded is kept".format(max(1, round(PULL_EVERY / 60))))
     p.add_argument("-y", "--yes", action="store_true")
     command("ssh", cmd_ssh, "a terminal on the pod").add_argument("command", nargs="*")
     command("train", cmd_train, "the pod's train command, run from here with the same words", pod=False).add_argument(

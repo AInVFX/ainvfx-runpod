@@ -388,7 +388,7 @@ class Units(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             train.check_blocks("ltx_mix", train.dataset_blocks(train.make_config("ltx_mix", mixed.parent), "x"), "x")
-        self.assertIn("1 of 121 frames", out.getvalue())
+        self.assertIn("1 clip(s) of 121 frames", out.getvalue())
         self.assertNotIn("run slower", out.getvalue())
 
     def test_a_mixed_dataset(self):

@@ -15,8 +15,8 @@ command, which runs this file with musubi-tuner's Python. In a terminal on the p
 
 <dataset> is a folder of /workspace/dataset (`python pod.py push --dataset NAME FOLDER` puts one there), or a dataset
 config (.toml) in musubi-tuner's format, for several folders or other settings. A run writes everything into
-ComfyUI/output/train/<run>/ (checkpoints, samples, logs, its dataset config and prompts), so `pod.py pull` brings it
-home, and links every checkpoint into ComfyUI's LoRA list, under train/<run>/.
+ComfyUI/output/train/<run>/ (checkpoints, samples, logs, its dataset config and prompts), which `python pod.py pull`
+downloads, and links every checkpoint into ComfyUI's LoRA list, under train/<run>/.
 
 The recipes repeat the settings of the AInVFX LoRA kit, proven on RTX PRO 6000 pods in September 2026, on the
 musubi-tuner commit that bootstrap.sh pins; `moss` follows the MOSS-Image guide of sd-scripts, the trainer that
@@ -363,7 +363,7 @@ def family_files(family):
         spec = json.loads(MODELS_JSON.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         die("no readable models list at {}: bootstrap.sh writes it at start (`bash /tmp/ainvfx-bootstrap.sh models` "
-            "fetches it again).".format(MODELS_JSON))
+            "downloads it again).".format(MODELS_JSON))
     fam = (spec.get("training") or {}).get(family)
     if not fam:
         die("the models list has no training entry for {}: a models list of your own needs the `training` part of the "
@@ -694,7 +694,7 @@ def check_clips(where, block, files, av_run):
     if full:
         lengths = sorted(Counter(r[2] for r in kept).items(), reverse=True)
         say("{}: at {:g} fps, each clip is read whole up to {} frames: {}".format(where, rate, most, ", ".join(
-            "{} of {} frames".format(c, k) for k, c in lengths) or "none"))
+            "{} clip(s) of {} frames".format(c, k) for k, c in lengths) or "none"))
         stills = [r for r in kept if r[2] == 1]
         if stills:
             say("  {} clip(s) give fewer than {} frames: the trainer keeps one frame of each, as a still: {}".format(
@@ -1157,8 +1157,8 @@ def cmd_train(recipe, argv, prep=False):
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     say("The run started in the background{}. Ctrl+C stops following the log, never the run; `train log` follows it "
         "again.".format(" ({} stages)".format(len(stages)) if len(stages) > 1 else ""))
-    next_line("python pod.py down --when-done", "in a second terminal: it downloads the run's files while the run goes "
-              "on, and terminates the pod when the run ends", computer=True)
+    next_line("python pod.py down --when-done", "in a second terminal: it downloads the run's files during the run, and "
+              "terminates the pod when the run ends", computer=True)
     say()
     return follow(proc)
 
@@ -1243,18 +1243,19 @@ def follow(proc=None, tail=None, then_down=False):
                 job = read_job()
                 if job.get("state") in ACTIVE:
                     job = update_job(state="failed", rc=1, ended=time.time())
-                    say("\nThe run's process ended without a word. Its own log: {}".format(RUNS / ".job.log"))
+                    say("\nThe run's process stopped without writing how it ended. Its own log: {}".format(
+                        RUNS / ".job.log"))
                 continue
             time.sleep(1)
     except KeyboardInterrupt:
-        say("\nStopped following. The run goes on: `train log` follows it again, `train stop` stops it.")
+        say("\nStopped following. The run continues: `train log` follows it again, `train stop` stops it.")
         return 130
 
 
 def report_end(job, then_down=False):
     state, last = job.get("state"), job["stages"][job.get("stage", 0)]
     if state == "done":
-        say("\nThe run is done{}. Its folder: {} (`python pod.py pull` brings it home).".format(
+        say("\nThe run is done{}. Its folder on the pod: {}. `python pod.py pull` downloads it.".format(
             ": {} stages".format(len(job["stages"])) if len(job["stages"]) > 1 else "", last["run"]))
         if then_down:
             next_line("python pod.py down", "it downloads the run's files, then terminates the pod; a down --when-done "
@@ -1280,7 +1281,8 @@ def cmd_log(argv):
 
 
 def cmd_status(argv):
-    argparse.ArgumentParser(prog="train status", description="Where the run stands.").parse_args(argv)
+    argparse.ArgumentParser(prog="train status", description="The run in progress, or the last one: its stage, its last "
+                                                            "lines, its checkpoints, the GPU.").parse_args(argv)
     job = read_job()
     running = bool(job and job.get("stages") and active_job())
     if not job or not job.get("stages"):
@@ -1288,7 +1290,7 @@ def cmd_status(argv):
     else:
         st, state = job["stages"][job.get("stage", 0)], job.get("state")
         if state in ACTIVE and not active_job():
-            state = "ended without a word (the pod restarted?)"
+            state = "stopped without writing how it ended (did the pod restart?)"
         since = time.time() - job.get("started", job.get("created", time.time()))
         say("{} · recipe {} · stage {} of {} · {} · {} since its start".format(
             st["name"], job["recipe"], job.get("stage", 0) + 1, len(job["stages"]), state, duration(since)))
@@ -1322,7 +1324,7 @@ def cmd_stop(argv):
         return 0
     name = job["stages"][job.get("stage", 0)]["name"]
     if not a.yes and input("Stop the run {}? Its checkpoints stay. [y/N] ".format(name)).strip().lower() not in ("y", "yes"):
-        say("The run goes on.")
+        say("The run continues.")
         return 0
     pid = job.get("pid")
     if pid:
