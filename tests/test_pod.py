@@ -103,6 +103,8 @@ STATE = {"pods": {}, "posts": [], "logs_403": False, "no_proxy_log": False, "upl
          "history_3d": False,     # the history also reports a GLB under "3d", and a temp preview
          "outfiles": None,        # the pod's output folder as {relative path: bytes}; None = JupyterLab off
          "refuse": {},            # {relative path: how many more downloads of that file fail (-1: every one)}
+         "put_fail": {},          # {path under JupyterLab's root: how many more writes of it answer 502, empty (-1: all)}
+         "blips": 0,              # how many more requests through the pod's address answer 502 with an empty body
          "logs_hang_for": 0}      # real seconds after creation during which the logs route sends nothing, not even headers
 
 
@@ -220,6 +222,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def problem(self, code, detail):
         self.send_json(code, {"title": "error", "status": code, "detail": detail})
+
+    def empty(self, code):
+        """An error with no text at all, as a proxy can answer when the pod behind it does not."""
+        self.send_response(code); self.send_header("Content-Length", "0"); self.end_headers()
 
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -415,6 +421,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------- fake ComfyUI behind the proxy
     def proxy_get(self, p, q):
+        if STATE["blips"]:                                  # the pod's address fails for a moment
+            STATE["blips"] -= 1
+            return self.empty(502)
         pid, pod = pod_of(p)
         up = pod and not pod["deleted"] and pod_seconds(pod) >= STATE["pull_seconds"] + 4
         if not up:
@@ -588,6 +597,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         model = json.loads(self.body() or b"{}")
+        left = STATE["put_fail"].get(path, 0)
+        if left and method == "PUT":                        # this write fails, with no text; the file is not written
+            STATE["put_fail"][path] = left - 1 if left > 0 else left
+            return self.empty(502)
         if method == "PATCH":
             new = model["path"].strip("/")
             if path not in jfs:
@@ -728,6 +741,40 @@ class Helpers(unittest.TestCase):
         self.assertFalse(pull.feed("[AINVFX] step 1/5 health check"))
         self.assertEqual(pull.counts(), (4, 2, 1, 1))
         self.assertIn("4 layers · 2 done · 1 extracting · 1 downloading", pull.summary())
+
+    def test_an_error_always_gives_a_reason(self):
+        """19 Nov 2026: a file sent to a pod failed with « sending still_19.jpg failed: » and nothing after the colon: an
+        HTTP error with an empty body. Every error now gives a reason in words, and a hint shows on a line of its own
+        only when there is one."""
+        e = pod.ApiError(502, "", "https://abc-8888.proxy.runpod.net/api/contents/x")
+        self.assertEqual(e.detail, "error 502 (Bad Gateway), with no explanation")
+        self.assertEqual(e.explain(), str(e), "no hint: no empty line after the message")
+        self.assertEqual(pod.ApiError(0, "", "u").detail, "no answer")
+        self.assertEqual(pod.ApiError(0, "  ", "u").detail, "no answer")
+        self.assertEqual(pod.plain_failure(OSError()), "no answer (OSError)")
+        self.assertEqual(pod.plain_failure(""), "no answer")
+        self.assertTrue(pod.plain_failure(ConnectionRefusedError(111, "Connection refused")).startswith(
+            "the connection was refused (ConnectionRefusedError: "))
+        self.assertTrue(pod.plain_failure(BrokenPipeError()).startswith("the connection was closed before the answer"))
+        hint = pod.ApiError(0, "no answer", "https://abc-8188.proxy.runpod.net/system_stats").hint()
+        self.assertIn("abc-8188.proxy.runpod.net", hint)
+        self.assertNotIn("api.runpod.io", hint, "a pod's address is not Runpod's API")
+        self.assertIn("api.runpod.io", pod.ApiError(0, "no answer", pod.API + "/pods").hint())
+        import socket as sk
+        srv = sk.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def close_at_once():                              # a server that takes the request and answers nothing
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.close()
+        threading.Thread(target=close_at_once, daemon=True).start()
+        with self.assertRaises(pod.ApiError) as cm:
+            pod.request("GET", "http://127.0.0.1:{}/x".format(srv.getsockname()[1]), timeout=10)
+        srv.close()
+        self.assertEqual(cm.exception.code, 0)
+        self.assertTrue(cm.exception.detail.startswith("the connection was closed before the answer"), cm.exception.detail)
 
     def test_api_error_timeout_hint(self):
         e = pod.ApiError(0, "timed out after 30 s (no answer)", "u")
@@ -1183,7 +1230,7 @@ class EndToEnd(unittest.TestCase):
                       "pull_seconds": 0, "logs_hang_for": 0, "boot": None, "no_5090": False, "maint_dcs": set(),
                       "maint_community": False, "graphql_down": False, "full_dcs": set(), "pro6000_dcs": None,
                       "balance": 212.40, "files": {}, "catalog_reads": 0, "schedule": {},
-                      "history_3d": False, "outfiles": None, "refuse": {}, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": [], "runs": []})
+                      "history_3d": False, "outfiles": None, "refuse": {}, "put_fail": {}, "blips": 0, "jfs": {}, "jdirs": {"", "workspace"}, "kernels": [], "web_gets": [], "runs": []})
         self.home = tempfile.mkdtemp(prefix="ainvfx-test-")
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, TZ="America/Toronto", RUNPOD_API_KEY="fake-key",
                         AINVFX_OUTPUTS=os.path.join(self.home, "outputs"),
@@ -1191,7 +1238,7 @@ class EndToEnd(unittest.TestCase):
                         AINVFX_PROXY_FMT="http://127.0.0.1:%d/proxy/{id}/{port}" % self.port,
                         AINVFX_STREAM_MAX_AGE="4", AINVFX_PROXY_POLL="3", AINVFX_STATUS_POLL="3",
                         AINVFX_PULL_SUMMARY="2", AINVFX_HEARTBEAT="4", AINVFX_STALL_MINUTES="0.1",
-                        AINVFX_STREAM_IDLE="2", AINVFX_HOST_WAIT="3",
+                        AINVFX_STREAM_IDLE="2", AINVFX_HOST_WAIT="3", AINVFX_SEND_RETRY="0",
                         AINVFX_GRAPHQL="http://127.0.0.1:{}/graphql".format(self.port),
                         AINVFX_SETTINGS=os.path.join(self.home, "settings.env"))
         with open(self.env["AINVFX_SETTINGS"], "w", encoding="utf-8") as f:
@@ -1592,8 +1639,10 @@ class EndToEnd(unittest.TestCase):
         for d in ("workspace/ComfyUI", "workspace/ComfyUI/output", "workspace/ComfyUI/output/train",
                   "workspace/ComfyUI/output/train/p1"):
             STATE["jdirs"].add(d)
+        STATE["put_fail"] = {"workspace/ComfyUI/output/train/p1/prompts.txt": 1}   # the send fails once, then goes
         out, rc = self.run_pod("train", "ltx_mix", "p1", "--dataset", "oldspace")
         self.assertEqual(rc, 0, out)
+        self.assertIn("sending train/p1/prompts.txt failed (error 502 (Bad Gateway), with no explanation): try 2 of 3", out)
         sent = "workspace/ComfyUI/output/train/p1/"
         self.assertEqual(bytes(STATE["jfs"][sent + "prompts.txt"]), b"# head\nmy prompt\n", out)
         self.assertNotIn(sent + "dataset.toml", STATE["jfs"], out)
@@ -1757,6 +1806,94 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("push", "--dataset", "../up", ds)
         self.assertNotEqual(rc, 0, out)
         self.assertIn("folder name", out, out)
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
+    def test_a_file_sent_to_the_pod_is_tried_three_times(self):
+        """19 Nov 2026: push --dataset stopped at its 16th file, on an error with no text (« sending still_19.jpg
+        failed: »), on a pod that was READY. Each file sent is now tried three times, with a line for each try that
+        fails. After three failures the message names the file, gives the reason, and says to type the command again,
+        which skips the files already sent. push --lora works the same way."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        ds = os.path.join(self.home, "stills")
+        os.makedirs(ds)
+        for n in (17, 18, 19):
+            with open(os.path.join(ds, "still_%d.jpg" % n), "wb") as f:
+                f.write(b"\xff\xd8" + bytes([n]) * 50)
+        top = "workspace/dataset/stills/"
+        STATE["put_fail"] = {top + "still_18.jpg": 1}               # fails once, then goes
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("  sending still_18.jpg failed (error 502 (Bad Gateway), with no explanation): try 2 of 3\n", out)
+        self.assertIn("3 file(s) sent, 0 unchanged", out)
+        self.assertEqual(sorted(STATE["jfs"]), [top + "still_17.jpg", top + "still_18.jpg", top + "still_19.jpg"], out)
+        with open(os.path.join(ds, "still_19.jpg"), "ab") as f:
+            f.write(b"more")                                         # a new size: it goes again
+        with open(os.path.join(ds, "still_20.jpg"), "wb") as f:
+            f.write(b"\xff\xd8 the last one")
+        STATE["put_fail"] = {top + "still_19.jpg": 3}               # fails three times
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("try 2 of 3", out)
+        self.assertIn("try 3 of 3", out)
+        self.assertIn("ERROR: sending still_19.jpg failed 3 times: error 502 (Bad Gateway), with no explanation. Type the "
+                      "same command again: it skips the files already sent.", out)
+        self.assertFalse([line for line in out.splitlines() if line.rstrip().endswith(":")], out)
+        self.assertEqual(len(STATE["jfs"][top + "still_19.jpg"]), 52, "the file that failed is left as it was")
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)    # the same command again
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 file(s) sent, 2 unchanged", out)
+        lora = os.path.join(self.home, "mine.safetensors")
+        with open(lora, "wb") as f:
+            f.write(b"lora weights" * 10)
+        STATE["put_fail"] = {"workspace/ComfyUI/models/loras/mine.safetensors": 1}
+        out, rc = self.run_pod("push", "--lora", lora)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("  sending mine.safetensors failed (error 502 (Bad Gateway), with no explanation): try 2 of 3", out)
+        self.assertEqual(bytes(STATE["jfs"]["workspace/ComfyUI/models/loras/mine.safetensors"]), b"lora weights" * 10)
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
+    def test_a_ready_pod_that_does_not_answer_lost_its_connection(self):
+        """19 Nov 2026: right after a failed push, the same command said « the pod does not answer yet: wait for READY »,
+        about a pod that was READY: its address had failed once. The address is now asked three times before
+        concluding. A pod seen at READY that still does not answer has lost its connection, and the message says so;
+        « wait for READY » stays for a pod never seen at READY."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        ds = os.path.join(self.home, "stills")
+        os.makedirs(ds)
+        with open(os.path.join(ds, "still_01.jpg"), "wb") as f:
+            f.write(b"\xff\xd8 a still")
+        STATE["blips"] = 1                                           # the address fails once
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 file(s) sent", out)
+        STATE["blips"] = 3                                           # three times: every try
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)
+        self.assertNotEqual(rc, 0, out)
+        name = STATE["pods"]["fakepod1"]["name"]
+        self.assertIn("ERROR: the pod {} reached READY, and its address did not answer 3 times: the connection to the pod "
+                      "is lost for now.".format(name), out)
+        self.assertNotIn("wait for READY", out)
+        cfg_path = os.path.join(self.home, ".ainvfx-runpod", "config.json")
+        cfg = json.loads(read_text(cfg_path))
+        for rec in cfg["pods"].values():
+            rec.pop("ready", None)                                   # a pod this computer never saw at READY
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        STATE["blips"] = 3
+        out, rc = self.run_pod("push", "--dataset", "stills", ds)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("the pod does not answer yet: wait for READY", out)
+        STATE["blips"] = 0
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 

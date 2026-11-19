@@ -162,8 +162,10 @@ RUN_STALE = env_num("AINVFX_RUN_STALE", "300")             # a run in progress m
                                                            # record stands still this long has died without a word
 RUN_NOTE = env_num("AINVFX_RUN_NOTE", "600")               # seconds between two "in progress" lines of the wait
 PULL_EVERY = max(0, env_num("AINVFX_PULL_EVERY", "300"))   # `down --when-done`: seconds between two pulls during the wait
-PULL_TRIES = 3                                             # `down`: how many times its last pull tries what did not come
-PULL_RETRY = max(0, env_num("AINVFX_PULL_RETRY", "20"))    # and the seconds between two tries
+TRIES = 3                                                  # a file sent to the pod, the pod's address, `down`'s last
+                                                           # pull: how many times each is tried before pod.py gives up
+PULL_RETRY = max(0, env_num("AINVFX_PULL_RETRY", "20"))    # `down`: seconds between two tries of its last pull
+SEND_RETRY = max(0, env_num("AINVFX_SEND_RETRY", "5"))     # seconds between two tries of a file sent, or of the address
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -444,15 +446,20 @@ def api_key(cfg):
 
 # ----------------------------------------------------------------------------- HTTP
 class ApiError(Exception):
-    """Every HTTP or network failure. Code 0 means no HTTP answer (no network, refused, timed out)."""
+    """Every HTTP or network failure. Code 0 means no HTTP answer (no network, refused, timed out). `detail` always
+    gives a reason in words: an answer without text gets its code and the code's name, a failure that names nothing
+    gets "no answer"."""
     def __init__(self, code, text, url):
-        self.code, self.detail, self.errors, self.retry_after = code, text, None, None
+        self.code, self.detail, self.errors, self.retry_after, self.url = code, text, None, None, url
         try:                       # Runpod errors are application/problem+json: title, status, detail, errors
             prob = json.loads(text)
             self.detail = prob.get("detail") or prob.get("title") or text
             self.errors = prob.get("errors")
         except (ValueError, AttributeError):
             pass
+        if not str(self.detail or "").strip():
+            self.detail = ("error {} ({}), with no explanation".format(code, http.client.responses.get(code, "no name"))
+                           if code else "no answer")
         super().__init__("HTTP {} on {}: {}".format(code, url, self.detail))
 
     @property
@@ -470,9 +477,42 @@ class ApiError(Exception):
             return "Too many requests: the Runpod API allows 180 a minute and 3,600 an hour per account; wait a minute, then try again."
         if self.code == 0 and self.timed_out:
             return "The server accepted the request but did not answer in time: a host that is not responding, or a slow link. Try again; `python pod.py status` shows the pod."
-        if self.code == 0:
+        if self.code == 0 and (self.url or "").startswith((API, GRAPHQL)):
             return "No network, or api.runpod.io unreachable from this machine."
+        if self.code == 0:
+            return "No network, or {} cannot be reached from this computer.".format(
+                urllib.parse.urlsplit(self.url or "").netloc or "the address")
         return ""
+
+    def hint_line(self):
+        """The hint on a line of its own, or nothing when there is none."""
+        hint = self.hint()
+        return "\n" + hint if hint else ""
+
+    def explain(self):
+        """The error, then its hint when it has one."""
+        return str(self) + self.hint_line()
+
+
+def plain_failure(err):
+    """A failed connection in plain words: what happened, then the system's own words when it gives any."""
+    if not isinstance(err, BaseException):
+        return str(err or "").strip() or "no answer"                     # urllib can give its reason as text
+    if isinstance(err, ConnectionRefusedError):
+        cause = "the connection was refused"
+    elif isinstance(err, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, http.client.IncompleteRead,
+                          http.client.RemoteDisconnected)):
+        cause = "the connection was closed before the answer"
+    elif isinstance(err, (socket.timeout, TimeoutError)):
+        cause = "no answer in time"
+    elif isinstance(err, socket.gaierror):
+        cause = "the address was not found: no network, or no name server"
+    elif type(err).__name__.startswith("SSL"):
+        cause = "the secure connection failed"
+    else:
+        cause = "no answer"
+    words = str(err).strip()
+    return "{} ({}{})".format(cause, type(err).__name__, ": " + words if words else "")
 
 
 def request(method, url, key=None, body=None, timeout=60, raw=False, headers=None, stream=False, data=None):
@@ -509,11 +549,11 @@ def _request_once(method, url, key, body, timeout, raw, headers, stream, data):
     except urllib.error.URLError as e:
         if isinstance(e.reason, (socket.timeout, TimeoutError)):
             raise ApiError(0, "timed out after {} s (connecting)".format(timeout), url)
-        raise ApiError(0, str(e.reason), url)
+        raise ApiError(0, plain_failure(e.reason), url)
     except (socket.timeout, TimeoutError):
         raise ApiError(0, "timed out after {} s (no answer)".format(timeout), url)
     except (OSError, http.client.HTTPException) as e:
-        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
+        raise ApiError(0, plain_failure(e), url)
     if stream:
         return r
     try:
@@ -522,7 +562,7 @@ def _request_once(method, url, key, body, timeout, raw, headers, stream, data):
     except (socket.timeout, TimeoutError):
         raise ApiError(0, "timed out after {} s (reading the answer)".format(timeout), url)
     except (OSError, http.client.HTTPException) as e:
-        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
+        raise ApiError(0, plain_failure(e), url)
     if raw:
         return payload
     if not payload:
@@ -569,6 +609,35 @@ def comfy_alive(pod_id):
         return True
     except ApiError:
         return False
+
+
+def pod_answers(pod_id):
+    """True when the pod's ComfyUI answers. A pod's address can fail for a moment, and one failure proves nothing: it
+    is asked up to TRIES times, SEND_RETRY seconds apart."""
+    for attempt in range(TRIES):
+        if attempt:
+            time.sleep(SEND_RETRY)
+        if comfy_alive(pod_id):
+            return True
+    return False
+
+
+def pod_silent(rec):
+    """Why the pod does not answer, as one message: a pod seen at READY has lost its connection for now; a pod never
+    seen at READY is still starting."""
+    if rec.get("ready"):
+        return ("the pod {} reached READY, and its address did not answer {} times: the connection to the pod is lost "
+                "for now. Check this computer's network, then type the same command again; `python pod.py status` "
+                "shows the pod.".format(rec.get("name") or rec["id"], TRIES))
+    return "the pod does not answer yet: wait for READY (`python pod.py status`)."
+
+
+def seen_ready(rec):
+    """Notes in the pod's record that pod.py saw it at READY: from then on, a pod that does not answer has lost its
+    connection, and is not still starting."""
+    if not rec.get("ready"):
+        rec["ready"] = True
+        keep_record(rec)
 
 
 # ----------------------------------------------------------------------------- where the person is
@@ -787,7 +856,7 @@ def read_catalogs(cfg, community, fatal=True):
             if cloud == "SECURE":
                 if not fatal:
                     raise
-                die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
+                die("the Runpod catalog could not be read ({}: {}).{}".format(e.code, e.detail[:200], e.hint_line()))
             if fatal:
                 say("Community Cloud catalog not readable ({}): Secure Cloud only.".format(e.code))
     return catalogs
@@ -1320,7 +1389,7 @@ def create_pod(cfg, body, where):
         except ApiError as e:
             if e.code in (401, 402, 404, 422):
                 detail = e.detail if not e.errors else "{} {}".format(e.detail, json.dumps(e.errors)[:400])
-                die("{}: {}\n{}".format(e.code, detail, e.hint()))
+                die("{}: {}{}".format(e.code, detail, e.hint_line()))
             if e.code >= 500 and attempt < 2:
                 say("   {}: Runpod error {}, retrying".format(where, e.code))
                 time.sleep(5)
@@ -1409,7 +1478,7 @@ def wait_for_stock(cfg, args, tag, wants, named, spec, region, country, max_pric
                 catalogs = read_catalogs(cfg, args.community, fatal=False)
             except ApiError as e:
                 if e.code in (401, 403):
-                    die("the Runpod catalog could not be read ({}: {}).\n{}".format(e.code, e.detail[:200], e.hint()))
+                    die("the Runpod catalog could not be read ({}: {}).{}".format(e.code, e.detail[:200], e.hint_line()))
                 if time.time() - last_note >= RETRY_NOTE:
                     say("   {}  the catalog could not be read ({}): still waiting".format(now, e.code or e.detail[:80]))
                     last_note = time.time()
@@ -1471,7 +1540,7 @@ def cmd_setup(args):
     try:
         pods = list_pods(cfg)
     except ApiError as e:
-        die("the key does not work: {}\n{}".format(e, e.hint()))
+        die("the key does not work: " + e.explain())
     say("   ok ({} pod(s) in the account right now)".format(len(pods)))
 
     guess_region, guess_country = local_place()
@@ -1585,7 +1654,7 @@ def cmd_up(args):
                 return
         except ApiError as e:
             if e.code != 404:
-                die("{}\n{}".format(e, e.hint()))
+                die(e.explain())
         remember_pod(cfg, tag, None)
 
     region = args.region or cfg.get("region") or local_place()[0]
@@ -1719,7 +1788,8 @@ def cmd_up(args):
 
     pod_id = created["id"]
     created_at = datetime.now(timezone.utc)
-    remember_pod(cfg, tag, {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()})
+    rec = {"id": pod_id, "name": name, "profile": profile, "created": created_at.isoformat()}
+    remember_pod(cfg, tag, rec)
     say("\nWaiting for the machine (PROVISIONING, STARTING, then RUNNING)...")
     pod = wait_running(cfg, pod_id, created, profile)
     gpu, dc, price = pod_summary(pod)
@@ -1744,6 +1814,7 @@ def cmd_up(args):
     say("\nWhen you are done:  python pod.py down {}".format(tag))
     if not ready:
         sys.exit(1)
+    seen_ready(rec)
     ready_next(cfg, tag, profile)
 
 
@@ -1795,6 +1866,7 @@ def cmd_logs(args):
         say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(tag))
         sys.exit(130)
     if ready:
+        seen_ready(rec)
         ready_next(cfg, tag, rec.get("profile") or "")
 
 
@@ -1806,7 +1878,7 @@ def cmd_status(args):
     except ApiError as e:
         if e.code == 404:
             die("the pod no longer exists on Runpod (terminated from the console?). Run `up` for a new one.")
-        die("{}\n{}".format(e, e.hint()))
+        die(e.explain())
     gpu, dc, _ = pod_summary(pod)
     st = pod_status(pod)
     say("`{}` · {} · {} · {} · CUDA {} · {}".format(tag, rec.get("name"), gpu, dc, pod.get("cudaVersion") or "?", st))
@@ -1893,15 +1965,14 @@ def cmd_push(args):
     _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
     if args.dataset:
         return push_dataset(rec, args.dataset, files)
-    if not comfy_alive(rec["id"]):
-        die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
+    if not pod_answers(rec["id"]):
+        die(pod_silent(rec))
     for f in files:
         body, ctype = multipart({"overwrite": "true", "type": "input"}, "image", f)
-        try:
-            request("POST", pod_url(rec["id"]) + "/upload/image", data=body, headers={"Content-Type": ctype}, timeout=600, raw=True)
-            say("  {}  ({:.1f} MB) -> input/".format(f.name, f.stat().st_size / 1e6))
-        except ApiError as e:
-            die("sending {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
+        send_tries("sending " + f.name, lambda: request("POST", pod_url(rec["id"]) + "/upload/image", data=body,
+                                                          headers={"Content-Type": ctype}, timeout=600, raw=True),
+                   again="Type the same command again.")
+        say("  {}  ({:.1f} MB) -> input/".format(f.name, f.stat().st_size / 1e6))
     say("Done. The files are in the lists of the Load Image and Load Video nodes.")
 
 
@@ -2051,12 +2122,31 @@ def digest(raw):
     return hashlib.sha256(clean_text(raw)).hexdigest()
 
 
+def jupyter_reach(rec, without=""):
+    """((JupyterLab's address, headers with the token of the READY line), None), or (None, the message that says
+    why): pod_silent for a pod that does not answer, or no token in its log (not READY yet, or no JupyterLab),
+    followed by `without`. The address is asked up to TRIES times, SEND_RETRY seconds apart: a pod's proxy can fail
+    for a moment."""
+    pod_id, answered = rec["id"], False
+    for attempt in range(TRIES):
+        if attempt:
+            time.sleep(SEND_RETRY)
+        if comfy_alive(pod_id):
+            answered = True
+            token = jupyter_token(proxy_log(pod_id))
+            if token:
+                seen_ready(rec)
+                return (pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}), None
+    if not answered:
+        return None, pod_silent(rec)
+    return None, "no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab.{}".format(
+        " " + without if without else "")
+
+
 def jupyter_link(rec):
     """(base address, headers) of the pod's JupyterLab, with the token of the READY line; None when it does not
-    answer."""
-    pod_id = rec["id"]
-    token = jupyter_token(proxy_log(pod_id)) if comfy_alive(pod_id) else None
-    return (pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}) if token else None
+    answer (jupyter_reach)."""
+    return jupyter_reach(rec)[0]
 
 
 def jupyter_read(base, hdrs, path):
@@ -2135,14 +2225,15 @@ def dataset_names(refs):
 
 def dataset_top(base, hdrs, name):
     """A dataset's folder as the pod's JupyterLab names it (workspace/dataset/<n>, or dataset/<n>); None when the
-    pod has no such folder."""
+    pod has no such folder. Any other failure is an ApiError: a folder that did not answer is not a folder missing."""
     for top in DATASET_DIRS:
         try:
             if request("GET", base + "/api/contents/" + urllib.parse.quote(top + "/" + name) + "?content=0", headers=hdrs,
                        timeout=60).get("type") == "directory":
                 return top + "/" + name
-        except ApiError:
-            pass
+        except ApiError as e:
+            if e.code != 404:
+                raise
     return None
 
 
@@ -2202,29 +2293,47 @@ def send_captions(cfg, tag, rec, names):
                 edited.append((name, rel, f, mine))
     if not edited:
         return
-    link = jupyter_link(rec)
+    link, why = jupyter_reach(rec)
     if not link:
-        die("the pod's JupyterLab does not answer, so the {} caption(s) edited on this computer cannot be sent to the pod. "
-            "`python pod.py status` shows the pod; then run the same command again.".format(len(edited)))
+        die("{} The {} caption(s) edited on this computer are not sent: nothing started.".format(why, len(edited)))
     base, hdrs = link
     tops, sent = {}, []
+
+    def send_one(path, mine):
+        """The caption goes when the pod's copy differs: True when sent."""
+        theirs = jupyter_read(base, hdrs, path)
+        if theirs is not None and digest(theirs) == digest(mine):
+            return False
+        jupyter_upload(base, hdrs, path, None, clean_text(mine))
+        return True
     for name, rel, f, mine in edited:
         if name not in tops:
-            tops[name] = dataset_top(base, hdrs, name)
+            tops[name] = send_tries("reading the folder of the dataset " + name, lambda: dataset_top(base, hdrs, name))
         if not tops[name]:
             continue                                      # no such dataset on the pod: the pod's train says so
-        theirs = jupyter_read(base, hdrs, tops[name] + "/" + rel)
-        if theirs is None or digest(theirs) != digest(mine):
-            try:
-                jupyter_upload(base, hdrs, tops[name] + "/" + rel, None, clean_text(mine))
-            except ApiError as e:
-                die("sending {} failed: {}\n{}".format(f, e.detail[:200], e.hint()))
+        if send_tries("sending {}/{}".format(name, rel), lambda: send_one(tops[name] + "/" + rel, mine)):
             sent.append(f)
         record[name + "/" + rel] = digest(mine)
     if sent:
         say("{} caption(s) edited on this computer sent to the pod: {}{}".format(
             len(sent), ", ".join(x.name for x in sent[:6]), " and {} more".format(len(sent) - 6) if len(sent) > 6 else ""))
     remember_pod(cfg, tag, rec)
+
+
+def send_tries(what, action, again="Type the same command again: it skips the files already sent."):
+    """action() tried up to TRIES times, SEND_RETRY seconds apart, for one file sent to the pod (`what`: "sending
+    still_19.jpg"): a pod's address can fail for a moment. A try that fails says so, with the reason and the number of
+    the next try. After the last, the command stops with the reason, then `again`. Returns what action returns."""
+    for attempt in range(1, TRIES + 1):
+        try:
+            return action()
+        except ApiError as e:
+            reason = e.detail[:200].rstrip(". ")
+            if attempt == TRIES:
+                die("{} failed {} times: {}. {}".format(what, TRIES, reason, again))
+            say("  {} failed ({}): try {} of {}{}".format(what, reason, attempt + 1, TRIES,
+                                                          " in {} s".format(SEND_RETRY) if SEND_RETRY else ""))
+            time.sleep(SEND_RETRY)
 
 
 def jupyter_upload(base, hdrs, path, local, data=None, progress=None):
@@ -2302,14 +2411,11 @@ def push_to_models(args):
 def push_models(rec, folder, paths):
     """Model files into ComfyUI's models/<folder>/, through the pod's JupyterLab, in chunks renamed at the end; a
     file already there with the same size is skipped."""
-    pod_id = rec["id"]
-    if not comfy_alive(pod_id):
-        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
-    token = jupyter_token(proxy_log(pod_id))
-    if not token:
-        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A model file "
-            "from this computer goes up through JupyterLab; a web address does not need it.")
-    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    link, why = jupyter_reach(rec, "A model file from this computer is sent through JupyterLab; a web address does "
+                                   "not need it.")
+    if not link:
+        die(why)
+    base, hdrs = link
     try:      # JupyterLab's root is / on Runpod's current images, /workspace on older ones
         top = "workspace/ComfyUI" if request("GET", base + "/api/contents/workspace?content=0", headers=hdrs,
                                              timeout=30).get("type") == "directory" else "ComfyUI"
@@ -2319,8 +2425,10 @@ def push_models(rec, folder, paths):
     there = dict(jupyter_tree(base, hdrs, dest) or [])
     parts = dest.split("/")
     for i in range(1, len(parts) + 1):     # every level, as push --dataset does: a folder already there is kept
-        request("PUT", base + "/api/contents/" + urllib.parse.quote("/".join(parts[:i])), body={"type": "directory"},
-                headers=hdrs, timeout=60)
+        folder_path = "/".join(parts[:i])
+        send_tries("sending the folder " + folder_path, lambda: request(
+            "PUT", base + "/api/contents/" + urllib.parse.quote(folder_path), body={"type": "directory"}, headers=hdrs,
+            timeout=60))
     sent = kept = done = 0
     t0, total = time.time(), sum(f.stat().st_size for f in paths)
     todo = sum(f.stat().st_size for f in paths if there.get(f.name) != f.stat().st_size)
@@ -2340,10 +2448,8 @@ def push_models(rec, folder, paths):
             kept += 1
             continue
         say("  {}  ({:.1f} MB) -> models/{}/".format(f.name, size / 1e6, folder))
-        try:
-            jupyter_upload(base, hdrs, dest + "/" + f.name, f, progress=lambda n, before=done: progress(before + n))
-        except ApiError as e:
-            die("sending {} failed: {}\n{}".format(f.name, e.detail[:200], e.hint()))
+        send_tries("sending " + f.name, lambda: jupyter_upload(base, hdrs, dest + "/" + f.name, f,
+                                                               progress=lambda n, before=done: progress(before + n)))
         sent += 1
         done += size
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> models/{}".format(sent, kept, total / 1e6,
@@ -2358,14 +2464,10 @@ def push_dataset(rec, name, paths):
     plan = dataset_plan(paths)
     if not plan:
         die("nothing to send: the folders hold no files (hidden ones stay behind)")
-    pod_id = rec["id"]
-    if not comfy_alive(pod_id):
-        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
-    token = jupyter_token(proxy_log(pod_id))
-    if not token:
-        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab. A training "
-            "dataset goes up through JupyterLab.")
-    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    link, why = jupyter_reach(rec, "A training dataset is sent through JupyterLab.")
+    if not link:
+        die(why)
+    base, hdrs = link
     try:      # JupyterLab's root is / on Runpod's current images, /workspace on older ones
         top = "workspace/dataset" if request("GET", base + "/api/contents/workspace?content=0", headers=hdrs,
                                              timeout=30).get("type") == "directory" else "dataset"
@@ -2378,8 +2480,8 @@ def push_dataset(rec, name, paths):
         parts = rel.split("/")[:-1]
         folders.update("/".join([dest] + parts[:i]) for i in range(1, len(parts) + 1))
     for d in sorted(folders, key=lambda x: x.count("/")):
-        request("PUT", base + "/api/contents/" + urllib.parse.quote(d), body={"type": "directory"}, headers=hdrs,
-                timeout=60)
+        send_tries("sending the folder " + d, lambda: request("PUT", base + "/api/contents/" + urllib.parse.quote(d),
+                                                              body={"type": "directory"}, headers=hdrs, timeout=60))
     total = sum(f.stat().st_size for f, _ in plan)
     sent = kept = done = 0
     t0 = last = time.time()
@@ -2389,10 +2491,8 @@ def push_dataset(rec, name, paths):
         if not text and there.get(rel) == size:
             kept += 1
         else:
-            try:
-                jupyter_upload(base, hdrs, dest + "/" + rel, local, clean_text(local.read_bytes()) if text else None)
-            except ApiError as e:
-                die("sending {} failed: {}\n{}".format(rel, e.detail[:200], e.hint()))
+            send_tries("sending " + rel, lambda: jupyter_upload(base, hdrs, dest + "/" + rel, local,
+                                                               clean_text(local.read_bytes()) if text else None))
             sent += 1
         done += size
         if time.time() - last >= 5:
@@ -2659,14 +2759,10 @@ def kernel_run(rec, code, on_line, on_text=None, keep_running=False):
     on_text, each piece of text as it comes. The kernel is removed at the end, also on Ctrl+C, which stops what it
     was doing. With keep_running, a link that breaks before the code ends leaves the kernel on the pod, so the code
     goes on there, as a command does in JupyterLab's terminal when its browser tab closes."""
-    pod_id = rec["id"]
-    if not comfy_alive(pod_id):
-        die("the pod does not answer yet: wait for READY (`python pod.py status`).")
-    token = jupyter_token(proxy_log(pod_id))
-    if not token:
-        die("no JupyterLab token in the pod's log: the pod is not READY yet, or runs without JupyterLab, which this "
-            "command goes through.")
-    base, hdrs = pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}
+    link, why = jupyter_reach(rec, "This command goes through JupyterLab.")
+    if not link:
+        die(why)
+    base, hdrs = link
     kernel = request("POST", base + "/api/kernels", body={}, headers=hdrs, timeout=60).get("id")
     if not kernel:
         die("JupyterLab did not start a kernel on the pod. Try again in a minute.")
@@ -2710,7 +2806,7 @@ def kernel_run(rec, code, on_line, on_text=None, keep_running=False):
         raise
     except (OSError, ConnectionError) as e:
         broken = LinkBroken(0, "the connection to the pod was lost ({}). Run the command again: it skips the files already "
-                               "there.".format(e), base)
+                               "there.".format(plain_failure(e)), base)
         broken.started = sent
         raise broken
     finally:
@@ -2790,7 +2886,7 @@ def fetch_to(url, target, headers=None, timeout=600):
             part.unlink()
         except OSError:
             pass
-        raise ApiError(0, "{}: {}".format(type(e).__name__, e), url)
+        raise ApiError(0, plain_failure(e), url)
     return size
 
 
@@ -2997,13 +3093,13 @@ def wait_for_run(cfg, rec, pull_every=None):
 
 def pull_before_down(rec, run_ended):
     """The pull that comes before a pod is terminated, since its disk is erased with it. What did not come is tried
-    again, PULL_TRIES times in all, PULL_RETRY seconds apart. Returns what is still missing: the files skipped and,
+    again, TRIES times in all, PULL_RETRY seconds apart. Returns what is still missing: the files skipped and,
     after a training run (run_ended), the whole output folder when the pod or its JupyterLab did not answer."""
     count, missing = 0, []
-    for attempt in range(PULL_TRIES):
+    for attempt in range(TRIES):
         if attempt:
             say("  some files were not downloaded: try {} of {}{}".format(
-                attempt + 1, PULL_TRIES, " in {} s".format(PULL_RETRY) if PULL_RETRY else ""))
+                attempt + 1, TRIES, " in {} s".format(PULL_RETRY) if PULL_RETRY else ""))
             time.sleep(PULL_RETRY)
         report = {}
         count += pull(rec, report)
@@ -3070,7 +3166,7 @@ def cmd_down(args):
                 say("Terminated: {}".format(rec.get("name")))
         except ApiError as e:
             if e.code != 404:
-                die("{}\n{}".format(e, e.hint()))
+                die(e.explain())
             say("{}: no longer on Runpod.".format(rec.get("name")))
         remember_pod(cfg, tag, None)
     try:
@@ -3180,31 +3276,32 @@ def send_prepared(cfg, tag, rec, runs):
     """Before a run: each file of a prepared run that was changed on this computer since `train prep` downloaded it
     goes back to the pod, cleaned (clean_text), and replaces the pod's. A file not changed here is left alone."""
     record = rec.get("prepared") or {}
-    todo = [(run, name) for run in runs for name in sorted(record.get(run) or {})]
-    link = jupyter_link(rec) if todo else None
-    if not link:
+    edited = []
+    for run in runs:
+        for name in sorted(record.get(run) or {}):
+            local = outputs_of(rec) / "train" / run / name
+            try:
+                mine = local.read_bytes()
+            except OSError:
+                continue
+            if digest(mine) != record[run][name]:
+                edited.append((run, name, local, mine))
+    if not edited:
         return
+    link, why = jupyter_reach(rec)
+    if not link:
+        die("{} The run's files edited on this computer are not sent: the run did not start.".format(why))
     base, hdrs = link
-    sends = []
-    for run, name in todo:
-        local = outputs_of(rec) / "train" / run / name
-        try:
-            mine = local.read_bytes()
-        except OSError:
-            continue
-        if digest(mine) == record[run][name]:
-            continue
-        root, theirs = pod_output_file(base, hdrs, "train/{}/{}".format(run, name))
+    for run, name, local, mine in edited:
+        rel = "train/{}/{}".format(run, name)
+        root, theirs = send_tries("reading {} on the pod".format(rel), lambda: pod_output_file(base, hdrs, rel))
         if theirs is None:
             continue
-        if digest(theirs) == digest(mine):
-            record[run][name] = digest(mine)
-        else:
-            sends.append((run, name, root, local, mine))
-    for run, name, root, local, mine in sends:
-        jupyter_upload(base, hdrs, "{}/train/{}/{}".format(root, run, name), None, clean_text(mine))
+        if digest(theirs) != digest(mine):
+            send_tries("sending " + rel, lambda: jupyter_upload(base, hdrs, "{}/{}".format(root, rel), None,
+                                                                clean_text(mine)))
+            say("sent to the pod: {}".format(local))
         record[run][name] = digest(mine)
-        say("sent to the pod: {}".format(local))
     remember_pod(cfg, tag, rec)
 # `python pod.py train ...` is the pod's own `train` command, run with the same words in a kernel of the pod's
 # JupyterLab, as if typed in its terminal: Ctrl+C acts as it does there (a run that has started goes on, in a session
@@ -3504,7 +3601,7 @@ def main():
     try:
         args.func(args)
     except ApiError as e:
-        die("{}\n{}".format(e, e.hint()))
+        die(e.explain())
     except KeyboardInterrupt:
         say("\nStopped.")
         sys.exit(130)
