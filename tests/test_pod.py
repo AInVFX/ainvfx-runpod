@@ -1127,6 +1127,22 @@ class Helpers(unittest.TestCase):
         self.assertEqual(pod.train_target(pods, ["--help"]), (None, ["--help"]))
         self.assertEqual(pod.train_target({}, []), (None, []))
 
+    def test_train_output_holds_the_next_line_for_the_end(self):
+        """The pod's last line names the next command: it is held back, so that what pod.py does after the command comes
+        before it. A Next line followed by more output was not the last one: it shows in its place."""
+        shown = []
+        out = pod.TrainOutput(shown.append)
+        out.feed("a line\nNext:  python pod.py train log   (follows it)\n\x1eainvfx-exit 0\n")
+        out.finish()
+        self.assertEqual(("".join(shown), out.code), ("a line\n", 0))
+        out.release()
+        self.assertEqual("".join(shown), "a line\nNext:  python pod.py train log   (follows it)\n")
+        shown.clear()
+        out = pod.TrainOutput(shown.append)
+        out.feed("Next:  python pod.py down --when-done   (x)\n")
+        out.feed("[AINVFX] the log\n")
+        self.assertEqual("".join(shown), "Next:  python pod.py down --when-done   (x)\n[AINVFX] the log\n")
+
     def test_train_output_shows_progress_and_keeps_the_exit_code_apart(self):
         """The pod's train output comes in pieces: a progress line that ends with \\r shows as soon as it ends, the signs
         of life (\\x1e) never show, and the exit code is read even when its line comes in two pieces."""
@@ -1246,9 +1262,11 @@ class EndToEnd(unittest.TestCase):
                              "BTC2/D6_E2_mesh_00001_.glb": b"glTF fake mesh",
                              "loras/jar/jar_lora_000250.safetensors": b"fake lora weights",
                              "_output_images_will_be_put_here": b""}
+        self.assertTrue(out.rstrip().endswith("Next:  python pod.py open   (opens ComfyUI in your browser)"), out)
         out, rc = self.run_pod("pull")
         self.assertEqual(rc, 0, out)
         self.assertIn("3 file(s) new", out, out)
+        self.assertNotIn("Next:", out, out)
         self.assertNotIn("JupyterLab did not answer", out, out)
         got = {os.path.relpath(os.path.join(r, f), os.path.join(self.home, "outputs")).replace(os.sep, "/").split("/", 1)[1]
                for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs}
@@ -1340,6 +1358,9 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(here("jar_step250.png"), out)
         self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
+        last = out.rstrip().splitlines()[-1]
+        self.assertTrue(last.startswith("Next:  uvx tensorboard --logdir "), out)
+        self.assertIn(os.path.join("train", "jar", "sample"), last, out)
 
     def test_down_keeps_a_pod_whose_files_did_not_all_come(self):
         """Terminating a pod erases its disk, so the pull that comes first tries again what did not come, three times
@@ -1431,6 +1452,7 @@ class EndToEnd(unittest.TestCase):
         fake = os.path.join(self.home, "train")
         with open(fake, "w") as f:
             f.write("#!%s\nimport sys\nprint('args:', ' '.join(sys.argv[1:]))\nprint(' 50%%', end='\\r')\n"
+                    "print('Next:  python pod.py train later   (why)')\n"
                     "sys.exit(3 if sys.argv[1:2] == ['fail'] else 0)\n" % sys.executable)
         os.chmod(fake, 0o755)
         self.env["AINVFX_POD_TRAIN"] = fake
@@ -1439,6 +1461,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("args: caption mydata --trigger myword", out, out)
         self.assertNotIn("ainvfx-exit", out, out)
         self.assertNotIn("\x1e", out, out)
+        self.assertEqual(out.rstrip().splitlines()[-1], "Next:  python pod.py train later   (why)", out)
         out, rc = self.run_pod("train", "fail")
         self.assertEqual(rc, 3, out)
         out, rc = self.run_pod("train", "--help")
@@ -1592,6 +1615,15 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("train caption mychar --trigger", out, out)
         out, rc = self.run_pod("push", "--dataset", "mychar", ds)
         self.assertIn("1 file(s) sent, 2 unchanged", out, out)
+        ready = os.path.join(self.home, "ready")                     # every image has its caption: the run comes next
+        os.makedirs(ready)
+        for rel, data in (("x.png", b"\x89PNG"), ("x.txt", b"mychr, a test\n")):
+            with open(os.path.join(ready, rel), "wb") as f:
+                f.write(data)
+        out, rc = self.run_pod("push", "--dataset", "ready", ready)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  python pod.py train <recipe> <run> --dataset "
+                                                                  "ready   ("), out)
         out, rc = self.run_pod("push", "--dataset", "../up", ds)
         self.assertNotEqual(rc, 0, out)
         self.assertIn("folder name", out, out)

@@ -229,7 +229,7 @@ VIA = os.environ.get("AINVFX_TRAIN_VIA", "")   # "python pod.py " when the words
 def as_typed(msg):
     """A message as its reader types it: when the command came through `python pod.py train`, every train command
     that the message names starts with those words too."""
-    return re.sub(r"(`|A run:  |\()train ", lambda m: m.group(1) + VIA + "train ", str(msg)) if VIA else msg
+    return re.sub(r"(`|Next:  |\()train ", lambda m: m.group(1) + VIA + "train ", str(msg)) if VIA else msg
 
 
 def say(msg=""):
@@ -239,6 +239,27 @@ def say(msg=""):
 def die(msg, code=2):
     print("\nERROR: " + as_typed(msg), file=sys.stderr, flush=True)
     sys.exit(code)
+
+
+def next_line(command, why, computer=False):
+    """The last line of a command's output: the command to type next, then why, in a few words. A command of the
+    computer (push, pull, down) is introduced as one when the words were typed on the pod."""
+    say("Next:  {}{}   ({})".format("on your computer, " if computer and not VIA else "", command, why))
+
+
+def dataset_name(ref):
+    """The dataset that a command names: a dataset config (.toml) as it is; else the first folder under
+    /workspace/dataset, since a sub-folder such as NAME/images belongs to the dataset NAME."""
+    if ref.endswith(".toml"):
+        return ref
+    p = Path(ref)
+    if p.is_absolute():
+        try:
+            return p.relative_to(DATASETS).parts[0]
+        except (ValueError, IndexError):
+            return ref
+    parts = [x for x in p.parts if x not in (".", "")]
+    return parts[0] if parts else ref
 
 
 def duration(secs):
@@ -1036,7 +1057,10 @@ def cmd_train(recipe, argv):
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run"], cwd=str(MUSUBI),
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     say("The run started in the background{}. Ctrl+C stops following the log, never the run; `train log` follows it "
-        "again.\n".format(" ({} stages)".format(len(stages)) if len(stages) > 1 else ""))
+        "again.".format(" ({} stages)".format(len(stages)) if len(stages) > 1 else ""))
+    next_line("python pod.py down --when-done", "in a second terminal: it downloads the run's files while the run goes "
+              "on, and terminates the pod when the run ends", computer=True)
+    say()
     return follow(proc)
 
 
@@ -1084,9 +1108,9 @@ def run_stage(recipe, st, i, n):
     return 0
 
 
-def follow(proc=None, tail=None):
+def follow(proc=None, tail=None, then_down=False):
     """Prints the run's log as it grows, stage after stage, until the run ends; returns its code. Ctrl+C stops the
-    printing only: the run goes on in the background."""
+    printing only: the run goes on in the background. With then_down, a run that ends well names `down` next."""
     stage, pos = None, None
     try:
         while True:
@@ -1112,7 +1136,7 @@ def follow(proc=None, tail=None):
                 stage, pos = stage + 1, 0
                 continue
             if job.get("state") not in ACTIVE:
-                return report_end(job)
+                return report_end(job, then_down)
             gone = proc.poll() is not None if proc else bool(job.get("pid")) and not alive(job["pid"])
             late = job.get("state") == "starting" and not job.get("pid") and time.time() - job.get("created", 0) > 60
             if gone or late:
@@ -1128,11 +1152,14 @@ def follow(proc=None, tail=None):
         return 130
 
 
-def report_end(job):
+def report_end(job, then_down=False):
     state, last = job.get("state"), job["stages"][job.get("stage", 0)]
     if state == "done":
         say("\nThe run is done{}. Its folder: {} (`python pod.py pull` brings it home).".format(
             ": {} stages".format(len(job["stages"])) if len(job["stages"]) > 1 else "", last["run"]))
+        if then_down:
+            next_line("python pod.py down", "it downloads the run's files, then terminates the pod; a down --when-done "
+                      "that waits does both", computer=True)
         return 0
     if state == "stopped":
         say("\nThe run was stopped. Its checkpoints stay in {}; `--from <checkpoint> --steps N` continues from one of "
@@ -1150,12 +1177,13 @@ def cmd_log(argv):
     if not read_job():
         say("No run on this pod yet. `train recipes` lists the recipes.")
         return 0
-    return follow(tail=6000)
+    return follow(tail=6000, then_down=True)
 
 
 def cmd_status(argv):
     argparse.ArgumentParser(prog="train status", description="Where the run stands.").parse_args(argv)
     job = read_job()
+    running = bool(job and job.get("stages") and active_job())
     if not job or not job.get("stages"):
         say("No run on this pod yet. `train recipes` lists the recipes.")
     else:
@@ -1180,6 +1208,8 @@ def cmd_status(argv):
     except (OSError, subprocess.SubprocessError):
         pass
     say("disk free: {:.0f} GB".format(shutil.disk_usage(ROOT).free / 1e9))
+    if running:
+        next_line("train log", "follows the run's log")
     return 0
 
 
@@ -1224,8 +1254,9 @@ def cmd_recipes(argv):
             "", sum(f["gb"] for f in files.values()), "on this pod" if on_pod else "downloaded by its first run",
             arg_value(r["args"], "--max_train_steps"), arg_value(r["args"], "--learning_rate"),
             arg_value(r["args"], "--network_dim")))
-    say("\nA run:  train <recipe> <run name> --dataset <a folder of /workspace/dataset, or a .toml>   "
-        "(train <recipe> -h lists the options)")
+    say()
+    next_line("train <recipe> <run> --dataset <dataset>", "a dataset is a folder of /workspace/dataset, or a .toml; "
+              "train <recipe> -h lists the options")
     return 0
 
 
@@ -1370,7 +1401,10 @@ def cmd_caption(argv):
     if a.dry_run:
         return 0
     word_report([f for t in targets for f in t["files"]], a.trigger)
-    say("Read every caption before training: the model makes mistakes, and a wrong word is learned like the others.")
+    say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
+        "wrong word is learned like the others.".format(", ".join(
+            "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))
+    next_line("train <recipe> <run> --dataset {}".format(dataset_name(a.datasets[0])), "train recipes lists the recipes")
     return 0
 
 

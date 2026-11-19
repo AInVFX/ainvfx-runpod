@@ -405,15 +405,35 @@ class Units(unittest.TestCase):
     def test_a_message_names_commands_as_its_reader_types_them(self):
         """Through `python pod.py train`, the pod's messages name every train command with those words; in the pod's own
         terminal they stay as they are."""
-        msg = "No run on this pod yet. `train recipes` lists the recipes. A run:  train <recipe> (train <recipe> -h)"
+        msg = "No run on this pod yet. `train recipes` lists the recipes.\nNext:  train <recipe> (train <recipe> -h)"
         self.assertEqual(train.as_typed(msg), msg)
         old, train.VIA = train.VIA, "python pod.py "
         try:
-            self.assertEqual(train.as_typed(msg), "No run on this pod yet. `python pod.py train recipes` lists the recipes. "
-                             "A run:  python pod.py train <recipe> (python pod.py train <recipe> -h)")
+            self.assertEqual(train.as_typed(msg), "No run on this pod yet. `python pod.py train recipes` lists the recipes."
+                             "\nNext:  python pod.py train <recipe> (python pod.py train <recipe> -h)")
             self.assertEqual(train.as_typed("the trainer, a train of thought"), "the trainer, a train of thought")
         finally:
             train.VIA = old
+
+    def test_the_next_line(self):
+        """One format for the next command: two spaces after Next:, three before the reason. A command of the computer
+        says so in the pod's terminal, and not when the words came from the computer (python pod.py train)."""
+        def lines():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                train.next_line("train log", "follows the run's log")
+                train.next_line("python pod.py down", "terminates the pod", computer=True)
+            return out.getvalue().splitlines()
+        self.assertEqual(lines(), ["Next:  train log   (follows the run's log)",
+                                   "Next:  on your computer, python pod.py down   (terminates the pod)"])
+        old, train.VIA = train.VIA, "python pod.py "
+        try:
+            self.assertEqual(lines(), ["Next:  python pod.py train log   (follows the run's log)",
+                                       "Next:  python pod.py down   (terminates the pod)"])
+        finally:
+            train.VIA = old
+        self.assertEqual([train.dataset_name(r) for r in ("x/images", str(train.DATASETS / "y" / "clips"), "c.toml", "./z")],
+                         ["x", "y", "c.toml", "z"])
 
     def test_the_caption_prompt_of_each_kind(self):
         """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is
@@ -520,6 +540,22 @@ class Runs(unittest.TestCase):
                 follower.kill()
                 follower.wait(timeout=30)
             follower.stdout.close()
+
+    def test_each_command_ends_with_the_next_one(self):
+        """The launch names `down --when-done` right after the run starts, and only there; `train log` names `down` when
+        the run it followed is done; `train recipes` names a run. Through python pod.py train, no « on your computer »."""
+        out, rc = self.run_train("zimage", "n1", "--dataset", "chars")
+        self.assertEqual(rc, 0, out)
+        lines = out.splitlines()
+        i = next(k for k, line in enumerate(lines) if line.startswith("The run started in the background"))
+        self.assertTrue(lines[i + 1].startswith("Next:  on your computer, python pod.py down --when-done   ("), out)
+        self.assertEqual(sum(line.startswith("Next:") for line in lines), 1, out)
+        out, rc = self.run_train("log")
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  on your computer, python pod.py down   ("), out)
+        out, rc = self.run_train("recipes")
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  train "), out)
+        out, rc = self.run_train("zimage", "n2", "--dataset", "chars", env={"AINVFX_TRAIN_VIA": "python pod.py "})
+        self.assertIn("\nNext:  python pod.py down --when-done   (", out)
 
     def test_caption_lists_what_it_would_write(self):
         out, rc = self.run_train("caption", "chars", "--trigger", "mychr", "--dry-run")

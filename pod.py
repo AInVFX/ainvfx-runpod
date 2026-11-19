@@ -133,6 +133,9 @@ UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per reques
                                                               # proxy's limit
 UPLOAD_NOTE = env_num("AINVFX_UPLOAD_NOTE", "10")           # seconds between two progress lines of a model file going up
 TEXT_SUFFIXES = (".txt", ".toml", ".json", ".jsonl", ".md", ".csv")
+DATASET_IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")   # train.py's IMAGES, VIDEOS and SOUNDS (test_repo)
+DATASET_VIDEOS = (".mp4", ".webm", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg")
+DATASET_SOUNDS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma")
 DATASET_SKIP = {"__MACOSX", "Thumbs.db", "desktop.ini"}       # left behind, as every hidden name
 DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 WEB_ADDRESS = re.compile(r"https?://", re.I)
@@ -1337,7 +1340,7 @@ def try_create(cfg, candidates, name, disk, env):
     template = cfg.get("template_id") or TEMPLATE_ID   # image, start command and ports come from the template
     for n, offer in enumerate(candidates):
         if n:
-            say("   Next: {}.".format(offer_line(offer)))
+            say("   Now trying: {}.".format(offer_line(offer)))
         for dc in (offer["dcs"] if offer["cloud"] == "SECURE" else [None]):
             body = {"name": name, "cloud": offer["cloud"], "disk": disk, "env": env, "templateId": template,
                     "startSsh": True, "startJupyter": True,
@@ -1502,7 +1505,7 @@ def cmd_setup(args):
     cfg.setdefault("pods", {})
     save_config(cfg)
     say("\nSaved in {} (readable by your account only).".format(CONFIG))
-    say("Next:  python pod.py up image")
+    say("Next:  python pod.py up image   (creates a pod for the image profile; README, \"Profiles\", lists the others)")
 
 
 def store_hf_secret(cfg, token):
@@ -1740,6 +1743,17 @@ def cmd_up(args):
     say("\nWhen you are done:  python pod.py down {}".format(tag))
     if not ready:
         sys.exit(1)
+    ready_next(cfg, tag, profile)
+
+
+def ready_next(cfg, tag, profile):
+    """The Next line of a pod at READY: a pod that trains takes a dataset, any other opens ComfyUI."""
+    pod = " " + tag if len(cfg.get("pods") or {}) > 1 else ""
+    if profile == "all" or "train" in profile.split("+"):
+        say("Next:  python pod.py push{} --dataset <name> <your folder>   (sends your images and clips to the pod, "
+            "for training)".format(pod))
+    else:
+        say("Next:  python pod.py open{}   (opens ComfyUI in your browser)".format(pod))
 
 
 def wait_running(cfg, pod_id, pod, profile):
@@ -1775,10 +1789,12 @@ def cmd_logs(args):
     except ApiError:
         pod = None
     try:
-        follow_logs(cfg, rec["id"], minutes=args.wait, pod=pod, created=parse_time(rec.get("created") or ""))
+        ready = follow_logs(cfg, rec["id"], minutes=args.wait, pod=pod, created=parse_time(rec.get("created") or ""))
     except KeyboardInterrupt:
         say("\nStopped following the log. The pod keeps running: `python pod.py down {}` terminates it.".format(tag))
         sys.exit(130)
+    if ready:
+        ready_next(cfg, tag, rec.get("profile") or "")
 
 
 def cmd_status(args):
@@ -1892,6 +1908,25 @@ def cmd_pull(args):
     _, rec = which_pod(load_config(), args.profile)
     n = pull(rec)
     say("{} file(s) new in {}".format(n, outputs_of(rec)))
+    tensorboard_next([outputs_of(rec)])
+
+
+def tensorboard_next(folders):
+    """The Next line once a training run's files are here: TensorBoard on the outputs folder, and where the samples
+    are. Nothing when none of these pods' folders holds a run."""
+    runs = sorted(d for f in folders for d in (f / "train").glob("*") if d.is_dir())
+    if not runs:
+        return
+
+    def shown(p):
+        try:
+            p = p.relative_to(Path.cwd())
+        except ValueError:
+            pass
+        return '"{}"'.format(p) if " " in str(p) else str(p)
+    samples = runs[0] / "sample" if len(runs) == 1 else runs[0].parent / "<run>" / "sample"
+    say("Next:  uvx tensorboard --logdir {}   (the loss curves, at http://localhost:6006; the samples are in {})".format(
+        shown(OUTPUTS), shown(samples)))
 
 
 # Pull reads two sources. (1) The whole output folder, walked through JupyterLab's contents API with the token
@@ -2182,7 +2217,14 @@ def push_dataset(rec, name, paths):
             say("   {}/{} files · {:.0f} of {:.0f} MB".format(k, len(plan), done / 1e6, total / 1e6))
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
         sent, kept, total / 1e6, time.time() - t0, name))
-    say("Next:  python pod.py train caption {} --trigger <word>   (README: Training a LoRA)".format(name))
+    media = [rel for _, rel in plan if rel.lower().endswith(DATASET_IMAGES + DATASET_VIDEOS)]
+    captions = {rel.rsplit(".", 1)[0] for _, rel in plan if rel.lower().endswith(".txt")}
+    if not media or any(rel.rsplit(".", 1)[0] not in captions for rel in media):
+        say("Next:  python pod.py train caption {} --trigger <word>   (writes a caption beside each image and clip that "
+            "has none)".format(name))
+    else:
+        say("Next:  python pod.py train <recipe> <run> --dataset {}   (each image and clip has its caption; python "
+            "pod.py train recipes lists the recipes)".format(name))
 
 # --------------------------------------------------------------------------- push from a web address
 # `push URL` makes the pod download by itself: nothing passes through the user's connection. pod.py starts a kernel in
@@ -2751,6 +2793,7 @@ def cmd_down(args):
     else:
         targets = [which_pod(cfg, args.profile)]
     names = ", ".join(r.get("name") or r["id"] for _, r in targets)
+    pulled = [] if args.no_pull else [outputs_of(r) for _, r in targets]
     if args.when_done:                                    # nothing to wait for must never read as "terminate now"
         run = read_run(targets[0][1]["id"])
         if not run_in_progress(run, 0):
@@ -2813,6 +2856,7 @@ def cmd_down(args):
     balance, _ = account_money(cfg)
     if balance is not None:
         say("Credit left on Runpod: {} (the last minutes may still be deducted).".format(fmt_money(balance)))
+    tensorboard_next(pulled)
 
 
 def cmd_list(args):
@@ -2917,11 +2961,12 @@ def show_text(text):
 class TrainOutput:
     """The output of the pod's `train`, shown as it comes: a line shows once it ends, with \n or with the \r of a
     progress bar. The signs of life never show, and the exit code is kept apart, even when its line comes in two
-    pieces. The output ends with a new line, so what follows never starts in the middle of one."""
+    pieces. The output ends with a new line, so what follows never starts in the middle of one. A last line that
+    names the next command (Next:) is held back until `release`, so that it stays last."""
     MARK = re.compile(r"\x1eainvfx-exit (-?\d+)\n")
 
     def __init__(self, write=show_text):
-        self.out, self.held, self.code, self.last = write, "", None, "\n"
+        self.out, self.held, self.code, self.last, self.next_line = write, "", None, "\n", ""
 
     def write(self, text):
         self.out(text)
@@ -2939,8 +2984,20 @@ class TrainOutput:
             self.code = int(m.group(1))
             text = text[:m.start()] + text[m.end():]
         text = text.replace("\x1e", "")
-        if text:
-            self.write(text)
+        if not text:
+            return
+        self.release()                            # more output came after a Next line: it was not the last one
+        lines = text.splitlines(True)
+        if lines[-1].startswith("Next:  ") and lines[-1].endswith("\n"):
+            self.next_line = lines.pop()          # held back: what pod.py does after the command comes before it
+        if lines:
+            self.write("".join(lines))
+
+    def release(self):
+        """Shows the Next line held back, if any."""
+        if self.next_line:
+            line, self.next_line = self.next_line, ""
+            self.write(line)
 
     def finish(self):
         held, self.held = self.held, ""
@@ -2982,19 +3039,23 @@ def cmd_train(args):
         kernel_run(rec, train_code(words), None, on_text=out.feed, keep_running=True)
     except KeyboardInterrupt:
         out.finish()
+        out.release()
         say("\nStopped here, as Ctrl+C does in the pod's terminal. A run that had started goes on: "
             "`python pod.py train status` says where it stands.")
         sys.exit(130)
     except LinkBroken as e:
         out.finish()
+        out.release()
         if not e.started:
             die("the link to the pod broke before train started there: run the command again.")
         die("the link to the pod broke; the command goes on there. Do not run it again: in a few minutes, "
             "`python pod.py train status` says where the run stands, `python pod.py train log` shows it.")
     out.finish()
     if out.code is None:
+        out.release()
         die("the link to the pod closed before train ended; the command goes on there. In a few minutes, "
             "`python pod.py train status` says where the run stands.")
+    out.release()
     sys.exit(exit_status(out.code))
 
 
