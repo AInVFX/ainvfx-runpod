@@ -1552,6 +1552,52 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
+    def test_prep_downloads_the_runs_files_and_the_run_sends_an_edit(self):
+        """After python pod.py train prep, dataset.toml and prompts.txt come into outputs/<pod>/train/<run>/. Before the
+        run, a file changed here goes back to the pod, cleaned; an unchanged one does not, so an edit made on the pod
+        stays; a file changed in both places stops the run before the pod's command; pull keeps an edit made here."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {"train/p1/dataset.toml": b"[general]\nresolution = [960, 544]\n",
+                             "train/p1/prompts.txt": b"# head\na prompt\n"}
+        fake = os.path.join(self.home, "train")
+        with open(fake, "w") as f:
+            f.write("#!%s\nimport sys\nprint('args:', ' '.join(sys.argv[1:]))\n"
+                    "print('Next:  python pod.py train ltx_mix p1 --dataset oldspace   (why)')\n" % sys.executable)
+        os.chmod(fake, 0o755)
+        self.env["AINVFX_POD_TRAIN"] = fake
+        out, rc = self.run_pod("train", "prep", "ltx_mix", "p1", "--dataset", "oldspace")
+        self.assertEqual(rc, 0, out)
+        here = os.path.join(self.home, "outputs", STATE["pods"]["fakepod1"]["name"], "train", "p1")
+        self.assertEqual(sorted(os.listdir(here)), ["dataset.toml", "prompts.txt"], out)
+        self.assertIn("dataset.toml and prompts.txt downloaded into " + here, out)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  python pod.py train ltx_mix p1"), out)
+        with open(os.path.join(here, "prompts.txt"), "wb") as f:
+            f.write(b"# head\r\nmy prompt\r\n")                    # edited here, as Notepad saves it
+        out, rc = self.run_pod("pull")
+        with open(os.path.join(here, "prompts.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"# head\r\nmy prompt\r\n", "pull keeps an edit made here")
+        for d in ("workspace/ComfyUI", "workspace/ComfyUI/output", "workspace/ComfyUI/output/train",
+                  "workspace/ComfyUI/output/train/p1"):
+            STATE["jdirs"].add(d)
+        out, rc = self.run_pod("train", "ltx_mix", "p1", "--dataset", "oldspace")
+        self.assertEqual(rc, 0, out)
+        sent = "workspace/ComfyUI/output/train/p1/"
+        self.assertEqual(bytes(STATE["jfs"][sent + "prompts.txt"]), b"# head\nmy prompt\n", out)
+        self.assertNotIn(sent + "dataset.toml", STATE["jfs"], out)
+        self.assertLess(out.index("sent to the pod: " + os.path.join(here, "prompts.txt")), out.index("args: ltx_mix p1"))
+        with open(os.path.join(here, "dataset.toml"), "wb") as f:
+            f.write(b"[general]\nresolution = [512, 512]\n")
+        STATE["outfiles"]["train/p1/dataset.toml"] = b"[general]\nresolution = [768, 432]\n"   # and on the pod
+        out, rc = self.run_pod("train", "ltx_mix", "p1", "--dataset", "oldspace")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("changed both here and on the pod since train prep: " + os.path.join(here, "dataset.toml"), out)
+        self.assertNotIn("args:", out, out)
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
     def test_push_from_a_web_address(self):
         """`push URL`: the pod downloads by itself. The code that pod.py sends runs for real in the fake kernel, against
         a folder page of the fake site. A file's address gives that file; a folder's address gives every file it lists
@@ -1696,8 +1742,8 @@ class EndToEnd(unittest.TestCase):
                 f.write(data)
         out, rc = self.run_pod("push", "--dataset", "ready", ready)
         self.assertEqual(rc, 0, out)
-        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  python pod.py train <recipe> <run> --dataset "
-                                                                  "ready   ("), out)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  python pod.py train prep <recipe> <run> "
+                                                                  "--dataset ready   ("), out)
         out, rc = self.run_pod("push", "--dataset", "../up", ds)
         self.assertNotEqual(rc, 0, out)
         self.assertIn("folder name", out, out)

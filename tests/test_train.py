@@ -290,12 +290,12 @@ class Units(unittest.TestCase):
         self.assertNotIn(" -- in", train.sample_line(train.RECIPES["zimage"], "a -- in b", None))
 
     def test_stages(self):
-        stages, prompts, trigger = train.parse_stages("ltx_iclora", [
+        stages, trigger = train.parse_stages("ltx_iclora", [
             "s1", "--dataset", "fx", "--trigger", "fxw", "--then", "s2", "--from", "s1", "--steps", "100", "--lr", "5e-5"])
         self.assertEqual([s["name"] for s in stages], ["s1", "s2"])
         self.assertEqual(stages[1]["dataset"], "fx", "a stage without --dataset takes the one before")
         self.assertEqual(stages[1]["start"], str(train.RUNS / "s1" / "s1.safetensors"))
-        self.assertEqual((prompts, trigger), (None, "fxw"))
+        self.assertEqual(trigger, "fxw")
         for bad in (["x", "--dataset", "fx", "--from", "y"], ["x y", "--dataset", "fx"], ["x", "--dataset", "fx", "--then"],
                     ["x", "--dataset", "fx", "--then", "z", "--trigger", "t"], ["x", "--dataset", "fx", "--then", "x"],
                     ["x", "--dataset", "fx", "--from", "y_comfy.safetensors", "--steps", "5"]):
@@ -715,7 +715,68 @@ class Runs(unittest.TestCase):
         out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--overwrite", env={"FAKE_CAPTION_LOG": str(log)})
         self.assertEqual(rc, 0, out)
         self.assertEqual([m["role"] for m in json.loads(log.read_text().splitlines()[0])], ["user"])
-        self.assertEqual(out.rstrip().splitlines()[-1].split("   ")[0], "Next:  train <recipe> <run> --dataset avoid2")
+        self.assertEqual(out.rstrip().splitlines()[-1].split("   ")[0], "Next:  train prep <recipe> <run> --dataset avoid2")
+
+    def test_prep_then_a_run_with_the_edited_files(self):
+        """train prep checks, shows the settings and both files, writes them and starts nothing. An edited resolution and
+        an edited prompt reach the trainer; each broken edit stops with its sentence; a run given other words than its
+        prep stops; --prompts points to prep; a chain has one prompts file."""
+        out, rc = self.run_train("prep", "zimage", "p1", "--dataset", "chars", "--steps", "300")
+        self.assertEqual(rc, 0, out)
+        run = train.RUNS / "p1"
+        self.assertEqual(sorted(p.name for p in run.iterdir()), [".prep.json", "dataset.toml", "prompts.txt"], out)
+        self.assertRegex(out, r"steps\s+300\s+from --steps")
+        self.assertRegex(out, r"learning rate\s+1e-4\s+from the recipe")
+        for said in ("settings of p1 (recipe zimage)", "dataset config: {} (written from the recipe)".format(
+                run / "dataset.toml"), "sample prompts: {} (written from the recipe)".format(run / "prompts.txt"),
+                "Nothing started"):
+            self.assertIn(said, out)
+        self.assertEqual(out.rstrip().splitlines()[-1].split("   ")[0], "Next:  train zimage p1 --dataset chars --steps 300")
+        toml = (run / "dataset.toml").read_text()
+        self.assertIn("resolution = [1024, 1024]", toml)
+        (run / "dataset.toml").write_text(toml.replace("resolution = [1024, 1024]", "resolution = [512, 512]"))
+        (run / "prompts.txt").write_text("# mine\nmychr, my own prompt --w 512 --h 512\n")
+        out, rc = self.run_train("zimage", "p1", "--dataset", "chars", "--steps", "300")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("dataset config: {} (prepared)".format(run / "dataset.toml"), out)
+        self.assertIn("    mychr, my own prompt --w 512 --h 512", out)
+        self.assertLess(out.index("sample prompts:"), out.index("The run started"))
+        args = json.loads((run / "args.json").read_text())
+        self.assertEqual(train.arg_value(args, "--dataset_config"), str(run / "dataset.toml"))
+        self.assertIn("resolution = [512, 512]", (run / "dataset.toml").read_text())
+        self.assertEqual((run / "prompts.txt").read_text(), "# mine\nmychr, my own prompt --w 512 --h 512\n")
+        self.assertFalse((run / ".prep.json").exists())
+        chars = str(train.DATASETS / "chars")
+        for name, file, edit, said in (("b1", "dataset.toml", lambda t: "[general\n", "is not valid TOML"),
+                                       ("b2", "dataset.toml", lambda t: t.replace(chars, chars + "_gone"), "no folder"),
+                                       ("b3", "prompts.txt", lambda t: "# nothing\n", "has no prompt line")):
+            out, rc = self.run_train("prep", "zimage", name, "--dataset", "chars")
+            self.assertEqual(rc, 0, out)
+            path = train.RUNS / name / file
+            path.write_text(edit(path.read_text()))
+            out, rc = self.run_train("zimage", name, "--dataset", "chars")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn(said, out)
+            self.assertFalse((train.RUNS / name / "train.log").exists(), out)
+        out, rc = self.run_train("prep", "zimage", "p2", "--dataset", "chars")
+        out, rc = self.run_train("zimage", "p2", "--dataset", "chars", "--steps", "500")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("the run p2 was prepared with other words: train prep zimage p2 --dataset chars", out)
+        out, rc = self.run_train("zimage", "p3", "--dataset", "chars", "--prompts", "x.txt")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("--prompts is gone: `train prep zimage p3 --dataset ...`", out)
+        chain = ["pc1", "--dataset", "chars", "--then", "pc2", "--from", "pc1", "--steps", "100"]
+        out, rc = self.run_train("prep", "zimage", *chain)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("The chain has one prompts file", out)
+        self.assertEqual(sorted(p.name for p in (train.RUNS / "pc2").iterdir()), ["dataset.toml"])
+        (train.RUNS / "pc1" / "prompts.txt").write_text("mychr, the chain's prompt\n")
+        out, rc = self.run_train("zimage", *chain)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((train.RUNS / "pc2" / "prompts.txt").read_text(), "mychr, the chain's prompt\n")
+        out, rc = self.run_train("prep")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("train prep <recipe> <run> --dataset <dataset> [options]", out)
 
     def test_a_mixed_run_end_to_end(self):
         """ltx_mix through the command: its config of three blocks, the settings of ltx_av with the two flags of a mixed

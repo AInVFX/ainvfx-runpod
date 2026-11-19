@@ -6,6 +6,8 @@ command, which runs this file with musubi-tuner's Python. In a terminal on the p
 
   train recipes                                 every recipe: what it learns, its dataset, its base files
   train caption <dataset> --trigger WORD        writes a caption (.txt) next to every image or clip that has none
+  train prep <recipe> <run> --dataset <dataset> checks the dataset, then writes and shows the run's dataset.toml and
+                                                prompts.txt, to read and edit before the run; nothing starts
   train <recipe> <run> --dataset <dataset>      trains a LoRA in the background; its log follows on screen
   train log                                     follows the log of the run in progress (or of the last one) again
   train status                                  the run in progress: stage, last lines, checkpoints, GPU
@@ -56,6 +58,7 @@ SOUNDS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma")    #
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 ACTIVE = ("starting", "running")
 SAVE_EVERY = 250          # steps between two checkpoints, and two sets of samples
+PREPARED = ("dataset.toml", "prompts.txt", ".prep.json")   # what `train prep` writes into a run's folder
 STABLE_SECONDS = 15       # a checkpoint untouched this long is complete: it is then converted for ComfyUI
 BEAT = float(os.environ.get("AINVFX_BEAT", "30"))   # seconds between two marks of a run in its record (`beat`), its sign
                                                     # of life, and two looks for new checkpoints; the tests shorten it
@@ -459,8 +462,8 @@ def cache_name(folder):
 def make_config(recipe, folder):
     """The dataset config of one folder, in its trainer's format, with the recipe's settings."""
     r = RECIPES[recipe]
-    head = ["# Written by train.py for the {} recipe. To change a setting, copy this file, edit the copy, then "
-            "--dataset <the copy>.toml.".format(recipe), ""]
+    head = ["# Written by train.py for the {} recipe. To change a setting, edit this file between `train prep` and the "
+            "run, or edit a copy and give --dataset <the copy>.toml.".format(recipe), ""]
     if r.get("trainer") == "sd-scripts":           # one dataset of one subset; sd-scripts caches next to the images
         lines = head + ["[general]", 'caption_extension = ".txt"', "enable_bucket = true", "", "[[datasets]]"]
         lines += ["{} = {}".format(k, toml_value(v)) for k, v in r["general"].items()]
@@ -843,6 +846,15 @@ def mix_share(source, infos, problems):
 
 
 # ----------------------------------------------------------------------------- sample prompts
+PROMPTS_HEAD = ("# The sample prompts of this run, one per line, with their options after the text (--w, --h, --s, --d...).\n"
+                "# The trainer renders them at the start and every {} steps, into the run's sample folder.\n".format(SAVE_EVERY))
+
+
+def prompt_lines(text):
+    """The prompts of a prompts file: its lines that are neither empty nor comments."""
+    return [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
 def sample_line(r, text, partner):
     text = " ".join(text.replace(" --", " - ").split())        # a caption must not open an option of the prompt line
     ctrl = "{} {} ".format(r["control"], partner) if r["control"] and partner else ""
@@ -868,9 +880,7 @@ def make_prompts(recipe, info, trigger):
     trigger = trigger or guess_trigger(caption_of(files[0]))
     if trigger:
         lines.append(sample_line(r, "{}, {}".format(trigger, r["sample"]), partner(files[0])))
-    head = ("# The sample prompts of this run, one per line, with their options after the text (--w, --h, --s, --d...).\n"
-            "# The trainer renders them at the start and every {} steps, into the run's sample folder.\n".format(SAVE_EVERY))
-    return head + "\n".join(lines) + "\n", trigger
+    return PROMPTS_HEAD + "\n".join(lines) + "\n", trigger
 
 
 # ----------------------------------------------------------------------------- a run
@@ -896,8 +906,8 @@ def resolve_from(ref, earlier):
 
 
 def parse_stages(recipe, argv):
-    """(stages, prompts file, trigger) from `<run> [options] --then <run> [options] ...`. A stage without --dataset
-    takes the one before."""
+    """(stages, trigger) from `<run> [options] --then <run> [options] ...`. A stage without --dataset takes the one
+    before."""
     groups, cur = [], []
     for a in argv:
         if a == "--then":
@@ -915,8 +925,8 @@ def parse_stages(recipe, argv):
     p.add_argument("--rank", type=int, help="the LoRA's rank; alpha changes by the same factor")
     p.add_argument("--from", dest="start", metavar="RUN_OR_CHECKPOINT",
                    help="start from these weights: a run's name (its final LoRA) or a checkpoint's file name; with --steps")
-    p.add_argument("--prompts", help="your own sample prompts file (first stage)")
     p.add_argument("--trigger", help="the trigger word of the third sample prompt (read from the captions otherwise)")
+    p.add_argument("--prompts", nargs="?", const="", help=argparse.SUPPRESS)   # gone: train prep writes prompts.txt
     stages, earlier, first = [], [], None
     for i, group in enumerate(groups):
         if not group:
@@ -927,8 +937,11 @@ def parse_stages(recipe, argv):
             die("a run name takes letters, digits, _ and -, up to 64 (got \"{}\")".format(a.run))
         if a.run in earlier:
             die("two stages are named {}".format(a.run))
-        if i and (a.prompts or a.trigger):
-            die("--prompts and --trigger go with the first run")
+        if a.prompts is not None:
+            die("--prompts is gone: `train prep {} {} --dataset ...` writes the run's prompts.txt, which you edit before "
+                "the run".format(recipe, a.run))
+        if i and a.trigger:
+            die("--trigger goes with the first run")
         if (a.steps is not None and a.steps < 1) or (a.rank is not None and a.rank < 1) or (a.lr is not None and a.lr <= 0):
             die("--steps, --rank and --lr take positive numbers")
         dataset = a.dataset or (stages[-1]["dataset"] if stages else None)
@@ -939,7 +952,7 @@ def parse_stages(recipe, argv):
         stages.append(dict(name=a.run, dataset=dataset, steps=a.steps, lr=a.lr, rank=a.rank,
                            start=resolve_from(a.start, earlier) if a.start else None))
         earlier.append(a.run)
-    return stages, first.prompts, first.trigger
+    return stages, first.trigger
 
 
 def stage_commands(recipe, stage, values):
@@ -1009,54 +1022,134 @@ def free_comfy_memory():
         pass
 
 
-def cmd_train(recipe, argv):
+def show_file(label, path, text, origin, hint=None):
+    """A run's file in full, under a line that names it and says where its text comes from."""
+    say("{}: {} ({})".format(label, path, origin))
+    if hint:
+        say("  " + hint)
+    for line in text.splitlines():
+        say("    " + line)
+
+
+def show_settings(recipe, st):
+    """The settings a stage trains with, each from the recipe or from an option."""
+    args = RECIPES[recipe]["args"]
+    dim, alpha = int(arg_value(args, "--network_dim")), float(arg_value(args, "--network_alpha"))
+    rank = st["rank"] or dim
+    rows = [("steps", st["steps"] or arg_value(args, "--max_train_steps"), "--steps" if st["steps"] else "the recipe"),
+            ("learning rate", "{:g}".format(st["lr"]) if st["lr"] else arg_value(args, "--learning_rate"),
+             "--lr" if st["lr"] else "the recipe"),
+            ("rank", rank, "--rank" if st["rank"] else "the recipe"),
+            ("alpha", "{:g}".format(alpha * rank / dim), "--rank: alpha follows it" if st["rank"] else "the recipe")]
+    say("settings of {} (recipe {}):".format(st["name"], recipe))
+    for name, value, source in rows:
+        say("  {:<14} {:<8} from {}".format(name, value, source))
+    say("  a checkpoint and samples every {} steps".format(SAVE_EVERY))
+    if st["start"]:
+        say("  starts from {}".format(st["start"]))
+
+
+def write_prep(recipe, argv, stages, trigger, plans, prompts):
+    """`train prep`: each stage's dataset.toml, and the first stage's prompts.txt (a chain has one), written into the
+    run folders and shown in full, after the settings of each stage, with what was given (.prep.json); nothing
+    starts."""
+    first = RUNS / stages[0]["name"]
+    for i, (st, (text, _, _)) in enumerate(zip(stages, plans)):
+        run = RUNS / st["name"]
+        run.mkdir(parents=True, exist_ok=True)
+        (run / "dataset.toml").write_text(text, encoding="utf-8")
+        if i == 0:
+            (run / "prompts.txt").write_text(prompts, encoding="utf-8")
+    (first / ".prep.json").write_text(json.dumps(dict(recipe=recipe, stages=stages, trigger=trigger, words=argv),
+                                                 indent=1), encoding="utf-8")
+    for st in stages:
+        show_settings(recipe, st)
+    for st, (text, _, origin) in zip(stages, plans):
+        show_file("dataset config", RUNS / st["name"] / "dataset.toml", text, origin,
+                  "To change a size, a length or a frame rate, edit resolution, target_frames, target_fps or "
+                  "num_repeats (README, \"Sizes and lengths\").")
+    show_file("sample prompts", first / "prompts.txt", prompts, "written from the recipe",
+              "One prompt per line, its options after the text (--w, --h, --s, --d...).")
+    if len(stages) > 1:
+        say("The chain has one prompts file, this one: every stage renders its samples from it.")
+    say("Nothing started: no base file downloaded, no GPU memory used.")
+    next_line("train {} {}".format(recipe, " ".join(shlex.quote(w) for w in argv)),
+              "starts the run with these files, edited or not")
+    return 0
+
+
+def cmd_train(recipe, argv, prep=False):
+    """A run, or with prep its preparation: every check of a run, then the run's dataset.toml and prompts.txt written
+    and shown, to read and edit; nothing starts. A run whose folder holds only what prep wrote reads those files,
+    edited or not, and checks them again; one given other words than its prep stops."""
     trainer = RECIPES[recipe].get("trainer", "musubi-tuner")
     if not (TRAINERS[trainer][0] / ".venv" / "bin" / "python").is_file():
         die("{} is not installed on this pod: create the pod with the train profile, or install the trainers "
             "here: bash /tmp/ainvfx-bootstrap.sh trainer".format(trainer))
-    stages, prompts_file, trigger = parse_stages(recipe, argv)
+    stages, trigger = parse_stages(recipe, argv)
     job = active_job()
-    if job:
+    if job and not prep:
         die("a run is in progress: {}. `train status` shows it, `train stop` stops it.".format(
             job["stages"][job.get("stage", 0)]["name"]))
     for st in stages:
         run = RUNS / st["name"]
-        if run.exists() and any(run.iterdir()):
+        if run.is_dir() and {p.name for p in run.iterdir()} - set(PREPARED):
             die("a run named {} exists ({}): choose another name, or delete that folder first".format(st["name"], run))
+    first = RUNS / stages[0]["name"]
+    if not prep and (first / ".prep.json").is_file():
+        try:
+            saved = json.loads((first / ".prep.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        if (saved.get("recipe"), saved.get("stages"), saved.get("trigger")) != (recipe, stages, trigger):
+            die("the run {} was prepared with other words: train prep {}. Run it with the same words, or run train "
+                "prep again with the new ones.".format(stages[0]["name"], " ".join(
+                    shlex.quote(str(w)) for w in [saved.get("recipe")] + list(saved.get("words") or []))))
     plans = []
     for st in stages:
-        text, source = dataset_config(recipe, st["dataset"])
+        toml = RUNS / st["name"] / "dataset.toml"
+        if not prep and toml.is_file():
+            text, source, origin = toml.read_text(encoding="utf-8"), str(toml), "prepared"
+        else:
+            text, source = dataset_config(recipe, st["dataset"])
+            origin = "copied from " + source if source.endswith(".toml") else "written from the recipe"
         say("dataset of {}: {}".format(st["name"], source))
-        plans.append((text, check_blocks(recipe, dataset_blocks(text, source), source)))
-    if prompts_file:
-        try:
-            prompts = resolve_path(prompts_file, ROOT).read_text(encoding="utf-8")
-        except OSError:
-            die("no prompts file {}".format(prompts_file))
+        plans.append((text, check_blocks(recipe, dataset_blocks(text, source), source), origin))
+    pfile = first / "prompts.txt"
+    if not prep and pfile.is_file():
+        prompts, porigin = pfile.read_text(encoding="utf-8"), "prepared"
     else:
         infos = [i for i in plans[0][1] if i]          # a mixed run's prompts start from a clip's caption
         info = next((i for i in infos if i["kind"] == "clips"), infos[0] if infos else None)
-        if not info:
-            die("--prompts FILE is needed: this dataset's files could not be read here")
-        prompts, trigger = make_prompts(recipe, info, trigger)
-        if not trigger:
-            say("no trigger word found (`train caption` starts every caption with it): the third sample prompt is left "
-                "out; --trigger WORD adds it")
-    say("sample prompts:")
-    for line in prompts.splitlines():
-        if line.strip() and not line.startswith("#"):
-            say("  " + line)
+        prompts, porigin = PROMPTS_HEAD, "written from the recipe"
+        if info:
+            prompts, found = make_prompts(recipe, info, trigger)
+            if not found:
+                say("no trigger word found (`train caption` starts every caption with it): the third sample prompt is "
+                    "left out; --trigger WORD adds it")
+    if not prompt_lines(prompts):
+        if not prep:
+            die("{} has no prompt line, and a run needs one: write one prompt per line under its header, its options "
+                "after the text, then run the same command again (`train prep` writes that file).".format(pfile))
+        say("No sample prompt could be written: this dataset's files cannot be read here. Write the prompts in {}, one "
+            "per line, its options after the text.".format(pfile))
+    if prep:
+        return write_prep(recipe, argv, stages, trigger, plans, prompts)
+    for st, (text, _, origin) in zip(stages, plans):
+        show_file("dataset config", RUNS / st["name"] / "dataset.toml", text, origin)
+    show_file("sample prompts", pfile, prompts, porigin)
     paths = ensure_models(RECIPES[recipe]["family"])
     job = dict(recipe=recipe, state="starting", stage=0, created=time.time(), beat=time.time(), stages=[])
-    for st, (text, _) in zip(stages, plans):
+    for st, (text, _, _) in zip(stages, plans):
         run = RUNS / st["name"]
         (run / "logs").mkdir(parents=True, exist_ok=True)
         (run / "dataset.toml").write_text(text, encoding="utf-8")
-        (run / "prompts.txt").write_text(prompts, encoding="utf-8")
+        (run / "prompts.txt").write_text(prompts, encoding="utf-8")      # a chain: the first stage's, in every stage
         values = dict(paths, config=str(run / "dataset.toml"), prompts=str(run / "prompts.txt"), run=str(run),
                       name=st["name"])
         job["stages"].append(dict(name=st["name"], run=str(run), cwd=str(TRAINERS[trainer][0]),
                                   commands=stage_commands(recipe, st, values)))
+    (first / ".prep.json").unlink(missing_ok=True)       # the run has used what prep wrote
     free_comfy_memory()
     write_job(job)
     with open(RUNS / ".job.log", "ab") as out:
@@ -1261,8 +1354,8 @@ def cmd_recipes(argv):
             arg_value(r["args"], "--max_train_steps"), arg_value(r["args"], "--learning_rate"),
             arg_value(r["args"], "--network_dim")))
     say()
-    next_line("train <recipe> <run> --dataset <dataset>", "a dataset is a folder of /workspace/dataset, or a .toml; "
-              "train <recipe> -h lists the options")
+    next_line("train prep <recipe> <run> --dataset <dataset>", "checks the dataset and shows the run's two files; "
+              "nothing starts")
     return 0
 
 
@@ -1453,7 +1546,8 @@ def cmd_caption(argv):
     say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
         "wrong word is learned like the others.".format(", ".join(
             "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))
-    next_line("train <recipe> <run> --dataset {}".format(dataset_name(a.datasets[0])), "train recipes lists the recipes")
+    next_line("train prep <recipe> <run> --dataset {}".format(dataset_name(a.datasets[0])),
+              "checks the dataset and shows the run's two files; train recipes lists the recipes")
     return 0
 
 
@@ -1468,10 +1562,17 @@ def main(argv=None):
         return 0
     if argv[0] in RECIPES:
         return cmd_train(argv[0], argv[1:])
+    if argv[0] == "prep":
+        if len(argv) > 1 and argv[1] in RECIPES:
+            return cmd_train(argv[1], argv[2:], prep=True)
+        say("train prep <recipe> <run> --dataset <dataset> [options]: the words of the run, after prep. It checks the "
+            "dataset, then writes and shows the run's dataset.toml and prompts.txt; nothing starts. Recipes: {}.".format(
+                ", ".join(RECIPES)))
+        return 0 if argv[1:2] in (["-h"], ["--help"]) else 2
     commands = {"recipes": cmd_recipes, "caption": cmd_caption, "log": cmd_log, "status": cmd_status, "stop": cmd_stop,
                 "_run": run_job}
     if argv[0] not in commands:
-        die("no command or recipe named {}. Commands: recipes, caption, log, status, stop. Recipes: {}.".format(
+        die("no command or recipe named {}. Commands: recipes, caption, prep, log, status, stop. Recipes: {}.".format(
             argv[0], ", ".join(RECIPES)))
     return commands[argv[0]](argv[1:])
 

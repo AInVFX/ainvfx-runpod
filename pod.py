@@ -34,6 +34,7 @@ Full guide: README.md, or https://github.com/AInVFX/ainvfx-runpod
 import argparse
 import base64
 import getpass
+import hashlib
 import http.client
 import inspect
 import io
@@ -2045,6 +2046,11 @@ def dataset_plan(paths):
     return plan
 
 
+def digest(raw):
+    """A text file's fingerprint as the pod receives it (clean_text): the same with a BOM or CR line ends."""
+    return hashlib.sha256(clean_text(raw)).hexdigest()
+
+
 def jupyter_link(rec):
     """(base address, headers) of the pod's JupyterLab, with the token of the READY line; None when it does not
     answer."""
@@ -2371,8 +2377,8 @@ def push_dataset(rec, name, paths, tag):
         say("Next:  python pod.py train caption {} --trigger <word>   (writes a caption beside each image and clip that "
             "has none)".format(name))
     else:
-        say("Next:  python pod.py train <recipe> <run> --dataset {}   (each image and clip has its caption; python "
-            "pod.py train recipes lists the recipes)".format(name))
+        say("Next:  python pod.py train prep <recipe> <run> --dataset {}   (each image and clip has its caption: this "
+            "checks the dataset and shows the run's two files)".format(name))
 
 # --------------------------------------------------------------------------- push from a web address
 # `push URL` makes the pod download by itself: nothing passes through the user's connection. pod.py starts a kernel in
@@ -2767,6 +2773,16 @@ def pull(rec, report=None):
     way to the files of a training run."""
     pod_id, dest = rec["id"], outputs_of(rec)
     comfy = comfy_alive(pod_id)
+    prepared = rec.get("prepared") or {}
+
+    def edited_here(rel):
+        """A file of a prepared run changed on this computer since `train prep`: kept, for the run to send."""
+        parts = rel.split("/")
+        known = (prepared.get(parts[1]) or {}).get(parts[2]) if len(parts) == 3 and parts[0] == "train" else None
+        try:
+            return bool(known) and digest(dest.joinpath(*parts).read_bytes()) != known
+        except OSError:
+            return False
     token = jupyter_token(proxy_log(pod_id)) if comfy else None
     count, listed, root, failed = 0, set(), None, []
     if report is not None:
@@ -2774,6 +2790,8 @@ def pull(rec, report=None):
 
     def get(rel, url, size=None, headers=None):
         nonlocal count
+        if edited_here(rel):
+            return
         target = dest.joinpath(*rel.split("/"))
         if target.exists() and (size is None or target.stat().st_size == size):
             return
@@ -3074,6 +3092,84 @@ def cmd_ssh(args):
 
 
 # ----------------------------------------------------------------------------- train, from this computer
+TRAIN_WORDS = ("recipes", "caption", "prep", "log", "status", "stop", "_run", "help")   # the pod's train: not a run
+PREP_FILES = ("dataset.toml", "prompts.txt")                                         # what `train prep` downloads
+
+
+def run_names(words):
+    """The runs that a run's words name, after the recipe: the first word, and the word after each --then."""
+    names = [words[0]] if words and not words[0].startswith("-") else []
+    return names + [b for a, b in zip(words, words[1:]) if a == "--then" and not b.startswith("-")]
+
+
+def pod_output_file(base, hdrs, rel):
+    """(the output folder as JupyterLab names it, the bytes) of one file of the pod's output folder; (None, None)
+    when the pod has no such file."""
+    for root in OUTPUT_DIRS:
+        data = jupyter_read(base, hdrs, root + "/" + rel)
+        if data is not None:
+            return root, data
+    return None, None
+
+
+def download_prepared(cfg, tag, rec, runs):
+    """After `train prep`: each run's dataset.toml and prompts.txt into outputs/<pod name>/train/<run>/, to read and
+    edit there. The pod's record keeps each file's fingerprint, to tell later which side changed it."""
+    link = jupyter_link(rec)
+    if not link:
+        say("The pod's JupyterLab does not answer: the run's files stay on the pod.")
+        return
+    base, hdrs = link
+    record = rec.setdefault("prepared", {})
+    for run in runs:
+        record[run], folder = {}, outputs_of(rec) / "train" / run
+        for name in PREP_FILES:
+            data = pod_output_file(base, hdrs, "train/{}/{}".format(run, name))[1]
+            if data is not None:
+                write_if_changed(folder / name, data)
+                record[run][name] = digest(data)
+        if record[run]:
+            say("{} downloaded into {}. Edit them there, or on the pod in JupyterLab: the run sends a file changed "
+                "here.".format(" and ".join(sorted(record[run])), folder))
+    remember_pod(cfg, tag, rec)
+
+
+def send_prepared(cfg, tag, rec, runs):
+    """Before a run: each file of a prepared run that was changed on this computer since `train prep` downloaded it
+    goes back to the pod, cleaned (clean_text). A file changed on the pod alone stays as it is there; a file changed
+    in both places stops the run before it starts."""
+    record = rec.get("prepared") or {}
+    todo = [(run, name) for run in runs for name in sorted(record.get(run) or {})]
+    link = jupyter_link(rec) if todo else None
+    if not link:
+        return
+    base, hdrs = link
+    sends, both = [], []
+    for run, name in todo:
+        local = outputs_of(rec) / "train" / run / name
+        try:
+            mine = local.read_bytes()
+        except OSError:
+            continue
+        if digest(mine) == record[run][name]:
+            continue
+        root, theirs = pod_output_file(base, hdrs, "train/{}/{}".format(run, name))
+        if theirs is None:
+            continue
+        if digest(theirs) == digest(mine):
+            record[run][name] = digest(mine)
+        elif digest(theirs) != record[run][name]:
+            both.append(str(local))
+        else:
+            sends.append((run, name, root, local, mine))
+    if both:
+        die("changed both here and on the pod since train prep: {}. Keep one of the two: copy it over the other, then "
+            "run the same command again.".format(", ".join(both)))
+    for run, name, root, local, mine in sends:
+        jupyter_upload(base, hdrs, "{}/train/{}/{}".format(root, run, name), None, clean_text(mine))
+        record[run][name] = digest(mine)
+        say("sent to the pod: {}".format(local))
+    remember_pod(cfg, tag, rec)
 # `python pod.py train ...` is the pod's own `train` command, run with the same words in a kernel of the pod's
 # JupyterLab, as if typed in its terminal: Ctrl+C acts as it does there (a run that has started goes on, in a session
 # of its own), and a link that breaks leaves the command running on the pod. Every TRAIN_ALIVE seconds without
@@ -3198,8 +3294,10 @@ def exit_status(code):
 def cmd_train(args):
     cfg = load_config()
     ref, words = train_target(cfg.get("pods") or {}, list(args.words))
-    _, rec = which_pod(cfg, ref)
+    tag, rec = which_pod(cfg, ref)
     helped = bool({"-h", "--help"} & set(words))
+    if words and words[0] not in TRAIN_WORDS and not words[0].startswith("-") and not helped:
+        send_prepared(cfg, tag, rec, run_names(words[1:]))     # a run: what was edited here since train prep
     if words[:1] == ["stop"] and not {"-y", "--yes"} & set(words[1:]):
         try:
             answer = input("Stop the training run on {}? Its checkpoints stay. [y/N] ".format(rec.get("name")))
@@ -3235,6 +3333,11 @@ def cmd_train(args):
             download_captions(rec, caption_refs(words))
         except ApiError as e:
             say("The captions could not be downloaded ({}): `python pod.py pull` tries again.".format(e.detail[:100]))
+    if out.code == 0 and not helped and words[:1] == ["prep"]:
+        try:
+            download_prepared(cfg, tag, rec, run_names(words[2:]))
+        except ApiError as e:
+            say("The run's files could not be downloaded ({}): they are on the pod.".format(e.detail[:100]))
     out.release()
     sys.exit(exit_status(out.code))
 
