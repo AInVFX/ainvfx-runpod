@@ -679,6 +679,7 @@ class Runs(unittest.TestCase):
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  on your computer, python pod.py down   ("), out)
         out, rc = self.run_train("recipes")
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("Next:  train "), out)
+        self.assertEqual(self.run_train("recipe"), (out, rc), "train recipe lists them too")
         out, rc = self.run_train("zimage", "n2", "--dataset", "chars", env={"AINVFX_TRAIN_VIA": "python pod.py "})
         self.assertIn("\nNext:  python pod.py down --when-done   (", out)
 

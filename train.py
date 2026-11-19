@@ -1576,7 +1576,7 @@ def main(argv=None):
             "dataset, then writes and shows the run's dataset.toml and prompts.txt; nothing starts. Recipes: {}.".format(
                 ", ".join(RECIPES)))
         return 0 if argv[1:2] in (["-h"], ["--help"]) else 2
-    commands = {"recipes": cmd_recipes, "caption": cmd_caption, "log": cmd_log, "status": cmd_status, "stop": cmd_stop,
+    commands = {"recipes": cmd_recipes, "recipe": cmd_recipes, "caption": cmd_caption, "log": cmd_log, "status": cmd_status, "stop": cmd_stop,
                 "_run": run_job}
     if argv[0] not in commands:
         die("no command or recipe named {}. Commands: recipes, caption, prep, log, status, stop. Recipes: {}.".format(

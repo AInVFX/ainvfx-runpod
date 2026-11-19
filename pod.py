@@ -3093,7 +3093,7 @@ def cmd_ssh(args):
 
 
 # ----------------------------------------------------------------------------- train, from this computer
-TRAIN_WORDS = ("recipes", "caption", "prep", "log", "status", "stop", "_run", "help")   # the pod's train: not a run
+TRAIN_WORDS = ("recipes", "recipe", "caption", "prep", "log", "status", "stop", "_run", "help")   # the pod's train: not a run
 PREP_FILES = ("dataset.toml", "prompts.txt")                                         # what `train prep` downloads
 
 
