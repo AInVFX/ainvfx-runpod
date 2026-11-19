@@ -741,6 +741,9 @@ class Runs(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("dataset config: {} (prepared)".format(run / "dataset.toml"), out)
         self.assertIn("    mychr, my own prompt --w 512 --h 512", out)
+        shown, _ = self.run_train("prep", "zimage", "p4", "--dataset", "chars", env={"AINVFX_TRAIN_VIA": "python pod.py "})
+        self.assertIn("    # Written by train.py for the zimage recipe. To change a setting, edit this file between `train prep`",
+                      shown, "a file shows as it is, through python pod.py train too")
         self.assertLess(out.index("sample prompts:"), out.index("The run started"))
         args = json.loads((run / "args.json").read_text())
         self.assertEqual(train.arg_value(args, "--dataset_config"), str(run / "dataset.toml"))

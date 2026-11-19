@@ -1032,8 +1032,8 @@ def show_file(label, path, text, origin, hint=None):
     say("{}: {} ({})".format(label, path, origin))
     if hint:
         say("  " + hint)
-    for line in text.splitlines():
-        say("    " + line)
+    for line in text.splitlines():                       # the file as it is: no word of it is changed for display
+        print("    " + line, flush=True)
 
 
 def show_settings(recipe, st):
@@ -1071,8 +1071,8 @@ def write_prep(recipe, argv, stages, trigger, plans, prompts):
         show_settings(recipe, st)
     for st, (text, _, origin) in zip(stages, plans):
         show_file("dataset config", RUNS / st["name"] / "dataset.toml", text, origin,
-                  "To change a size, a length or a frame rate, edit resolution, target_frames, target_fps or "
-                  "num_repeats (README, \"Sizes and lengths\").")
+                  "To change the size, the length, the frame rate or the repeats: resolution, target_frames, "
+                  "target_fps, num_repeats (README, \"Sizes and lengths\").")
     show_file("sample prompts", first / "prompts.txt", prompts, "written from the recipe",
               "One prompt per line, its options after the text (--w, --h, --s, --d...).")
     if len(stages) > 1:
