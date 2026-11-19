@@ -28,6 +28,18 @@ Three data files drive them: **`settings.env`** holds every choice the pod makes
 | Tag | The short name commands take for a pod: its profile (`image+3d`) or the name given to `up --name`. |
 | Log words | The fixed words `bootstrap.sh` prints at each milestone (`COMFYUI UP`, `MODELS DONE`, `TRAINERS OK`, `READY`, `FAILED`). `pod.py` reacts to them. |
 
+**One word per action**, in messages and documents:
+
+| Word | For |
+|---|---|
+| download | a file from the pod to this computer (`pull`, `down`, the captions, a prepared run's files) |
+| send | a file from this computer to the pod (`push`, a prepared file edited on the computer) |
+| create, terminate | a pod: `up` creates it; `down` terminates it, which stops its billing and erases its disk |
+| start, stop | a run: `train <recipe>` starts it, `train stop` stops it; Ctrl+C stops a wait or the display |
+| continue | a run or a command that keeps going |
+
+`push` and `pull` stay as command names; the sentences that explain them say *sends* and *downloads*.
+
 ## 3. The big picture
 
 ```
@@ -64,7 +76,7 @@ pod.py                               api.runpod.io                      start co
 3. The container starts. The template's start command fetches `bootstrap.sh` from `AINVFX_REPO_RAW` (the template sets the branch `latest`; the command's own fallback is `main`) and runs it. If GitHub cannot be reached, it runs Runpod's own `/start.sh`, so SSH and JupyterLab still start.
 4. **`bootstrap.sh`** runs its steps (section 6). Meanwhile `pod.py` follows Runpod's log stream (`GET /pods/{id}/logs`, Server-Sent Events). The stream can stay open without delivering the last lines, so `pod.py` reopens it every 60 seconds a few seconds back, and reads the pod's own copy of the log through the ComfyUI proxy every 15 seconds. It stops on `READY` or `FAILED`, and warns when no container has started 8 minutes after creation.
 5. The user works. **`push`** sends files to ComfyUI's `/upload/image`; with `--dataset`, through JupyterLab's contents API, in 8 MiB chunks written to a `.part` file and renamed at the end; with `--to FOLDER` (or `--lora`), the same way into ComfyUI's `models/FOLDER`; with a web address (a Hugging Face file page or `hf://` address turned into its download link first), the pod downloads by itself, into the input folder, the dataset or the model folder: `pod.py` starts a kernel in the pod's JupyterLab, sends it the source of its own download functions over the kernel's WebSocket, prints what the kernel prints, then removes the kernel. **`pull`** walks the output folder through JupyterLab, or falls back to the files ComfyUI's history lists.
-6. **`down`** pulls, terminates, then reports the pod's cost and the credit left. Terminating erases the pod's disk, so the pull tries three times what did not come (`pull_before_down`); with a file still missing, `down` asks first, and `--when-done` keeps the pod. With `--when-done`, it first waits for the training run in progress on the pod to end (section 7). Every command first forgets the records of pods gone from the account.
+6. **`down`** downloads, terminates, then reports the pod's cost and the credit left. Terminating erases the pod's disk, so the download tries three times what was not downloaded (`pull_before_down`); with a file still missing, `down` asks first, and `--when-done` keeps the pod. With `--when-done`, it first waits for the training run in progress on the pod to end (section 7). Every command first forgets the records of pods gone from the account.
 
 ## 6. What `bootstrap.sh` does
 
@@ -93,9 +105,15 @@ pod.py                               api.runpod.io                      start co
 
 1. `train <recipe> <run> --dataset ...` checks everything before any GPU time: the dataset's folders, files, captions and pairs (`check_blocks`), the frames each clip gives (`check_clips`), the sample prompts (`make_prompts`), the base files (`ensure_models`: downloaded once into `ComfyUI/models`, with a disk check first). `check_clips` reads each clip's container with PyAV, which the trainer's environment holds, and counts as the trainer does: frames dropped to reach the block's rate only when the source's rate, rounded up, is more than 1 away from it; lengths of 8k + 1 frames; `head` keeps a clip only when it is long enough, `full` keeps it whole up to `max_frames`. A clip without its caption stops the check: the trainer opens each clip's caption while caching and stops on a missing one, while it leaves out an image without one.
 2. It writes the job record `ComfyUI/output/train/.job.json`, asks ComfyUI to free the GPU (`/free`), starts itself in the background in a new session (`train _run`), then follows the log.
-3. The background process runs each stage's commands in order: the trainer's caching scripts (musubi-tuner), then `accelerate launch` of the training script. Every 30 seconds (`BEAT`) it marks the job record with the time (`beat`), the run's sign of life, and during the training it publishes the new checkpoints (`publish`): Z-Image's converted for ComfyUI once untouched for 15 seconds, LTX's `.comfy.safetensors` copies, the others as they are, each linked under `ComfyUI/models/loras/train/<run>/`.
+3. The background process runs each stage's commands in order: the trainer's caching scripts (musubi-tuner), then `accelerate launch` of the training script. Every 30 seconds (`BEAT`) it marks the job record with the time (`beat`), which shows that the run is alive, and during the training it publishes the new checkpoints (`publish`): Z-Image's converted for ComfyUI once untouched for 15 seconds, LTX's `.comfy.safetensors` copies, the others as they are, each linked under `ComfyUI/models/loras/train/<run>/`.
 4. `log` and `status` read the job record and the run's `train.log`. `stop` signals the whole process group: SIGTERM, then SIGKILL after 30 seconds.
-5. `pod.py down --when-done` reads the job record from outside the pod. It stops at once, and terminates nothing, when no run is in progress; else it asks, then looks once a minute (`wait_for_run`), and pulls the new files every `PULL_EVERY` seconds (300) while the run goes on; a pull that fails never ends the wait. When the run has ended, the pod is terminated only after a whole pull: `pull_before_down` tries `PULL_TRIES` times (3) what did not come, and keeps a pod whose files did not all come, or whose JupyterLab does not answer, the only way to a run's files. ComfyUI serves its output folder, so the record comes through the proxy as the bootstrap log does: `/view?filename=.job.json&subfolder=train&type=output` (`read_run`). A run is in progress while the record's `state` is `starting` or `running` and the record keeps changing. A record that stands still for 300 seconds (`RUN_STALE`) is of a run whose process died without a word, after a pod restart (`run_in_progress`). An answer 404 means "no run" only when ComfyUI answers `/system_stats`; any other failed look is tried again, and the wait ends when Runpod says the pod is gone. `pod.py` reads the record's `state`, `stage`, `beat` and each stage's `name`: a change to them changes `train.py`, `pod.py` and both test modules in the same commit.
+5. `pod.py down --when-done` reads the job record from outside the pod. It stops at once, and terminates nothing, when no run is in progress; else it asks, then checks the run once a minute (`wait_for_run`), and downloads the new files at its first check, then every `PULL_EVERY` seconds (300) while the run continues; a download that fails never ends the wait. When the run has ended, the pod is terminated only after a whole pull: `pull_before_down` tries `PULL_TRIES` times (3) what was not downloaded, and keeps a pod whose files were not all downloaded, or whose JupyterLab does not answer, the only way to a run's files. ComfyUI serves its output folder, so the record comes through the proxy as the bootstrap log does: `/view?filename=.job.json&subfolder=train&type=output` (`read_run`). A run is in progress while the record's `state` is `starting` or `running` and the record keeps changing. A record that stands still for 300 seconds (`RUN_STALE`) is of a run whose process stopped without writing how it ended, after a pod restart (`run_in_progress`). An answer 404 means "no run" only when ComfyUI answers `/system_stats`; any other failed look is tried again, and the wait ends when Runpod says the pod is gone. `pod.py` reads the record's `state`, `stage`, `beat` and each stage's `name`: a change to them changes `train.py`, `pod.py` and both test modules in the same commit.
+
+**A prepared run** (`train prep`, `write_prep`). `train prep` takes the words of a run after `prep`, and runs every check of step 1. It writes each stage's `dataset.toml` and the first stage's `prompts.txt` (a chain has one prompts file) into the run folders, with `.prep.json`, the words it was given. It shows the settings (`show_settings`) and both files in full (`show_file`), and starts nothing: no base file, no GPU memory. A run whose folders hold only those files (`PREPARED`) reads them in place of writing them, checks them again, and shows both before `ensure_models`. A run given other words than its `.prep.json` stops. The run deletes `.prep.json` when it starts. Every command ends with a `Next:` line (`next_line`); through `python pod.py train`, `pod.py` holds the pod's Next line back (`TrainOutput.release`) and prints it after its own work.
+
+**Captions** (`caption_model`, `caption_files`). The model is called in one place: `caption_model` returns `ask(messages)`, and the tests give a stand-in. With `--avoid`, a system message tells the model never to use the words. `avoided_in` checks each caption for them: whole words, any case, the plain plural. A caption that keeps one is rewritten once; one that still keeps it is written whole and named at the end. No code deletes a word from a caption.
+
+**Files between the pod and the computer** (`pod.py`). `push --dataset` records the folders it sent under the dataset's name, in the pod's record. After `train caption`, `download_captions` downloads every caption of the dataset into `outputs/<pod name>/dataset/<NAME>/`, and beside each file of the recorded folder (found with `dataset_plan`): a missing caption is written, an identical one is left, and captions that differ are replaced after one question only. `pull` also downloads the text files of `/workspace/dataset/` (`pull_dataset_texts`), read again at each pull. After `train prep`, `download_prepared` downloads both files into `outputs/<pod name>/train/<run>/`, and keeps their fingerprints in the record (`digest`: the SHA-256 of the cleaned text). Before a run, `send_prepared` sends a file changed on the computer, leaves a file changed on the pod, and stops when a file changed in both places; `pull` keeps a file edited on the computer.
 
 A recipe is data (`RECIPES`): argument lists with `{name}` placeholders, filled per run (`fill`). `--steps`, `--lr`, `--rank` and `--from` edit those lists (`set_flag`, `with_rank`). `train caption` writes captions with Qwen3-VL-8B-Instruct (downloaded at first use, 17.6 GB). The model reads pictures only. In a mixed dataset it describes a clip with a sound track with the sound prompt, which guesses what is heard from what is seen (`caption_prompt`), and a silent clip with the video prompt; it writes nothing for a sound file, and lists those for captions written by hand.
 
@@ -107,9 +125,11 @@ On the user's computer:
 
 | Path | What |
 |---|---|
-| `~/.ainvfx-runpod/config.json` | The API key, the data center preferences and the pod records |
+| `~/.ainvfx-runpod/config.json` | The API key, the data center preferences and the pod records: per pod, the folders each dataset was sent from, and the fingerprints of a prepared run's files |
 | `settings.local.env` | The user's own settings, next to `settings.env`, ignored by git |
 | `outputs/<pod name>/` | What `pull` downloads (`AINVFX_OUTPUTS` moves it) |
+| `outputs/<pod name>/dataset/<NAME>/` | The captions and dataset configs of the pod's datasets. After `train caption`, the captions also go beside the files of the folder sent |
+| `outputs/<pod name>/train/<run>/` | Each run's files. After `train prep`, its `dataset.toml` and `prompts.txt`, to edit before the run |
 
 On the pod:
 
@@ -124,7 +144,7 @@ On the pod:
 | `/workspace/musubi-tuner`, `/workspace/sd-scripts` | The trainers, each with its `.venv` |
 | `/workspace/ainvfx/train.py`, `/usr/local/bin/train` | The training command |
 | `/workspace/dataset/<name>` | The datasets; the trainers' caches go to `/workspace/cache` |
-| `/workspace/ComfyUI/output/train/<run>` | Each run; `.job.json` and `.job.log` there describe the last job |
+| `/workspace/ComfyUI/output/train/<run>` | Each run. `train prep` writes its `dataset.toml`, `prompts.txt` and `.prep.json` there first. `.job.json` and `.job.log`, in `train/`, describe the last job |
 
 ## 9. Code map
 
@@ -141,11 +161,11 @@ On the pod:
 | Host and money | `pod_machine`, `maintenance_of`, `host_check`, `account_money` | The two GraphQL reads |
 | Logs | `log_stream`, `follow_logs`, `ImagePull` | `ImagePull` turns Docker's layer lines into one progress line |
 | Creation | `create_pod`, `try_create` | |
-| Commands | `cmd_setup`, `cmd_up`, `cmd_status`, `cmd_logs`, `cmd_open`, `cmd_push`, `cmd_pull`, `cmd_down`, `cmd_list`, `cmd_ssh`, `cmd_train`, `cmd_doctor` | |
-| Files | `jupyter_tree`, `jupyter_upload`, `push_dataset`, `model_folder`, `push_to_models`, `push_models`, `history_files`, `fetch_to`, `pull` | Downloads go through a `.part` file |
+| Commands | `cmd_setup`, `cmd_up`, `ready_next`, `cmd_status`, `cmd_logs`, `cmd_open`, `cmd_push`, `cmd_pull`, `cmd_down`, `cmd_list`, `cmd_ssh`, `cmd_train`, `cmd_doctor` | |
+| Files | `jupyter_tree`, `digest`, `jupyter_link`, `jupyter_read`, `write_if_changed`, `download_captions`, `jupyter_upload`, `push_dataset`, `model_folder`, `push_to_models`, `push_models`, `history_files`, `fetch_to`, `pull`, `pull_dataset_texts`, `tensorboard_next` | Downloads go through a `.part` file; a text file is written only when it changed |
 | A training run, seen from outside the pod | `read_run`, `run_in_progress`, `run_label`, `wait_for_run`, `pull_before_down` | `down --when-done`: one read of the job record a minute, a pull every 5 minutes; then the pull before the termination, which must be whole |
 | Push from a web address | `is_web`, `hf_url`, `index_links`, `frame_split`, `frames_in_range`, `hf_host`, `HfRedirect`, `open_url`, `remote_push`, `remote_code`, `ws_connect`, `ws_send`, `ws_messages`, `kernel_run`, `push_url` | `index_links` to `remote_push` run on the pod as well: `remote_code` sends their source |
-| Train from this computer | `TRAIN_ALIVE`, `TRAIN_CODE`, `train_code`, `show_text`, `TrainOutput`, `train_target`, `exit_status`, `cmd_train` | The pod's `train` runs in a kernel through `kernel_run(on_text=, keep_running=True)`, its output shown as it comes. Ctrl+C removes the kernel, which stops the command as in the pod's terminal; a broken link (`LinkBroken`) leaves the kernel, so the command goes on; a training run, in a session of its own, outlives both |
+| Train from this computer | `TRAIN_WORDS`, `run_names`, `pod_output_file`, `download_prepared`, `send_prepared`, `TRAIN_ALIVE`, `TRAIN_CODE`, `train_code`, `show_text`, `TrainOutput`, `train_target`, `exit_status`, `cmd_train` | The pod's `train` runs in a kernel through `kernel_run(on_text=, keep_running=True)`, its output shown as it comes. Ctrl+C removes the kernel, which stops the command as in the pod's terminal; a broken link (`LinkBroken`) leaves the kernel, so the command continues; a training run, in a session of its own, outlives both |
 | Entry | `main` | argparse; `train` and every word after it skip it, so `train --help` reaches the pod |
 
 ### `bootstrap.sh`, in file order
@@ -154,7 +174,7 @@ The header (steps, variables, modes), then the settings and paths, the helpers (
 
 ### `train.py`, in file order
 
-The paths, the recipes (`COMMON`, the `LTX_*` parts, `RECIPES`, `DATA`, `CAPTION_PROMPTS`), the helpers, the job record, the base files, the datasets (`make_config` with a mixed dataset's `mix_parts`, `sound_repeats` and `mixed_blocks`; `check_blocks` with `mix_share`; the clips' check: `clip_probe`, `frames_at`, `frames_kept`, `check_clips`), the sample prompts, a run (`parse_stages`, `stage_commands`, `publish`, `cmd_train`, `run_job`, `run_stage`, `follow`), the other commands, the captions, and `main`.
+The paths, the recipes (`COMMON`, the `LTX_*` parts with why the LTX base loads in fp8, `RECIPES`, `DATA`, `CAPTION_PROMPTS`, `AVOID_RULE`, `REWRITE`), the helpers (`as_typed`, `say`, `die`, `next_line`, `dataset_name`), the job record, the base files, the datasets (`make_config` with a mixed dataset's `mix_parts`, `sound_repeats` and `mixed_blocks`; `check_blocks` with `mix_share`; the clips' check: `clip_probe`, `frames_at`, `frames_kept`, `check_clips`), the sample prompts (`PROMPTS_HEAD`, `prompt_lines`, `make_prompts`), a run (`parse_stages`, `stage_commands`, `publish`, `show_file`, `show_settings`, `write_prep`, `cmd_train`, `run_job`, `run_stage`, `follow`, `report_end`), the other commands (`cmd_log`, `cmd_status`, `cmd_stop`, `cmd_recipes`), the captions (`caption_targets`, `caption_prompt`, `clean_caption`, `avoided_in`, `model_on_disk`, `caption_model`, `word_report`, `caption_files`, `cmd_caption`), then `main`.
 
 ### Data files
 
@@ -171,8 +191,8 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 
 | Module | What it proves | Needs |
 |---|---|---|
-| `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans, a run in progress and one that died). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
-| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, the clips' lengths (with a stand-in for PyAV), sample prompts, stages, a run end to end, a chain, a mixed dataset and a mixed run, a MOSS-Image run, a failure, `stop`, captions in a dry run (a mixed folder's included), and README's recipe table | Python 3.11 or newer (skipped below) |
+| `test_pod.py` | `Helpers`: the pure functions (settings files, profiles and the disk rule on a fixed list of models, offers and prices, maintenance windows, names and records, log parsing, dataset plans, a run in progress and one that stopped, the Next line held back for the end). `EndToEnd`: every command against a fake Runpod API (REST v2, GraphQL, the catalog, a log stream that behaves as the real one), a fake ComfyUI and a fake JupyterLab, run through subprocess with `HOME` in a temporary folder. Each test's docstring names the incident it reproduces | Python 3.8 or newer |
+| `test_train.py` | `train.py` against fake trainers in a temporary `/workspace`: recipes and their base files, dataset configs and checks, the clips' lengths (with a stand-in for PyAV), sample prompts, stages, a run end to end, a chain, a mixed dataset and a mixed run, a MOSS-Image run, a failure, `stop`, captions in a dry run (a mixed folder's included) and through a stand-in caption model (`--avoid`), `train prep` and a run from its edited files, the Next lines, and README's recipe table | Python 3.11 or newer (skipped below) |
 | `test_repo.py` | The files agree: `models.json` is whole, `pod.py` knows every profile, README's tables match `models.json` and `settings.env`, `bootstrap.sh`'s defaults match `settings.env`, the self-test's files are in the image profile, `bootstrap.sh` turns a Google Drive, Dropbox or GitHub share link into the same file link as `pod.py`, `custom_nodes.json` names known profiles, `bootstrap.sh` installs the custom nodes `pod.py` announces; `pod.py` reads the record of a training run as `train.py` writes it | Python 3.8 or newer (`sed` for the last test) |
 
 **CI** (`.github/workflows/tests.yml`) runs on every push and pull request: pyflakes, shellcheck and vermin; the whole suite on Python 3.12 and 3.14; the pod and repository tests on Python 3.8.
@@ -180,9 +200,9 @@ python -m unittest discover -s tests -p "test_repo.py"  # under a second: the fi
 **What only a pod can test.** `bootstrap.sh` runs only on a real pod (shellcheck checks it statically), and the real trainers only on a GPU. When a change touches them, run this on an RTX PRO 6000 pod before the release, with the branch's address in `AINVFX_REPO_RAW`:
 
 1. `python pod.py up image+train --set AINVFX_REPO_RAW=https://raw.githubusercontent.com/AInVFX/ainvfx-runpod/<branch>`: the log reaches `TRAINERS OK`, `SELFTEST OK` and `READY`.
-2. `train recipes`, then a 10-image dataset through `push --dataset`, then `train caption`.
-3. `train zimage t1 --steps 250`, `train moss m1 --steps 250`, and a two-pair `ltx_iclora` run of 250 steps; each LoRA loads in ComfyUI.
-4. During the last run, `python pod.py down --when-done`: it waits for the run's end, brings the runs home, then terminates the pod.
+2. `train recipes`, then a 10-image dataset through `push --dataset`, then `train caption --avoid` with one word: no caption uses it, and the captions are downloaded beside the images.
+3. `train prep zimage t1 --dataset <it> --steps 250`, an edit of both files on the computer, then `train zimage t1 --dataset <it> --steps 250`: the edits reach the run. Then `train moss m1 --steps 250`, and a two-pair `ltx_iclora` run of 250 steps; each LoRA loads in ComfyUI.
+4. During the last run, `python pod.py down --when-done`: it waits for the run's end, downloads the runs, then terminates the pod.
 
 ## 11. How to make common changes
 
@@ -238,6 +258,9 @@ The variable appears once, so the command works whether Runpod runs it directly 
 - **`--from` loads without a strict check.** Both trainers load the starting weights with `strict=False`: weights of another recipe load nothing, and only the log line `load network weights` says so. Another rank fails, since the shapes differ.
 - **The `ltx_mix` recipe** reads its clips with `frame_extraction = "full"`, which decodes each clip whole before it keeps up to `max_frames`: a long clip costs time and memory.
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
-- **`down --when-done` runs on the user's computer**, which must stay on and online: the pull comes before the termination, and only that computer can pull. On a pod whose `train.py` is older than 1.6.1, the job record carries no `beat`: the wait believes the record, and cannot tell a run that died.
+- **`down --when-done` runs on the user's computer**, which must stay on and online: the download comes before the termination, and only that computer can download. On a pod whose `train.py` is older than 1.6.1, the job record carries no `beat`: the wait believes the record, and cannot tell a run that died.
+- **Whether the caption model obeys `--avoid`** shows only on a pod: the tests give a stand-in model. A caption that still uses a word after one rewrite is named, to edit by hand.
+- **Two `[ERROR] min_frames` lines** of the transformers library show when the caption model loads. They come from the library's own documentation check, and the captions are written all the same.
+- **A lost connection ends `python pod.py train` on the computer**, while the command continues on the pod: `python pod.py train log` follows a run again. `pod.py` does not connect again by itself.
 - **Custom nodes are not pinned.** `custom_nodes.json` and `AINVFX_CUSTOM_NODES` clone each node's default branch at its latest commit.
 - **The pod's address is its only protection.** ComfyUI has no login, and the log it serves holds JupyterLab's token. ComfyUI's own origin check refuses a click from another site, which is why the console's Connect button can show an empty 403 page: kept on purpose.

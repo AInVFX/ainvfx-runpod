@@ -40,7 +40,7 @@ python pod.py setup --hf-token   # optional: your Hugging Face token, for the ga
 python pod.py up image           # creates the pod, follows its log until READY
 python pod.py open               # opens ComfyUI in your browser
 python pod.py pull               # downloads the pod's output folder into outputs/<pod name>/
-python pod.py down               # pulls, then terminates: billing stops
+python pod.py down               # downloads, then terminates: billing stops
 ```
 
 `pod.py` uses Python's standard library only, so there is nothing to install. On your computer you need:
@@ -59,17 +59,17 @@ python pod.py down               # pulls, then terminates: billing stops
 | `status [pod]` | GPU, data center, cost so far, credit left, addresses, last log lines |
 | `logs [pod]` | Follows the log again until `READY` |
 | `open [pod]` | Opens ComfyUI in your browser |
-| `push [pod] FILES` | Copies files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training |
+| `push [pod] FILES` | Sends files into ComfyUI's input folder. `--dataset NAME` sends files and folders into `/workspace/dataset/NAME`, for training, and records your folder: the captions written on the pod come back into it |
 | `push --lora [pod] FILE` | Puts a model file into ComfyUI's `models/loras`, from your computer or a web address. `--to FOLDER` names any other model folder: `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`... ([Models to a pod](#models-to-a-pod)) |
 | `push [pod] URL` | The pod downloads a web address itself: one file, or every file that a folder page lists. `--frames 480-600` keeps the frames of that range, `--into NAME` names the folder under ComfyUI's input. With `--dataset NAME`, the files go to `/workspace/dataset/NAME` |
-| `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/` |
-| `down [pod]` | Pulls, terminates, then gives the pod's cost and the credit left. A file that does not come is tried three times; if one is still missing, `down` asks before it terminates. `--all` for every pod recorded here, `--no-pull` to skip the download, `--when-done` to wait first for the training run in progress on the pod, its new files pulled every 5 minutes meanwhile ([A first run](#a-first-run)) |
+| `pull [pod]` | Downloads every new file of the pod's output folder into `outputs/<pod name>/`, and the text files of its datasets (captions and dataset configs) into `outputs/<pod name>/dataset/` |
+| `down [pod]` | Downloads, terminates, then gives the pod's cost and the credit left. A file that is not downloaded is tried three times; if one is still missing, `down` asks before it terminates. `--all` for every pod recorded here, `--no-pull` to skip the download, `--when-done` to wait first for the training run in progress on the pod, its new files downloaded at once, then every 5 minutes ([A first run](#a-first-run)) |
 | `ssh [pod]` | A terminal on the pod |
-| `train [pod] ...` | Runs the pod's own `train` command from your computer, with the same words: `train caption`, `train <recipe>`, `train log`, `train status`, `train stop` ([Training a LoRA](#training-a-lora)). Its output shows here. Ctrl+C acts as in the pod's terminal, and a run that has started goes on; if the connection drops, the command keeps running on the pod |
+| `train [pod] ...` | Runs the pod's own `train` command from your computer, with the same words: `train caption`, `train prep`, `train <recipe>`, `train log`, `train status`, `train stop` ([Training a LoRA](#training-a-lora)). Its output shows here, then the files that `train caption` and `train prep` wrote are downloaded. Ctrl+C acts as in the pod's terminal, and a run that has started continues; if the connection drops, the command continues on the pod |
 | `list` | Every pod of your account, and which ones this computer knows |
 | `doctor` | Checks Python, ssh, the API key and the settings |
 
-`[pod]` is the profile, the name given to `up --name`, the pod's name or its id, matched exactly: `image` is the pod of `up image`, never the pod of `up image+3d`. You can leave it out when one pod is recorded. Ctrl+C while a log is followed stops the following only: the pod keeps running until `down`. `python pod.py --help` lists every option.
+`[pod]` is the profile, the name given to `up --name`, the pod's name or its id, matched exactly: `image` is the pod of `up image`, never the pod of `up image+3d`. You can leave it out when one pod is recorded. Ctrl+C while a log is followed stops the following only: the pod keeps running until `down`. `python pod.py --help` lists every option. Each command ends with a `Next:` line: the command to type next, and why.
 
 **Several pods at once.** `up video+train --name jar-lora` creates a second pod, known here as `jar-lora`. A pod created from the console or from another computer is attached by its first command (`python pod.py status <name or id>`).
 
@@ -142,6 +142,7 @@ Some repositories are **gated**: Hugging Face serves their files only to an acco
 - **Images and videos in**: the upload button of a Load Image or Load Video node, or `python pod.py push file1 file2`.
 - **Files from a web address**: `python pod.py push URL`. The pod downloads them itself, so nothing passes through your own connection ([Files from a web address](#files-from-a-web-address)).
 - **A training dataset in**: `python pod.py push --dataset NAME FOLDER` ([Training a LoRA](#training-a-lora)).
+- **Captions out**: after `python pod.py train caption NAME`, beside each file of FOLDER, and in `outputs/<pod name>/dataset/NAME/`. `pull` and `down` also download the text files of every dataset (captions and dataset configs, never images or clips) into `outputs/<pod name>/dataset/`.
 - **A model file in**, at the last minute: `python pod.py push --lora FILE` or `--to FOLDER`, from your computer or a web address ([Models to a pod](#models-to-a-pod)).
 - **Results out**: the Assets panel in ComfyUI, or `python pod.py pull`. It downloads every file of the pod's output folder that you do not have yet, subfolders kept: images, videos, 3D files, and files a node saves without showing them, such as a trained LoRA. Results go to `outputs/<pod name>/` next to the script, or to the folder named in the `AINVFX_OUTPUTS` environment variable. Without JupyterLab, `pull` gets only the files that ComfyUI's history lists. `down` runs the same pull first.
 - **Many files at once**: JupyterLab, from the link of the `READY` line. Its terminal is under File, New, Terminal.
@@ -164,7 +165,7 @@ python pod.py push https://example.org/plates/shot_010/ --frames 480-600 --into 
 
 ### Models to a pod
 
-`--to FOLDER` puts model files into that folder of ComfyUI's `models`, and `--lora` is short for `--to loras`. A file on your computer goes up through the pod's JupyterLab; a web address is downloaded by the pod itself. With a pod's name, the options come first: `python pod.py push --lora my-pod FILE`.
+`--to FOLDER` puts model files into that folder of ComfyUI's `models`, and `--lora` is short for `--to loras`. A file on your computer is sent through the pod's JupyterLab; a web address is downloaded by the pod itself. With a pod's name, the options come first: `python pod.py push --lora my-pod FILE`.
 
 ```bash
 python pod.py push --lora outputs/my-pod/train/mychar_v1/mychar_v1.comfy.safetensors      # a LoRA you trained
@@ -175,14 +176,14 @@ python pod.py push --to diffusion_models https://example.org/models/my_model.saf
 
 - **The folder** is one of ComfyUI's own: `loras`, `vae`, `diffusion_models`, `text_encoders`, `checkpoints`, `upscale_models`, `controlnet`, `latent_upscale_models`, `clip_vision` and the others of its `models` folder. `lora`, `checkpoint`, `diffusion_model`, `unet`, `text_encoder` and `clip` name them too. A custom node's own folder works (`--to sam3`), with a note; one subfolder too (`--to loras/ltx`).
 - **A web address** can be a file, a Hugging Face file page or download link, `hf://owner/repo/path` (`hf://datasets/owner/repo/path` for a dataset, `@revision` after the repository for another branch), or a Google Drive, Dropbox or GitHub share link of one file. The file keeps its name.
-- **A gated Hugging Face file** comes down when your token is stored (`setup --hf-token`) and its licence is accepted on that account. The pod sends the token to huggingface.co only.
-- **A file from your computer** goes up at the speed of your connection, with a progress line every 10 seconds: megabytes sent, speed, time left. A web address is faster, since the pod downloads it itself.
+- **A gated Hugging Face file** is downloaded when your token is stored (`setup --hf-token`) and its licence is accepted on that account. The pod sends the token to huggingface.co only.
+- **A file from your computer** is sent at the speed of your connection, with a progress line every 10 seconds: megabytes sent, speed, time left. A web address is faster, since the pod downloads it itself.
 - **Run it again** after an interruption: a file already there with the same size is skipped.
 - **Then, in ComfyUI**, press R: the file appears in its loader's list.
 
 ## Training a LoRA
 
-The `train` profile makes the pod a training machine too. After ComfyUI, it installs two trainers, each at one tested commit and in its own environment: [musubi-tuner](https://github.com/kohya-ss/musubi-tuner) in [AkaneTendo25's fork](https://github.com/AkaneTendo25/musubi-tuner), the one that trains LTX 2.5, and [sd-scripts](https://github.com/kohya-ss/sd-scripts) for MOSS-Image. Then it adds the `train` command to the pod. No base model comes at start: the first run of a recipe downloads that recipe's files, once.
+The `train` profile makes the pod a training machine too. After ComfyUI, it installs two trainers, each at one tested commit and in its own environment: [musubi-tuner](https://github.com/kohya-ss/musubi-tuner) in [AkaneTendo25's fork](https://github.com/AkaneTendo25/musubi-tuner), the one that trains LTX 2.5, and [sd-scripts](https://github.com/kohya-ss/sd-scripts) for MOSS-Image. Then it adds the `train` command to the pod. No base model is downloaded at start: the first run of a recipe downloads that recipe's files, once.
 
 | Recipe | It learns | Dataset | Base files | Steps · learning rate · rank |
 |---|---|---|---|---|
@@ -199,27 +200,27 @@ A dataset is one folder. **Images**: each image with its caption, a `.txt` file 
 
 ### A first run
 
-On your computer:
+On your computer, in the toolkit's folder:
 
 ```bash
-python pod.py up train                          # or image+train, to test the LoRA with the course's image models
-python pod.py push --dataset mychar mychar/     # the folder's files go to /workspace/dataset/mychar on the pod
+python pod.py up train                                       # or image+train, to test the LoRA with the course's image models
+python pod.py push --dataset mychar mychar/                  # the folder's files go to /workspace/dataset/mychar on the pod
+python pod.py train caption mychar --trigger mychr           # a caption for every image or clip that has none
+python pod.py train prep zimage mychar_v1 --dataset mychar   # the checks, then the run's two files; nothing starts
+python pod.py train zimage mychar_v1 --dataset mychar        # the run, in the background; its log follows on screen
+python pod.py down --when-done                               # in a second terminal: downloads during the run, then terminates
 ```
 
-Then, from the same folder:
+Each command ends with a `Next:` line that names the next one. `python pod.py train` runs the pod's `train` command through its JupyterLab, with the same words. In a terminal on the pod (JupyterLab, from the link of the `READY` line: File, New, Terminal), type them without `python pod.py`: the rest of this guide writes them that way. If the connection drops, the command continues on the pod: do not run it again; `python pod.py train log` shows its log again.
 
-```bash
-python pod.py train caption mychar --trigger mychr      # writes a caption for every image that has none
-python pod.py train zimage mychar_v1 --dataset mychar   # trains in the background; its log follows on screen
-```
-
-`python pod.py train` runs the pod's `train` command through its JupyterLab, with the same words. In a terminal on the pod (JupyterLab, from the link of the `READY` line: File, New, Terminal), type them without `python pod.py`: the rest of this guide writes them that way. If the connection drops, the command keeps running on the pod: do not run it again; `python pod.py train status` says where it stands.
-
-- **Read every caption before training.** JupyterLab opens the `.txt` files under `workspace/dataset/mychar`. The caption model makes mistakes, and a wrong word is learned like the others. `train caption` ends with the words found in most captions: a word that describes the style goes in `--avoid`, then `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`. For `ltx_av`, `--audio` adds what is heard to each clip's caption: the caption model hears nothing and guesses the sound from the picture, so read those lines too.
-- **During the run**, Ctrl+C stops the display, never the run. `python pod.py train log` shows it again, `python pod.py train status` says where it stands, `python pod.py train stop` stops it, after asking. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
-- **Every 250 steps**, a checkpoint and test images (samples) land in `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI to refresh it). Judge the samples, not the loss curve: stop when they stop improving.
-- **At the end**, `python pod.py pull` or `down` brings the run home with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats. On another pod, `python pod.py push --lora <its .comfy.safetensors file>` puts it back into ComfyUI's LoRA list.
-- **To stop paying when the run ends**, once the run has started, leave `python pod.py down --when-done` running on your computer. It looks at the run once a minute, and every 5 minutes pulls the new files of the output folder: the samples, the checkpoints and the loss logs come as the run makes them. When the run has ended, it pulls what is left, then terminates the pod. If a file still does not come after three tries, it keeps the pod, which keeps billing, and names the file: terminating would erase it. `python pod.py down` then tries again, and asks before it terminates without that file. Your computer must stay on, awake and online until then. Ctrl+C stops the wait and leaves the pod running. To read the loss as a curve, run TensorBoard on your computer on the pulled logs: `pip install tensorboard`, then `tensorboard --logdir outputs/<pod name>/train`, and open http://localhost:6006. A run that failed or was stopped ends the wait too, so stop the wait before you stop a run to launch another. A run whose process died without a word, after a pod restart, is seen after 5 minutes without a sign of life.
+- **The captions.** `train caption` writes them on the pod and shows each one whole. Then they are downloaded beside your files in `mychar/`, and into `outputs/<pod name>/dataset/mychar/`. A caption of yours that differs from the pod's is replaced only after one question. Read every caption: the caption model makes mistakes, and a wrong word is learned like the others. Edit a caption on your computer, then `push --dataset` again; or edit it in JupyterLab, under `workspace/dataset/mychar`, then run `train caption` again: it writes nothing new, and downloads the captions.
+- **Words to avoid.** `train caption` ends with the words found in most captions. A word that describes the style goes in `--avoid`: `train caption mychar --trigger mychr --avoid "watercolor,brush" --overwrite`. The caption model is told never to use those words. A caption that still uses one is rewritten once, and named at the end when it still does: edit it by hand. For `ltx_av`, `--audio` adds what is heard to each clip's caption: the caption model hears nothing and guesses the sound from the picture, so read those lines too.
+- **The run's two files.** `train prep` takes the words of the run after `prep`. It runs the run's checks, shows its settings (steps, learning rate, rank, alpha), then shows `dataset.toml` (the dataset config) and `prompts.txt` (the sample prompts) in full, and downloads both into `outputs/<pod name>/train/<run>/`. Nothing starts. By default, `prompts.txt` holds two of your captions, then the recipe's own subject with your trigger. Edit the files there, or on the pod in JupyterLab, under `ComfyUI/output/train/<run>/`. The run sends a file you changed on your computer, keeps a file changed on the pod, and stops when a file changed in both places. It checks both files again, and shows them before it starts.
+- **During the run**, Ctrl+C stops the display, never the run. `python pod.py train log` shows it again, `python pod.py train status` shows its state, `python pod.py train stop` stops it, after asking. Run no workflow in ComfyUI meanwhile: the run needs the GPU's memory.
+- **Every 250 steps**, a checkpoint and test images (samples) are written into `ComfyUI/output/train/<run>/`, and the checkpoint appears in ComfyUI's LoRA list under `train/<run>/` (press r in ComfyUI to refresh it). Judge the samples, not the loss curve: stop when they stop improving.
+- **At the end**, `python pod.py pull` or `down` downloads the run with the rest of the output folder. An LTX checkpoint weighs about 0.65 GB in each of its two formats. On another pod, `python pod.py push --lora <its .comfy.safetensors file>` puts it back into ComfyUI's LoRA list.
+- **To stop paying when the run ends**, once the run has started, leave `python pod.py down --when-done` running on your computer, in a second terminal. It checks the run once a minute. It downloads the new files of the output folder at once, then every 5 minutes: the samples, the checkpoints, the loss logs and the datasets' captions arrive as the run makes them. When the run has ended, it downloads what is left, then terminates the pod. If a file is still not downloaded after three tries, it keeps the pod, which keeps billing, and names the file: terminating would erase it. `python pod.py down` then tries again, and asks before it terminates without that file. Your computer must stay on, awake and online until then. Ctrl+C stops the wait and leaves the pod running. A run that failed or was stopped ends the wait too, so stop the wait before you stop a run to start another. When a pod restarts, its run's process stops without writing how it ended: the wait sees it after 5 minutes without an update of the run's record.
+- **The loss as a curve.** In the toolkit's folder, run `uvx tensorboard --logdir outputs`, then open http://localhost:6006. `uvx` comes with [uv](https://docs.astral.sh/uv/getting-started/installation/) and runs TensorBoard without installing it into your Python: `pip install tensorboard` stops on a Python that the system manages. The samples are in `outputs/<pod name>/train/<run>/sample/`.
 
 ### Options of a run
 
@@ -230,11 +231,10 @@ python pod.py train zimage mychar_v1 --dataset mychar   # trains in the backgrou
 | `--lr X` | the learning rate: how fast the LoRA learns |
 | `--rank N` | the LoRA's rank (its size); alpha changes by the same factor, so the learning speed stays the same |
 | `--from RUN` | start from the final LoRA of an earlier run of the same recipe and rank, or from one of its checkpoints by file name; with `--steps`. The trainer's log line `load network weights` lists any key that did not load |
-| `--prompts FILE` | your own sample prompts (by default: two of your captions, then the recipe's own subject with your trigger) |
 | `--trigger WORD` | the trigger word of the third sample prompt, when the captions do not start with it |
 | `--then RUN [options]` | another stage after this one, in the same background run |
 
-Each run writes the dataset config it used (`dataset.toml`) into its folder: copy it to change a setting. A chain of three stages, here the three resolutions of an IC-LoRA, each stage starting from the one before:
+`train prep` takes the same options, and shows the settings they give. A chain has one prompts file, the first stage's: every stage renders its samples from it. A chain of three stages, here the three resolutions of an IC-LoRA, each stage starting from the one before:
 
 ```bash
 train ltx_iclora fx_s1 --dataset fx/low.toml \
@@ -261,7 +261,7 @@ The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods; `ltx_mix` 
 - **A file smaller than its bucket is enlarged**, and trains soft. Use files at the training size or larger.
 - **A clip filmed faster than 25 fps loses frames**: from 50 fps, the trainer keeps every second frame. A clip at 24 fps is read as it is.
 
-To train at another size, length or frame rate, copy the run's `dataset.toml`, change the copy and give it to the next run with `--dataset`. Three settings do it:
+To train at another size, length or frame rate, edit the run's `dataset.toml` between `train prep` and the run, or give a copy of it with `--dataset`. Three settings do it:
 
 | Setting | What it takes |
 |---|---|
@@ -341,7 +341,7 @@ python pod.py up image+video --gpu B200 --gpu B300 --retry
 
 ## What the log says
 
-The template's start command runs [`bootstrap.sh`](bootstrap.sh). Every line it writes starts with `[AINVFX]`. Before it, `up` shows Runpod's own system log as `[RUNPOD]` lines: the host fetching the image, then starting the container. These words mark the steps:
+The template's start command runs [`bootstrap.sh`](bootstrap.sh). Every line it writes starts with `[AINVFX]`. Before it, `up` shows Runpod's own system log as `[RUNPOD]` lines: the host downloading the image, then starting the container. These words mark the steps:
 
 | The log says | It means |
 |---|---|
@@ -351,7 +351,7 @@ The template's start command runs [`bootstrap.sh`](bootstrap.sh). Every line it 
 | `SELFTEST OK` | MOSS-Image made a test image: a thank-you poster with this repository's address. It needs the `image` profile |
 | `READY` | The pod is ready. The line gives the ComfyUI and JupyterLab links |
 | `Warning:` | Something is wrong or slow, such as an old driver or a slow disk. The line says what to do |
-| `ACTION NEEDED` | Gated files did not come (below) |
+| `ACTION NEEDED` | Gated files were not downloaded (below) |
 | `FAILED` | The pod cannot work on that machine. It stays up so the log can be read, and it bills |
 
 The log is also written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log`, so the pod serves it at its ComfyUI address too. [ARCHITECTURE.md](ARCHITECTURE.md) describes every step.
@@ -359,9 +359,9 @@ The log is also written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log`, so t
 ## When something goes wrong
 
 - **`FAILED` in the log.** The pod cannot work on that machine: Python, PyTorch or ComfyUI could not be installed, or PyTorch cannot see the GPU. The line says which. Terminate the pod and create another (`python pod.py down`, then `up`): it lands on another machine. `up` stops on that line.
-- **`ACTION NEEDED` in the log.** Some gated files did not come. Logged in to Hugging Face with the account the log names, click "Agree and access repository" on each page listed. Then fetch them on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal or after `python pod.py ssh`. A pod without a token needs one first (`setup --hf-token`), then a new pod.
+- **`ACTION NEEDED` in the log.** Some gated files were not downloaded. Logged in to Hugging Face with the account the log names, click "Agree and access repository" on each page listed. Then download them on the same pod: `bash /tmp/ainvfx-bootstrap.sh models`, in JupyterLab's terminal or after `python pod.py ssh`. A pod without a token needs one first (`setup --hf-token`), then a new pod.
 - **The trainers did not install.** The log says why. `bash /tmp/ainvfx-bootstrap.sh trainer` tries again on the same pod.
-- **No container after 8 minutes.** `up` prints a warning: the host is still fetching the image, or does not respond. The pod bills meanwhile. Run `python pod.py down`, then `up` again, usually in another data center.
+- **No container after 8 minutes.** `up` prints a warning: the host is still downloading the image, or does not respond. The pod bills meanwhile. Run `python pod.py down`, then `up` again, usually in another data center.
 - **A blank "403" page from the Connect button.** Press Enter in the address bar. ComfyUI refuses a page opened by a click from another site (a protection against sites that would control it), never an address typed or opened by `pod.py open`.
 - **GitHub unreachable at start.** The start command falls back to Runpod's own `/start.sh`: the pod still starts SSH and JupyterLab, so you can read the error.
 - **Any other error after the pod exists.** `pod.py` prints a message that names the pod, never a traceback. `python pod.py list` shows your pods, `down` terminates one. `AINVFX_DEBUG=1` prints the full trace for a bug report.
@@ -370,7 +370,7 @@ The log is also written to `/workspace/ComfyUI/input/ainvfx/bootstrap.log`, so t
 
 - ComfyUI has no login, and its proxy address is public: the pod id is its only protection. The log, served at that address, holds JupyterLab's token. Keep the address to yourself, and terminate the pod when you are done.
 - Community Cloud runs on machines owned by third parties. Keep client material on Secure Cloud, or on your own computer.
-- The API key sits in one file readable by your account only (`chmod 600`, or an `icacls` grant on Windows). `RUNPOD_API_KEY` in the environment takes precedence, so you can avoid the file entirely.
+- The API key is in one file readable by your account only (`chmod 600`, or an `icacls` grant on Windows). `RUNPOD_API_KEY` in the environment takes precedence, so you can avoid the file entirely.
 - The Hugging Face token stays on Runpod as a secret; pods receive it when they start.
 - Nothing survives termination: `down` downloads your results first.
 
