@@ -556,6 +556,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"name": path.split("/")[-1], "path": path, "type": "directory", "content": entries})
         if rest.startswith("files/"):
             path = rest[len("files/"):]
+            if path in STATE["jfs"]:                       # a file written through the contents API
+                data = bytes(STATE["jfs"][path])
+                self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+                self.wfile.write(data); return
             rel = path[len(root) + 1:] if path.startswith(root + "/") else None
             if rel not in files:
                 return self.problem(404, "no such file")
@@ -1477,6 +1481,76 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("train", "log")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("no train command", out, out)
+
+    def test_train_caption_downloads_the_captions(self):
+        """A participant lost the captions written on a pod when it ended. Now push --dataset records the folder it sent, and after
+        python pod.py train caption the pod's captions come into outputs/<pod>/dataset/NAME/ and beside the files of that
+        folder: a missing one is written, an identical one left, ones that differ replaced after one question only, and
+        nothing replaced when no one answers. NAME/images names NAME; a .toml downloads nothing; a dataset sent from
+        elsewhere goes to outputs/ only; pull brings the datasets' text files, never media, an edit of the same size
+        included. The Next line stays last."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {}                                       # JupyterLab answers
+        ds = os.path.join(self.home, "oldspace")
+        os.makedirs(os.path.join(ds, "images"))
+        mine = {"images/a.png": b"\x89PNGa", "images/b.png": b"\x89PNGb", "images/c.png": b"\x89PNGc",
+                "images/b.txt": b"w, the pod's b\r\n", "images/c.txt": b"w, my own c\n"}
+        for rel, data in mine.items():
+            with open(os.path.join(ds, rel), "wb") as f:
+                f.write(data)
+        out, rc = self.run_pod("push", "--dataset", "oldspace", ds)
+        self.assertEqual(rc, 0, out)
+        cfg = json.loads(read_text(os.path.join(self.home, ".ainvfx-runpod", "config.json")))
+        self.assertEqual(cfg["pods"]["image"]["datasets"], {"oldspace": [os.path.realpath(ds)]})
+        top = "workspace/dataset/oldspace/images/"
+        for stem in "abc":                                           # what train caption wrote on the pod
+            STATE["jfs"][top + stem + ".txt"] = bytearray(b"w, the pod's " + stem.encode() + b"\n")
+        fake = os.path.join(self.home, "train")
+        with open(fake, "w") as f:
+            f.write("#!%s\nprint('[1/1] a.png')\nprint('Next:  python pod.py train later   (why)')\n" % sys.executable)
+        os.chmod(fake, 0o755)
+        self.env["AINVFX_POD_TRAIN"] = fake
+        out, rc = self.run_pod("train", "caption", "oldspace/images", "--trigger", "w", "--avoid", "scene")
+        self.assertEqual(rc, 0, out)
+
+        def local(rel):
+            with open(os.path.join(ds, rel), "rb") as f:
+                return f.read()
+        self.assertEqual([local("images/" + s + ".txt") for s in "abc"],
+                         [b"w, the pod's a\n", b"w, the pod's b\r\n", b"w, my own c\n"], out)
+        self.assertIn("1 caption(s) of {} differ from the pod's: {}".format(os.path.realpath(ds),
+                                                                          os.path.join(os.path.realpath(ds), "images", "c.txt")), out)
+        self.assertIn("No one answered. Your 1 caption(s) stay as they are.", out)
+        self.assertIn("1 new, 0 replaced, 1 unchanged", out)
+        copy = [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs]
+        self.assertEqual(sorted(os.path.basename(p) for p in copy), ["a.txt", "b.txt", "c.txt"], out)
+        self.assertTrue(all(os.sep + os.path.join("dataset", "oldspace", "images") + os.sep in p for p in copy), copy)
+        self.assertEqual(out.rstrip().splitlines()[-1], "Next:  python pod.py train later   (why)", out)
+        out, rc = self.run_pod("train", "caption", "oldspace", "--trigger", "w", input="y\n")
+        self.assertEqual(local("images/c.txt"), b"w, the pod's c\n", out)
+        self.assertIn("0 new, 1 replaced, 2 unchanged", out)
+        out, rc = self.run_pod("train", "caption", "mine.toml", "--trigger", "w")
+        self.assertIn("mine.toml is a dataset config: no caption downloaded", out, out)
+        STATE["jdirs"].add("workspace/dataset/other")
+        STATE["jfs"]["workspace/dataset/other/z.txt"] = bytearray(b"w, z\n")
+        out, rc = self.run_pod("train", "caption", "other", "--trigger", "w")
+        self.assertIn("No folder of this computer is recorded for other", out, out)
+        STATE["jfs"][top + "a.txt"] = bytearray(b"w, the pod's A\n")    # edited in JupyterLab, same size
+        out, rc = self.run_pod("pull")
+        self.assertEqual(rc, 0, out)
+        got = {os.path.relpath(os.path.join(r, f), os.path.join(self.home, "outputs")).replace(os.sep, "/").split("/", 1)[1]
+               for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs}
+        self.assertEqual(got, {"dataset/oldspace/images/a.txt", "dataset/oldspace/images/b.txt", "ainvfx_selftest_00001_.png",
+                               "dataset/oldspace/images/c.txt", "dataset/other/z.txt"}, out)
+        with open(os.path.join(self.home, "outputs", STATE["pods"]["fakepod1"]["name"], "dataset", "oldspace", "images",
+                               "a.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"w, the pod's A\n", out)
+        self.assertEqual(local("images/a.txt"), b"w, the pod's a\n", "pull never touches the dataset folder")
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
     def test_push_from_a_web_address(self):
         """`push URL`: the pod downloads by itself. The code that pod.py sends runs for real in the fake kernel, against

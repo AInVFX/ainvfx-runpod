@@ -126,6 +126,7 @@ EUROPE_CITY_COUNTRY = {"Paris": "FR", "Prague": "CZ", "Bucharest": "RO", "Amster
 # bootstrap.sh writes its log inside ComfyUI's input folder, so the pod also serves it through its proxy.
 LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
 OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root
+DATASET_DIRS = ("workspace/dataset", "dataset")                 # and the datasets' folder
 SKIP_NAMES = {"_output_images_will_be_put_here"}               # the empty placeholder ComfyUI creates
 # Training: a pod with `train` also holds the trainers' environments, the caption model, caches and checkpoints.
 TRAIN_RESERVE_GB = 70
@@ -1889,9 +1890,9 @@ def cmd_push(args):
                                               if args.dataset else ""))
         if f.is_dir() and not args.dataset:
             die("{} is a folder: ComfyUI's input takes files; a training dataset goes with --dataset NAME".format(f))
-    _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
+    tag, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
     if args.dataset:
-        return push_dataset(rec, args.dataset, files)
+        return push_dataset(rec, args.dataset, files, tag)
     if not comfy_alive(rec["id"]):
         die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
     for f in files:
@@ -2044,6 +2045,150 @@ def dataset_plan(paths):
     return plan
 
 
+def jupyter_link(rec):
+    """(base address, headers) of the pod's JupyterLab, with the token of the READY line; None when it does not
+    answer."""
+    pod_id = rec["id"]
+    token = jupyter_token(proxy_log(pod_id)) if comfy_alive(pod_id) else None
+    return (pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}) if token else None
+
+
+def jupyter_read(base, hdrs, path):
+    """The bytes of one file of the pod, through JupyterLab; None when the pod has no such file."""
+    try:
+        return request("GET", base + "/files/" + urllib.parse.quote(path), headers=hdrs, timeout=120, raw=True)
+    except ApiError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def write_if_changed(target, data):
+    """Writes the bytes into the file, through a temporary file, unless it holds them already. True when written."""
+    try:
+        if target.read_bytes() == data:
+            return False
+    except OSError:
+        pass
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".ainvfx-tmp")
+    tmp.write_bytes(data)
+    os.replace(str(tmp), str(target))
+    return True
+
+
+def pod_dataset_name(ref):
+    """The dataset a `train` word names on the pod: NAME for NAME, NAME/images or /workspace/dataset/NAME/...; None
+    for anything else."""
+    parts = [x for x in ref.replace("\\", "/").split("/") if x not in ("", ".")]
+    if ref.startswith("/"):
+        root = [x for x in POD_DATASET.split("/") if x]
+        if parts[:len(root)] != root:
+            return None
+        parts = parts[len(root):]
+    return parts[0] if parts and DATASET_NAME.fullmatch(parts[0]) else None
+
+
+def caption_refs(words):
+    """The datasets that `train caption ...` names: its words that are neither options nor their values."""
+    refs, value = [], False
+    for w in words[1:]:
+        if value:
+            value = False
+        elif w in ("--trigger", "--avoid", "--max-words"):
+            value = True
+        elif not w.startswith("-"):
+            refs.append(w)
+    return refs
+
+
+def download_captions(rec, refs):
+    """After `train caption`: every caption (.txt) of each dataset named comes from the pod into
+    outputs/<pod name>/dataset/<NAME>/, and beside the files of the folder that `push --dataset` sent from this
+    computer (dataset_plan finds each file's place). There a missing caption is written and an identical one left;
+    captions that differ are replaced only after one question for all of them."""
+    link = jupyter_link(rec)
+    if not link:
+        say("The pod's JupyterLab does not answer: the captions stay on the pod. `python pod.py pull` downloads them "
+            "into {} later.".format(outputs_of(rec) / "dataset"))
+        return
+    base, hdrs = link
+    names = []
+    for ref in refs:
+        name = None if ref.endswith(".toml") else pod_dataset_name(ref)
+        if ref.endswith(".toml"):
+            say("{} is a dataset config: no caption downloaded for it (`python pod.py pull` downloads every caption of "
+                "the pod).".format(ref))
+        elif name and name not in names:
+            names.append(name)
+    for name in names:
+        top, files = None, None
+        for top in DATASET_DIRS:
+            files = jupyter_tree(base, hdrs, top + "/" + name)
+            if files is not None:
+                break
+        if files is None:
+            say("No dataset folder {} on the pod: no caption downloaded.".format(name))
+            continue
+        caps = {}
+        for rel, _ in files:
+            if rel.lower().endswith(".txt"):
+                data = jupyter_read(base, hdrs, top + "/" + name + "/" + rel)
+                if data is not None:
+                    caps[rel] = data
+        copy = outputs_of(rec) / "dataset" / name
+        for rel, data in caps.items():
+            write_if_changed(copy.joinpath(*rel.split("/")), data)
+        mine = [Path(p) for p in (rec.get("datasets") or {}).get(name) or []]
+        here = [p for p in mine if p.exists()]
+        if not here:
+            say("{} caption(s) downloaded into {}. {}: that copy is the only one.".format(len(caps), copy, (
+                "The folder sent from this computer is no longer there: {}".format(", ".join(map(str, mine))) if mine
+                else "No folder of this computer is recorded for {} (sent from another computer, or through "
+                     "JupyterLab)".format(name))))
+            continue
+        plan = dataset_plan(here)
+        by_rel = {rel: f for f, rel in plan}
+        by_stem = {rel.rsplit(".", 1)[0]: f for f, rel in plan
+                   if rel.lower().endswith(DATASET_IMAGES + DATASET_VIDEOS + DATASET_SOUNDS)}
+        new, differ, same = [], [], 0
+        for rel, data in sorted(caps.items()):
+            target = by_rel.get(rel) or (by_stem[rel[:-4]].with_suffix(".txt") if rel[:-4] in by_stem else None)
+            if target is None:
+                continue
+            try:
+                old = target.read_bytes()
+            except OSError:
+                new.append((target, data))
+                continue
+            if clean_text(old) == clean_text(data):
+                same += 1
+            else:
+                differ.append((target, data))
+        for target, data in new:
+            write_if_changed(target, data)
+        where = ", ".join(str(p) for p in here)
+        replaced = 0
+        if differ:
+            listed = ", ".join(str(t) for t, _ in differ[:4]) + (" and {} more".format(len(differ) - 4)
+                                                                  if len(differ) > 4 else "")
+            try:
+                answer = input("{} caption(s) of {} differ from the pod's: {}. Replace them with the pod's? "
+                               "[y/N] ".format(len(differ), where, listed))
+            except EOFError:
+                answer = None
+                say()
+            if answer is not None and answer.strip().lower() in ("y", "yes"):
+                for target, data in differ:
+                    write_if_changed(target, data)
+                replaced = len(differ)
+            else:
+                say("{}Your {} caption(s) stay as they are. The pod's are in {}.".format(
+                    "No one answered. " if answer is None else "", len(differ), copy))
+        say("Captions of {} downloaded: {} new, {} replaced, {} unchanged beside your files in {}; all {} in {}.".format(
+            name, len(new), replaced, same, where, len(caps), copy))
+
+
 def jupyter_upload(base, hdrs, path, local, data=None, progress=None):
     """One file through JupyterLab's contents API. A file that fits one request is written by one PUT, which Jupyter
     writes atomically; a larger one goes in chunks into <name>.part (chunk 1 starts it, -1 ends it), renamed over
@@ -2168,10 +2313,11 @@ def push_models(rec, folder, paths):
     say("Done. In ComfyUI, press R to refresh the model lists.")
 
 
-def push_dataset(rec, name, paths):
+def push_dataset(rec, name, paths, tag):
     """Files and folders into /workspace/dataset/<name>/, through the pod's JupyterLab with the token of the READY
     line. Captions and configs go cleaned (clean_text); a file already there with the same size is skipped, except
-    text files, which always go (an edited caption can keep its size)."""
+    text files, which always go (an edited caption can keep its size). The pod's record keeps the paths sent, under
+    the dataset's name: the captions written on the pod come back beside these files (download_captions)."""
     plan = dataset_plan(paths)
     if not plan:
         die("nothing to send: the folders hold no files (hidden ones stay behind)")
@@ -2217,6 +2363,8 @@ def push_dataset(rec, name, paths):
             say("   {}/{} files · {:.0f} of {:.0f} MB".format(k, len(plan), done / 1e6, total / 1e6))
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
         sent, kept, total / 1e6, time.time() - t0, name))
+    rec.setdefault("datasets", {})[name] = [str(p.resolve()) for p in paths]
+    remember_pod(load_config(), tag, rec)
     media = [rel for _, rel in plan if rel.lower().endswith(DATASET_IMAGES + DATASET_VIDEOS)]
     captions = {rel.rsplit(".", 1)[0] for _, rel in plan if rel.lower().endswith(".txt")}
     if not media or any(rel.rsplit(".", 1)[0] not in captions for rel in media):
@@ -2646,6 +2794,7 @@ def pull(rec, report=None):
             listed.add(rel)
             get(rel, pod_url(pod_id, JUPYTER_PORT) + "/files/" + urllib.parse.quote(root + "/" + rel), size,
                 {"Authorization": "token " + token})
+        count += pull_dataset_texts(pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}, dest, failed)
     if not comfy:
         say("ComfyUI does not answer on the pod: nothing to pull through it.")
         return count
@@ -2662,6 +2811,31 @@ def pull(rec, report=None):
     if not root:
         say("JupyterLab did not answer: only the files in ComfyUI's history came back. A file saved before a ComfyUI "
             "restart, or by a node that reports nothing, stays on the pod: fetch it from JupyterLab's file browser.")
+    return count
+
+
+def pull_dataset_texts(base, hdrs, dest, failed):
+    """The text files of the pod's datasets (captions and dataset configs, never media) into <dest>/dataset/. Each is
+    read again at every pull, so a caption edited on the pod comes even when its size did not change. Returns how many
+    are new or changed here."""
+    top, texts, count = None, None, 0
+    for top in DATASET_DIRS:
+        texts = jupyter_tree(base, hdrs, top, failed)
+        if texts is not None:
+            break
+    for rel, _ in texts or []:
+        if not rel.lower().endswith(TEXT_SUFFIXES):
+            continue
+        try:
+            data = jupyter_read(base, hdrs, top + "/" + rel)
+        except ApiError as e:
+            say("  skipped dataset/{} ({})".format(rel, e.code or e.detail[:100]))
+            failed.append("dataset/" + rel)
+            continue
+        target = dest.joinpath("dataset", *rel.split("/"))
+        if data is not None and write_if_changed(target, data):
+            count += 1
+            say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), len(data) / 1e6))
     return count
 
 
@@ -3025,6 +3199,7 @@ def cmd_train(args):
     cfg = load_config()
     ref, words = train_target(cfg.get("pods") or {}, list(args.words))
     _, rec = which_pod(cfg, ref)
+    helped = bool({"-h", "--help"} & set(words))
     if words[:1] == ["stop"] and not {"-y", "--yes"} & set(words[1:]):
         try:
             answer = input("Stop the training run on {}? Its checkpoints stay. [y/N] ".format(rec.get("name")))
@@ -3055,6 +3230,11 @@ def cmd_train(args):
         out.release()
         die("the link to the pod closed before train ended; the command goes on there. In a few minutes, "
             "`python pod.py train status` says where the run stands.")
+    if out.code == 0 and not helped and words[:1] == ["caption"] and "--dry-run" not in words:
+        try:
+            download_captions(rec, caption_refs(words))
+        except ApiError as e:
+            say("The captions could not be downloaded ({}): `python pod.py pull` tries again.".format(e.detail[:100]))
     out.release()
     sys.exit(exit_status(out.code))
 
