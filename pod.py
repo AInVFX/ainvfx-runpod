@@ -135,9 +135,8 @@ UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per reques
                                                               # proxy's limit
 UPLOAD_NOTE = env_num("AINVFX_UPLOAD_NOTE", "10")           # seconds between two progress lines of a model file going up
 TEXT_SUFFIXES = (".txt", ".toml", ".json", ".jsonl", ".md", ".csv")
-DATASET_IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")   # train.py's IMAGES, VIDEOS and SOUNDS (test_repo)
+DATASET_IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")   # train.py's IMAGES and VIDEOS
 DATASET_VIDEOS = (".mp4", ".webm", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg")
-DATASET_SOUNDS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma")
 DATASET_SKIP = {"__MACOSX", "Thumbs.db", "desktop.ini"}       # left behind, as every hidden name
 DATASET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 WEB_ADDRESS = re.compile(r"https?://", re.I)
@@ -1891,9 +1890,9 @@ def cmd_push(args):
                                               if args.dataset else ""))
         if f.is_dir() and not args.dataset:
             die("{} is a folder: ComfyUI's input takes files; a training dataset goes with --dataset NAME".format(f))
-    tag, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
+    _, rec = which_pod(load_config(), args.profile)   # after the files: a wrong path stops before any lookup
     if args.dataset:
-        return push_dataset(rec, args.dataset, files, tag)
+        return push_dataset(rec, args.dataset, files)
     if not comfy_alive(rec["id"]):
         die("ComfyUI does not answer on the pod yet. `python pod.py status` shows the log.")
     for f in files:
@@ -1916,7 +1915,8 @@ def cmd_pull(args):
 def tensorboard_next(folders):
     """The Next line once a training run's files are here: TensorBoard on the outputs folder, and where the samples
     are. Nothing when none of these pods' folders holds a run."""
-    runs = sorted(d for f in folders for d in (f / "train").glob("*") if d.is_dir())
+    runs = sorted(d for f in folders for d in (f / "train").glob("*")
+                  if d.is_dir() and any(x.name not in PREP_FILES for x in d.iterdir()))   # more than what prep downloads
     if not runs:
         return
 
@@ -2108,91 +2108,123 @@ def caption_refs(words):
     return refs
 
 
-def download_captions(rec, refs):
-    """After `train caption`: every caption (.txt) of each dataset named comes from the pod into
-    outputs/<pod name>/dataset/<NAME>/, and beside the files of the folder that `push --dataset` sent from this
-    computer (dataset_plan finds each file's place). There a missing caption is written and an identical one left;
-    captions that differ are replaced only after one question for all of them."""
-    link = jupyter_link(rec)
-    if not link:
-        say("The pod's JupyterLab does not answer: the captions stay on the pod. `python pod.py pull` downloads them "
-            "into {} later.".format(outputs_of(rec) / "dataset"))
-        return
-    base, hdrs = link
+def keep_record(rec):
+    """Saves a pod's record into the configuration, under the name it has there."""
+    cfg = load_config()
+    for tag, known in (cfg.get("pods") or {}).items():
+        if known.get("id") == rec.get("id"):
+            remember_pod(cfg, tag, rec)
+            return
+
+
+def option_values(words, option):
+    """The values given to an option among a command's words: `--dataset X` and `--dataset=X`."""
+    return [b for a, b in zip(words, words[1:]) if a == option] + [w[len(option) + 1:] for w in words
+                                                                   if w.startswith(option + "=")]
+
+
+def dataset_names(refs):
+    """The datasets of the pod that these words name, each once; a dataset config (.toml) names none."""
     names = []
     for ref in refs:
         name = None if ref.endswith(".toml") else pod_dataset_name(ref)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def dataset_top(base, hdrs, name):
+    """A dataset's folder as the pod's JupyterLab names it (workspace/dataset/<n>, or dataset/<n>); None when the
+    pod has no such folder."""
+    for top in DATASET_DIRS:
+        try:
+            if request("GET", base + "/api/contents/" + urllib.parse.quote(top + "/" + name) + "?content=0", headers=hdrs,
+                       timeout=60).get("type") == "directory":
+                return top + "/" + name
+        except ApiError:
+            pass
+    return None
+
+
+def download_captions(cfg, tag, rec, refs):
+    """After `train caption`: every caption (.txt) of each dataset named is downloaded into
+    outputs/<pod name>/dataset/<n>/, with the pod's sub-folders: the one place to read and edit captions on this
+    computer. The pod's record keeps each caption's fingerprint, which tells later the captions edited here
+    (send_captions, pull)."""
+    link = jupyter_link(rec)
+    if not link:
+        say("The pod's JupyterLab does not answer: the captions are on the pod, under /workspace/dataset. `python pod.py "
+            "pull` downloads them into {} later.".format(outputs_of(rec) / "dataset"))
+        return
+    base, hdrs = link
+    record = rec.setdefault("captions", {})
+    for ref in refs:
         if ref.endswith(".toml"):
             say("{} is a dataset config: no caption downloaded for it (`python pod.py pull` downloads every caption of "
                 "the pod).".format(ref))
-        elif name and name not in names:
-            names.append(name)
-    for name in names:
-        top, files = None, None
-        for top in DATASET_DIRS:
-            files = jupyter_tree(base, hdrs, top + "/" + name)
-            if files is not None:
-                break
+    for name in dataset_names(refs):
+        top = dataset_top(base, hdrs, name)
+        files = jupyter_tree(base, hdrs, top) if top else None
         if files is None:
             say("No dataset folder {} on the pod: no caption downloaded.".format(name))
             continue
-        caps = {}
+        copy, count = outputs_of(rec) / "dataset" / name, 0
         for rel, _ in files:
             if rel.lower().endswith(".txt"):
-                data = jupyter_read(base, hdrs, top + "/" + name + "/" + rel)
+                data = jupyter_read(base, hdrs, top + "/" + rel)
                 if data is not None:
-                    caps[rel] = data
-        copy = outputs_of(rec) / "dataset" / name
-        for rel, data in caps.items():
-            write_if_changed(copy.joinpath(*rel.split("/")), data)
-        mine = [Path(p) for p in (rec.get("datasets") or {}).get(name) or []]
-        here = [p for p in mine if p.exists()]
-        if not here:
-            say("{} caption(s) downloaded into {}. {}: that copy is the only one.".format(len(caps), copy, (
-                "The folder sent from this computer is no longer there: {}".format(", ".join(map(str, mine))) if mine
-                else "No folder of this computer is recorded for {} (sent from another computer, or through "
-                     "JupyterLab)".format(name))))
-            continue
-        plan = dataset_plan(here)
-        by_rel = {rel: f for f, rel in plan}
-        by_stem = {rel.rsplit(".", 1)[0]: f for f, rel in plan
-                   if rel.lower().endswith(DATASET_IMAGES + DATASET_VIDEOS + DATASET_SOUNDS)}
-        new, differ, same = [], [], 0
-        for rel, data in sorted(caps.items()):
-            target = by_rel.get(rel) or (by_stem[rel[:-4]].with_suffix(".txt") if rel[:-4] in by_stem else None)
-            if target is None:
+                    write_if_changed(copy.joinpath(*rel.split("/")), data)
+                    record[name + "/" + rel] = digest(data)
+                    count += 1
+        say("{} caption(s) downloaded into {}. Read each one before training, and edit it there: the caption model makes "
+            "mistakes, and a wrong word is learned like the others. The next `python pod.py train` command sends your "
+            "edits to the pod.".format(count, copy))
+    remember_pod(cfg, tag, rec)
+
+
+def send_captions(cfg, tag, rec, names):
+    """Before `train caption`, `train prep` and a run: each caption of outputs/<pod name>/dataset/<n>/ edited on this
+    computer since it was downloaded goes to the same place on the pod, cleaned (clean_text), and replaces the pod's.
+    A caption not edited here is left alone, here and on the pod."""
+    record = rec.setdefault("captions", {})
+    edited = []
+    for name in names:
+        folder = outputs_of(rec) / "dataset" / name
+        for f in sorted(folder.rglob("*.txt")) if folder.is_dir() else []:
+            if f.name.startswith(".") or not f.is_file():
                 continue
             try:
-                old = target.read_bytes()
+                mine = f.read_bytes()
             except OSError:
-                new.append((target, data))
                 continue
-            if clean_text(old) == clean_text(data):
-                same += 1
-            else:
-                differ.append((target, data))
-        for target, data in new:
-            write_if_changed(target, data)
-        where = ", ".join(str(p) for p in here)
-        replaced = 0
-        if differ:
-            listed = ", ".join(str(t) for t, _ in differ[:4]) + (" and {} more".format(len(differ) - 4)
-                                                                  if len(differ) > 4 else "")
+            rel = f.relative_to(folder).as_posix()
+            if record.get(name + "/" + rel) != digest(mine):
+                edited.append((name, rel, f, mine))
+    if not edited:
+        return
+    link = jupyter_link(rec)
+    if not link:
+        die("the pod's JupyterLab does not answer, so the {} caption(s) edited on this computer cannot be sent to the pod. "
+            "`python pod.py status` shows the pod; then run the same command again.".format(len(edited)))
+    base, hdrs = link
+    tops, sent = {}, []
+    for name, rel, f, mine in edited:
+        if name not in tops:
+            tops[name] = dataset_top(base, hdrs, name)
+        if not tops[name]:
+            continue                                      # no such dataset on the pod: the pod's train says so
+        theirs = jupyter_read(base, hdrs, tops[name] + "/" + rel)
+        if theirs is None or digest(theirs) != digest(mine):
             try:
-                answer = input("{} caption(s) of {} differ from the pod's: {}. Replace them with the pod's? "
-                               "[y/N] ".format(len(differ), where, listed))
-            except EOFError:
-                answer = None
-                say()
-            if answer is not None and answer.strip().lower() in ("y", "yes"):
-                for target, data in differ:
-                    write_if_changed(target, data)
-                replaced = len(differ)
-            else:
-                say("{}Your {} caption(s) stay as they are. The pod's are in {}.".format(
-                    "No one answered. " if answer is None else "", len(differ), copy))
-        say("Captions of {} downloaded: {} new, {} replaced, {} unchanged beside your files in {}; all {} in {}.".format(
-            name, len(new), replaced, same, where, len(caps), copy))
+                jupyter_upload(base, hdrs, tops[name] + "/" + rel, None, clean_text(mine))
+            except ApiError as e:
+                die("sending {} failed: {}\n{}".format(f, e.detail[:200], e.hint()))
+            sent.append(f)
+        record[name + "/" + rel] = digest(mine)
+    if sent:
+        say("{} caption(s) edited on this computer sent to the pod: {}{}".format(
+            len(sent), ", ".join(x.name for x in sent[:6]), " and {} more".format(len(sent) - 6) if len(sent) > 6 else ""))
+    remember_pod(cfg, tag, rec)
 
 
 def jupyter_upload(base, hdrs, path, local, data=None, progress=None):
@@ -2319,11 +2351,10 @@ def push_models(rec, folder, paths):
     say("Done. In ComfyUI, press R to refresh the model lists.")
 
 
-def push_dataset(rec, name, paths, tag):
+def push_dataset(rec, name, paths):
     """Files and folders into /workspace/dataset/<name>/, through the pod's JupyterLab with the token of the READY
     line. Captions and configs go cleaned (clean_text); a file already there with the same size is skipped, except
-    text files, which always go (an edited caption can keep its size). The pod's record keeps the paths sent, under
-    the dataset's name: the captions written on the pod come back beside these files (download_captions)."""
+    text files, which always go (an edited caption can keep its size)."""
     plan = dataset_plan(paths)
     if not plan:
         die("nothing to send: the folders hold no files (hidden ones stay behind)")
@@ -2369,8 +2400,6 @@ def push_dataset(rec, name, paths, tag):
             say("   {}/{} files · {:.0f} of {:.0f} MB".format(k, len(plan), done / 1e6, total / 1e6))
     say("{} file(s) sent, {} unchanged, {:.1f} MB in {:.0f} s -> /workspace/dataset/{}".format(
         sent, kept, total / 1e6, time.time() - t0, name))
-    rec.setdefault("datasets", {})[name] = [str(p.resolve()) for p in paths]
-    remember_pod(load_config(), tag, rec)
     media = [rel for _, rel in plan if rel.lower().endswith(DATASET_IMAGES + DATASET_VIDEOS)]
     captions = {rel.rsplit(".", 1)[0] for _, rel in plan if rel.lower().endswith(".txt")}
     if not media or any(rel.rsplit(".", 1)[0] not in captions for rel in media):
@@ -2812,7 +2841,11 @@ def pull(rec, report=None):
             listed.add(rel)
             get(rel, pod_url(pod_id, JUPYTER_PORT) + "/files/" + urllib.parse.quote(root + "/" + rel), size,
                 {"Authorization": "token " + token})
-        count += pull_dataset_texts(pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}, dest, failed)
+        record = rec.setdefault("captions", {})
+        before = dict(record)
+        count += pull_dataset_texts(pod_url(pod_id, JUPYTER_PORT), {"Authorization": "token " + token}, dest, failed, record)
+        if record != before:
+            keep_record(rec)
     if not comfy:
         say("ComfyUI does not answer on the pod: nothing to download through it.")
         return count
@@ -2833,10 +2866,11 @@ def pull(rec, report=None):
     return count
 
 
-def pull_dataset_texts(base, hdrs, dest, failed):
-    """The text files of the pod's datasets (captions and dataset configs, never media) into <dest>/dataset/. Each is
-    read again at every pull, so a caption edited on the pod comes even when its size did not change. Returns how many
-    are new or changed here."""
+def pull_dataset_texts(base, hdrs, dest, failed, record):
+    """The text files of the pod's datasets (captions and dataset configs, never media) into <dest>/dataset/, with the
+    pod's sub-folders. A file edited on this computer since its download stays as it is here (`record` holds the
+    fingerprints of what was downloaded); any other is read again at every pull, so a caption edited on the pod is
+    downloaded even when its size did not change. Returns how many are new or changed here."""
     top, texts, count = None, None, 0
     for top in DATASET_DIRS:
         texts = jupyter_tree(base, hdrs, top, failed)
@@ -2845,16 +2879,23 @@ def pull_dataset_texts(base, hdrs, dest, failed):
     for rel, _ in texts or []:
         if not rel.lower().endswith(TEXT_SUFFIXES):
             continue
+        target = dest.joinpath("dataset", *rel.split("/"))
+        try:
+            if digest(target.read_bytes()) != record.get(rel):
+                continue                                  # edited here, or not downloaded by pod.py: this copy stays
+        except OSError:
+            pass                                          # not on this computer yet
         try:
             data = jupyter_read(base, hdrs, top + "/" + rel)
         except ApiError as e:
             say("  skipped dataset/{} ({})".format(rel, e.code or e.detail[:100]))
             failed.append("dataset/" + rel)
             continue
-        target = dest.joinpath("dataset", *rel.split("/"))
-        if data is not None and write_if_changed(target, data):
-            count += 1
-            say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), len(data) / 1e6))
+        if data is not None:
+            record[rel] = digest(data)
+            if write_if_changed(target, data):
+                count += 1
+                say("  {}  ({:.1f} MB)".format(target.relative_to(OUTPUTS), len(data) / 1e6))
     return count
 
 
@@ -3130,22 +3171,21 @@ def download_prepared(cfg, tag, rec, runs):
                 write_if_changed(folder / name, data)
                 record[run][name] = digest(data)
         if record[run]:
-            say("{} downloaded into {}. Edit them there, or on the pod in JupyterLab: the run sends a file changed "
-                "here.".format(" and ".join(sorted(record[run])), folder))
+            say("{} downloaded into {}. Edit them there: the run sends your changes to the pod.".format(
+                " and ".join(sorted(record[run])), folder))
     remember_pod(cfg, tag, rec)
 
 
 def send_prepared(cfg, tag, rec, runs):
     """Before a run: each file of a prepared run that was changed on this computer since `train prep` downloaded it
-    goes back to the pod, cleaned (clean_text). A file changed on the pod alone stays as it is there; a file changed
-    in both places stops the run before it starts."""
+    goes back to the pod, cleaned (clean_text), and replaces the pod's. A file not changed here is left alone."""
     record = rec.get("prepared") or {}
     todo = [(run, name) for run in runs for name in sorted(record.get(run) or {})]
     link = jupyter_link(rec) if todo else None
     if not link:
         return
     base, hdrs = link
-    sends, both = [], []
+    sends = []
     for run, name in todo:
         local = outputs_of(rec) / "train" / run / name
         try:
@@ -3159,13 +3199,8 @@ def send_prepared(cfg, tag, rec, runs):
             continue
         if digest(theirs) == digest(mine):
             record[run][name] = digest(mine)
-        elif digest(theirs) != record[run][name]:
-            both.append(str(local))
         else:
             sends.append((run, name, root, local, mine))
-    if both:
-        die("changed both here and on the pod since train prep: {}. Keep one of the two: copy it over the other, then "
-            "run the same command again.".format(", ".join(both)))
     for run, name, root, local, mine in sends:
         jupyter_upload(base, hdrs, "{}/train/{}/{}".format(root, run, name), None, clean_text(mine))
         record[run][name] = digest(mine)
@@ -3297,8 +3332,14 @@ def cmd_train(args):
     ref, words = train_target(cfg.get("pods") or {}, list(args.words))
     tag, rec = which_pod(cfg, ref)
     helped = bool({"-h", "--help"} & set(words))
-    if words and words[0] not in TRAIN_WORDS and not words[0].startswith("-") and not helped:
-        send_prepared(cfg, tag, rec, run_names(words[1:]))     # a run: what was edited here since train prep
+    a_run = bool(words) and words[0] not in TRAIN_WORDS and not words[0].startswith("-")
+    if not helped and "--dry-run" not in words:               # first, what was edited on this computer
+        if words[:1] == ["caption"]:
+            send_captions(cfg, tag, rec, dataset_names(caption_refs(words)))
+        elif words[:1] == ["prep"] or a_run:
+            send_captions(cfg, tag, rec, dataset_names(option_values(words, "--dataset")))
+        if a_run:
+            send_prepared(cfg, tag, rec, run_names(words[1:]))
     if words[:1] == ["stop"] and not {"-y", "--yes"} & set(words[1:]):
         try:
             answer = input("Stop the training run on {}? Its checkpoints stay. [y/N] ".format(rec.get("name")))
@@ -3333,7 +3374,7 @@ def cmd_train(args):
         sys.exit(1)
     if out.code == 0 and not helped and words[:1] == ["caption"] and "--dry-run" not in words:
         try:
-            download_captions(rec, caption_refs(words))
+            download_captions(cfg, tag, rec, caption_refs(words))
         except ApiError as e:
             say("The captions could not be downloaded ({}): `python pod.py pull` tries again.".format(e.detail[:100]))
     if out.code == 0 and not helped and words[:1] == ["prep"]:

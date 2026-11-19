@@ -1556,9 +1556,10 @@ def cmd_caption(argv):
     if kept:
         say("{} caption(s) still use a word of --avoid: {}. Edit each of them by hand before training.".format(
             len(kept), ", ".join("{} ({})".format(f, ", ".join(w)) for f, w in kept)))
-    say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
-        "wrong word is learned like the others.".format(", ".join(
-            "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))
+    if not VIA:                                           # from a computer, pod.py downloads them and says where they are
+        say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
+            "wrong word is learned like the others.".format(", ".join(
+                "the folders of " + r if r.endswith(".toml") else str(resolve_path(r, DATASETS)) for r in a.datasets)))
     next_line("train prep <recipe> <run> --dataset {}".format(dataset_name(a.datasets[0])),
               "checks the dataset and shows the run's two files; `train recipes` lists the recipes")
     return 0

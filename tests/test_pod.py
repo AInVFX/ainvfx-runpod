@@ -1484,12 +1484,11 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("no train command", out, out)
 
     def test_train_caption_downloads_the_captions(self):
-        """A participant lost the captions written on a pod when it ended. Now push --dataset records the folder it sent, and after
-        python pod.py train caption the pod's captions come into outputs/<pod>/dataset/NAME/ and beside the files of that
-        folder: a missing one is written, an identical one left, ones that differ replaced after one question only, and
-        nothing replaced when no one answers. NAME/images names NAME; a .toml downloads nothing; a dataset sent from
-        elsewhere goes to outputs/ only; pull downloads the datasets' text files, never media, an edit of the same size
-        included. The Next line stays last."""
+        """After python pod.py train caption, every caption of the dataset is downloaded into
+        outputs/<pod>/dataset/<n>/, with the pod's sub-folders, and nowhere else: the folder sent by push --dataset is
+        never written. One statement says where they are. A caption edited there goes to the pod before the next train
+        command and replaces the pod's; one edited on the pod alone is left there, and pull downloads it; pull keeps a
+        caption edited here."""
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
@@ -1505,58 +1504,68 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("push", "--dataset", "oldspace", ds)
         self.assertEqual(rc, 0, out)
         cfg = json.loads(read_text(os.path.join(self.home, ".ainvfx-runpod", "config.json")))
-        self.assertEqual(cfg["pods"]["image"]["datasets"], {"oldspace": [os.path.realpath(ds)]})
+        self.assertNotIn("datasets", cfg["pods"]["image"], "the folder sent is not recorded")
         top = "workspace/dataset/oldspace/images/"
         for stem in "abc":                                           # what train caption wrote on the pod
             STATE["jfs"][top + stem + ".txt"] = bytearray(b"w, the pod's " + stem.encode() + b"\n")
         fake = os.path.join(self.home, "train")
         with open(fake, "w") as f:
-            f.write("#!%s\nprint('[1/1] a.png')\nprint('Next:  python pod.py train later   (why)')\n" % sys.executable)
+            f.write("#!%s\nimport sys\nprint('args:', ' '.join(sys.argv[1:]))\n"
+                    "print('Next:  python pod.py train later   (why)')\n" % sys.executable)
         os.chmod(fake, 0o755)
         self.env["AINVFX_POD_TRAIN"] = fake
         out, rc = self.run_pod("train", "caption", "oldspace/images", "--trigger", "w", "--avoid", "scene")
         self.assertEqual(rc, 0, out)
+        copy = os.path.join(self.home, "outputs", STATE["pods"]["fakepod1"]["name"], "dataset", "oldspace")
 
-        def local(rel):
-            with open(os.path.join(ds, rel), "rb") as f:
-                return f.read()
-        self.assertEqual([local("images/" + s + ".txt") for s in "abc"],
-                         [b"w, the pod's a\n", b"w, the pod's b\r\n", b"w, my own c\n"], out)
-        self.assertIn("1 caption(s) of {} differ from the pod's: {}".format(os.path.realpath(ds),
-                                                                          os.path.join(os.path.realpath(ds), "images", "c.txt")), out)
-        self.assertIn("No one answered. Your 1 caption(s) stay as they are.", out)
-        self.assertIn("1 new, 0 replaced, 1 unchanged", out)
-        copy = [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs]
-        self.assertEqual(sorted(os.path.basename(p) for p in copy), ["a.txt", "b.txt", "c.txt"], out)
-        self.assertTrue(all(os.sep + os.path.join("dataset", "oldspace", "images") + os.sep in p for p in copy), copy)
+        def here(rel, data=None):
+            with open(os.path.join(copy, rel), "rb" if data is None else "wb") as f:
+                return f.read() if data is None else f.write(data)
+        self.assertEqual([here("images/" + x + ".txt") for x in "abc"], [b"w, the pod's " + x.encode() + b"\n" for x in "abc"], out)
+        self.assertEqual(sorted(os.listdir(os.path.join(ds, "images"))), ["a.png", "b.png", "b.txt", "c.png", "c.txt"],
+                         "the folder sent is never written")
+        with open(os.path.join(ds, "images", "c.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"w, my own c\n")
+        self.assertIn("3 caption(s) downloaded into {}. Read each one before training, and edit it there".format(copy), out)
+        self.assertNotIn("beside", out)
         self.assertEqual(out.rstrip().splitlines()[-1], "Next:  python pod.py train later   (why)", out)
-        out, rc = self.run_pod("train", "caption", "oldspace", "--trigger", "w", input="y\n")
-        self.assertEqual(local("images/c.txt"), b"w, the pod's c\n", out)
-        self.assertIn("0 new, 1 replaced, 2 unchanged", out)
+        here("images/c.txt", b"w, my own c, edited here\r\n")       # edited on this computer, as Notepad saves it
+        STATE["jfs"][top + "a.txt"] = bytearray(b"w, the pod's A\n")    # edited in JupyterLab, same size
+        out, rc = self.run_pod("pull")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((here("images/a.txt"), here("images/c.txt")), (b"w, the pod's A\n", b"w, my own c, edited here\r\n"),
+                         "pull downloads the caption edited on the pod and keeps the one edited here")
+        out, rc = self.run_pod("train", "prep", "moss", "r1", "--dataset", "oldspace")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(bytes(STATE["jfs"][top + "c.txt"]), b"w, my own c, edited here\n", out)
+        self.assertEqual(bytes(STATE["jfs"][top + "a.txt"]), b"w, the pod's A\n", "a caption not edited here stays on the pod")
+        self.assertLess(out.index("1 caption(s) edited on this computer sent to the pod: c.txt"), out.index("args: prep moss r1"))
+        out, rc = self.run_pod("train", "moss", "r1", "--dataset", "oldspace")
+        self.assertNotIn("sent to the pod", out, "nothing changed since: nothing is sent again")
+        here("images/b.txt", b"w, b edited here\n")
+        out, rc = self.run_pod("train", "caption", "oldspace", "--trigger", "w")
+        self.assertEqual(bytes(STATE["jfs"][top + "b.txt"]), b"w, b edited here\n", out)
+        self.assertIn("1 caption(s) edited on this computer sent to the pod: b.txt", out)
         out, rc = self.run_pod("train", "caption", "mine.toml", "--trigger", "w")
         self.assertIn("mine.toml is a dataset config: no caption downloaded", out, out)
         STATE["jdirs"].add("workspace/dataset/other")
         STATE["jfs"]["workspace/dataset/other/z.txt"] = bytearray(b"w, z\n")
         out, rc = self.run_pod("train", "caption", "other", "--trigger", "w")
-        self.assertIn("No folder of this computer is recorded for other", out, out)
-        STATE["jfs"][top + "a.txt"] = bytearray(b"w, the pod's A\n")    # edited in JupyterLab, same size
+        self.assertIn("1 caption(s) downloaded into " + os.path.join(os.path.dirname(copy), "other"), out, out)
         out, rc = self.run_pod("pull")
         self.assertEqual(rc, 0, out)
         got = {os.path.relpath(os.path.join(r, f), os.path.join(self.home, "outputs")).replace(os.sep, "/").split("/", 1)[1]
                for r, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs}
         self.assertEqual(got, {"dataset/oldspace/images/a.txt", "dataset/oldspace/images/b.txt", "ainvfx_selftest_00001_.png",
                                "dataset/oldspace/images/c.txt", "dataset/other/z.txt"}, out)
-        with open(os.path.join(self.home, "outputs", STATE["pods"]["fakepod1"]["name"], "dataset", "oldspace", "images",
-                               "a.txt"), "rb") as f:
-            self.assertEqual(f.read(), b"w, the pod's A\n", out)
-        self.assertEqual(local("images/a.txt"), b"w, the pod's a\n", "pull never touches the dataset folder")
+        self.assertNotIn("Next:  uvx tensorboard", out, "no run's files here yet")
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
     def test_prep_downloads_the_runs_files_and_the_run_sends_an_edit(self):
         """After python pod.py train prep, dataset.toml and prompts.txt come into outputs/<pod>/train/<run>/. Before the
-        run, a file changed here goes back to the pod, cleaned; an unchanged one does not, so an edit made on the pod
-        stays; a file changed in both places stops the run before the pod's command; pull keeps an edit made here."""
+        run, a file changed here goes back to the pod, cleaned, and replaces the pod's, even one changed there too; an
+        unchanged one does not; pull keeps an edit made here."""
         out, rc = self.run_pod("setup", "-y")
         self.assertEqual(rc, 0, out)
         out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
@@ -1593,9 +1602,9 @@ class EndToEnd(unittest.TestCase):
             f.write(b"[general]\nresolution = [512, 512]\n")
         STATE["outfiles"]["train/p1/dataset.toml"] = b"[general]\nresolution = [768, 432]\n"   # and on the pod
         out, rc = self.run_pod("train", "ltx_mix", "p1", "--dataset", "oldspace")
-        self.assertNotEqual(rc, 0, out)
-        self.assertIn("changed both here and on the pod since train prep: " + os.path.join(here, "dataset.toml"), out)
-        self.assertNotIn("args:", out, out)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(bytes(STATE["jfs"][sent + "dataset.toml"]), b"[general]\nresolution = [512, 512]\n", out)
+        self.assertLess(out.index("sent to the pod: " + os.path.join(here, "dataset.toml")), out.index("args: ltx_mix p1"))
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
