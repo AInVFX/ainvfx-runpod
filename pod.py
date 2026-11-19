@@ -2897,14 +2897,14 @@ def wait_for_run(cfg, rec, pull_every=None):
     """`down --when-done`: returns when the training run in progress on the pod has ended (True), or when the pod
     itself is gone (False). One look at the run's record every RUN_POLL seconds; a look that the pod does not answer
     is tried again.
-    With pull_every, the new files of the pod's output folder come every pull_every seconds while the run goes on
-    (its samples, checkpoints and loss logs), so they are here as the run makes them; a pull that fails is tried again
-    at the next one, and never ends the wait."""
+    With pull_every, the new files of the pod's output folder are downloaded at the first check, then every pull_every
+    seconds while the run continues (its samples, checkpoints and loss logs), so they are here as the run makes them; a
+    download that fails is tried again at the next one, and never ends the wait."""
     pod_id, name = rec["id"], rec.get("name") or rec["id"]
     start = moved = time.time()
     last = said = None
     noted = 0
-    pulled = start                                # the first pull comes pull_every seconds after the wait starts
+    pulled = None                                 # the first download comes at the first check
     while True:
         now = time.time()
         try:
@@ -2937,12 +2937,12 @@ def wait_for_run(cfg, rec, pull_every=None):
         if said is None:
             say("Waiting for the training run on {} to end: a check every {} s{}. Ctrl+C stops the wait; the pod "
                 "keeps running and billing.".format(name, RUN_POLL, "" if pull_every is None else
-                                                    ", and its new files downloaded every {} min".format(
+                                                    ", and its new files downloaded now, then every {} min".format(
                                                         max(1, round(pull_every / 60)))))
         if note != said or now - noted >= RUN_NOTE:
             say("  {} (waited {})".format(note, fmt_duration((now - start) / 3600)))
             said, noted = note, now
-        if run is not None and pull_every is not None and now - pulled >= pull_every:
+        if run is not None and pull_every is not None and (pulled is None or now - pulled >= pull_every):
             try:
                 count = pull(rec)
             except (ApiError, OSError) as e:          # the wait continues: the next download tries again

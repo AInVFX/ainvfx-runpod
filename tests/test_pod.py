@@ -1290,7 +1290,8 @@ class EndToEnd(unittest.TestCase):
 
     def test_down_when_done_waits_for_the_run(self):
         """`down --when-done` asks first, then waits while the run's record says in progress, through a look that the
-        pod does not answer and a change of stage; when the run has ended it pulls, then terminates. A run whose record
+        pod does not answer and a change of stage. It downloads the files already made at its first look, without
+        waiting 5 minutes; when the run has ended it downloads the rest, then terminates. A run whose record
         stands still is of a run whose process stopped: the same end. With no run in progress it stops, and terminates nothing."""
         self.env.update(AINVFX_RUN_POLL="1", AINVFX_RUN_STALE="2")
         out, rc = self.run_pod("setup", "-y")
@@ -1320,9 +1321,9 @@ class EndToEnd(unittest.TestCase):
         STATE["runs"] = [run("running", 0, 1.0), run("running", 0, 1.5), "down", run("running", 1, 2.0), run("done", 1, 3.0)]
         out, rc = self.run_pod("down", "image", "--when-done", "-y", timeout=60)
         self.assertEqual(rc, 0, out)
-        steps = ["Waiting for the training run", "jar_a, stage 1 of 2: in progress", "the pod does not answer",
-                 "jar_b, stage 2 of 2: in progress", "The run jar_b, stage 2 of 2 has ended (done).",
-                 "jar_b.safetensors", "file(s) downloaded into", "Terminated"]
+        steps = ["Waiting for the training run", "jar_a, stage 1 of 2: in progress", "jar_b.safetensors",
+                 "the pod does not answer", "jar_b, stage 2 of 2: in progress",
+                 "The run jar_b, stage 2 of 2 has ended (done).", "file(s) downloaded into", "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(STATE["pods"]["fakepod1"].get("deleted"), out)
         self.assertIn("jar_b.safetensors", [f for _, _, fs in os.walk(os.path.join(self.home, "outputs")) for f in fs], out)
@@ -1357,7 +1358,7 @@ class EndToEnd(unittest.TestCase):
         STATE["outfiles"]["train/jar/sample/jar_step250.png"] = b"a later sample"      # written on the pod meanwhile
         out, _ = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 0, out)
-        steps = ["new files downloaded every 1 min", "jar_step0.png", "jar_step250.png", "The run jar has ended (done).",
+        steps = ["new files downloaded now, then every 1 min", "jar_step0.png", "jar_step250.png", "The run jar has ended (done).",
                  "Terminated"]
         self.assertEqual(sorted(steps, key=out.index), steps, out)
         self.assertTrue(here("jar_step250.png"), out)
