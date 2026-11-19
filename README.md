@@ -242,7 +242,7 @@ train ltx_iclora fx_s1 --dataset fx/low.toml \
   --then fx --from fx_s2 --steps 500 --lr 2e-5 --dataset fx/high.toml
 ```
 
-The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods; `ltx_mix` follows the trainer's guide for mixed audio and video training, with the settings of `ltx_av`. The `moss` recipe follows the MOSS-Image guide of sd-scripts. Both run to the end on an RTX PRO 6000: `moss` makes about 1.4 steps a second on 1024 x 768 images; `ltx_mix` takes about 3.3 seconds a step on 121-frame clips at 960 x 544, its model in fp8 taking 22.4 GB once loaded and 27 GB at the first step. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
+The musubi-tuner recipes repeat settings proven on RTX PRO 6000 pods; `ltx_mix` follows the trainer's guide for mixed audio and video training, with the settings of `ltx_av`. The `moss` recipe follows the MOSS-Image guide of sd-scripts. Both run to the end on an RTX PRO 6000: `moss` makes about 1.4 steps a second on 1024 x 768 images; `ltx_mix` takes about 3.3 seconds a step on 121-frame clips at 960 x 544, its model in fp8 taking 22.4 GB once loaded and 27 GB at the first step. The base file is the dev model in bf16 (42 GB): the trainer turns its frozen weights to fp8 as it loads them (`--fp8_base --fp8_scaled`, as in the trainer's own guide) and computes in bf16, since the 22 billion weights alone would take about 44 GB in bf16. FLUX 3 Image Klein has no recipe: neither trainer supports it yet.
 
 ### Sizes and lengths
 

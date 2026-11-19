@@ -88,6 +88,11 @@ LTX_LATENTS = ["ltx2_cache_latents.py", "--ltx2_checkpoint", "{checkpoint}", "--
 LTX_TEXT = ["ltx2_cache_text_encoder_outputs.py", "--ltx2_checkpoint", "{checkpoint}", "--ltx2_text_encoder_checkpoint",
             "{text_encoder}", "--ltx_version", "2.5", "--device", "cuda", "--mixed_precision", "bf16", "--batch_size", "4",
             "--precache_sample_prompts", "--sample_prompts", "{prompts}"]
+# The LTX base file is the dev model in bf16 (42 GB). The trainer turns its frozen weights to fp8 as it loads them
+# (--fp8_base --fp8_scaled) and computes in bf16. Measured on an RTX PRO 6000 in November 2026, with the ltx_mix recipe at
+# its own size and clips of 121 frames: 22.4 GB once loaded, 27.0 GB at the first step; in bf16, the 22 billion weights
+# alone would take about 44 GB. The trainer's guide (docs/ltx_2.md at the pinned commit) uses the same two flags. A
+# training with the base in bf16 ran out of memory; its figures were not kept.
 LTX_TRAIN = ["--mixed_precision", "bf16", "--ltx2_checkpoint", "{checkpoint}", "--ltx2_video_vae", "{vae}",
              "--ltx_version", "2.5", "--ltx_version_check_mode", "warn", "--sdpa", "--fp8_base", "--fp8_scaled",
              "--gradient_checkpointing", "--network_module", "networks.lora_ltx2", "--network_dim", "32",
