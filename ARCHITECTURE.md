@@ -264,7 +264,6 @@ The variable appears once, so the command works whether Runpod runs it directly 
 - **FLUX 3 Image Klein** has no recipe: neither pinned trainer supports it.
 - **`down --when-done` runs on the user's computer**, which must stay on and online: the download comes before the termination, and only that computer can download. On a pod whose `train.py` is older than 1.6.1, the job record carries no `beat`: the wait believes the record, and cannot tell a run that died.
 - **Whether the caption model obeys `--avoid`** shows only on a pod: the tests give a stand-in model. A caption that still uses a word after one rewrite is named, to edit by hand.
-- **Two `[ERROR]` lines of the transformers library** (`min_frames`, `max_frames`) print when the caption model loads: the library's documentation check. `DropDocCheck` drops them by their exact form; only a pod shows that the form of the pinned library matches.
 - **A lost connection ends `python pod.py train` on the computer**, while the command continues on the pod: `python pod.py train log` follows a run again. `pod.py` does not connect again by itself.
 - **Custom nodes are not pinned.** `custom_nodes.json` and `AINVFX_CUSTOM_NODES` clone each node's default branch at its latest commit.
 - **The pod's address is its only protection.** ComfyUI has no login, and the log it serves holds JupyterLab's token. ComfyUI's own origin check refuses a click from another site, which is why the console's Connect button can show an empty 403 page: kept on purpose.
