@@ -1474,6 +1474,7 @@ VIEW_STEPS = re.compile(r"^steps:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+) \[(?:(\d+):)?(\d
 VIEW_DONE = re.compile(r"\|\s*(\d+)/(\d+) \[")
 VIEW_SAMPLES = re.compile(r"(?i)^generating sample images at step\b\D*(\d+)$")
 VIEW_CACHE = re.compile(r"(?i)^(caching .*\.\.\.|encoding dataset \[\d+\])$")
+VIEW_START = re.compile(r"(?i)^load(?:ed)? network weights\b")    # a run with --from: what loaded, what did not
 VIEW_PYWARN = re.compile(r"^\S.*?:\d+: (\w+Warning): ")    # Python's warnings: <file>:<line>: <Category>: <text>
 VIEW_WORDS = re.compile(r"(?i)\b(errors?|exception|traceback|warnings?|fail|failed|failure|fatal|cannot|can't|could not|"
                         r"unable|not found|out of memory|killed|abort(ed)?|nan)\b")
@@ -1601,7 +1602,7 @@ class LogView:
         samples = VIEW_SAMPLES.match(text)
         if samples:
             self.show("Generating sample images at step {}".format(samples.group(1)))
-        elif text.startswith("saving checkpoint: ") or text == "model saved.":
+        elif text.startswith("saving checkpoint: ") or text == "model saved." or VIEW_START.match(text):
             self.show(text)
         elif VIEW_CACHE.match(text):
             self.end_cache()

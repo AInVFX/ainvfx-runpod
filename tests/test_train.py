@@ -654,7 +654,8 @@ class Units(unittest.TestCase):
         bar it follows, Hugging Face's requests, a Python warning and the line of code under it, then a traceback.
         The steps show every 20 of 250 with their new loss; a warning shows once; the traceback shows whole, after the
         hidden line before it; the hidden lines before FAILED show too."""
-        log = ["[AINVFX] r1 · recipe moss · stage 1 of 1\n", "HTTP Request: HEAD https://huggingface.co/x \"HTTP/1.1 404 Not "
+        log = ["[AINVFX] r1 · recipe moss · stage 1 of 1\n", "load network weights from /w/r0.safetensors: <All keys "
+               "matched successfully>\n", "HTTP Request: HEAD https://huggingface.co/x \"HTTP/1.1 404 Not "
                "Found\"\n", "caching latents...\n", "\r  0%|          | 0/20 [00:00<?, ?it/s]",
                "\r100%|##########| 20/20 [00:05<00:00,  3.44it/s]\n", "epoch is incremented. current_epoch: 0, epoch: 1\n"]
         for n in range(1, 251):
@@ -674,7 +675,9 @@ class Units(unittest.TestCase):
         self.assertEqual(view[at - 1:at + 2], ["steps: 100%|#  | 250/250 [00:10<00:10,  1.4it/s, avr_loss=0.250]",
                                                "Generating sample images at step 250",
                                                "saving checkpoint: /w/r1-step00000250.safetensors"])
-        self.assertEqual(view[1], "caching latents...  100%|##########| 20/20 [00:05<00:00,  3.44it/s]")
+        self.assertEqual(view[1], "load network weights from /w/r0.safetensors: <All keys matched successfully>",
+                         "--from: what loaded, which README says to read")
+        self.assertEqual(view[2], "caching latents...  100%|##########| 20/20 [00:05<00:00,  3.44it/s]")
         self.assertEqual(sum("UserWarning" in l for l in view), 1)
         self.assertEqual(view[-7:], ["the last line before the failure", "Traceback (most recent call last):",
                                      '  File "t.py", line 1', "    boom()", "RuntimeError: CUDA out of memory",
