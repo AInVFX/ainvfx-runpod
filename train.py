@@ -39,6 +39,7 @@ import time
 import tomllib
 import urllib.request
 from collections import Counter
+from xml.sax.saxutils import escape
 from pathlib import Path
 
 ROOT = Path(os.environ.get("AINVFX_ROOT", "/workspace"))          # the tests point it at a temporary folder
@@ -1029,6 +1030,142 @@ def publish(recipe, run, name, final=False):
                 link.symlink_to(f)
 
 
+# ----------------------------------------------------------------------------- the sample sheet
+# One picture of a run's samples, made again after each round of samples: a row for each sample prompt, in the order
+# of prompts.txt, and a column for each round, its step above it. The trainers name a sample
+# <run>_<step>_<prompt>_<date and time>_<seed>, the step as 000250, or e000000 for the samples before the first step;
+# a name with an epoch above 0 (e000039) is the second render of a step's samples, which the LTX trainer makes when a
+# pass over the dataset ends on a step that renders samples: the same pictures, left out. An LTX sample is three files:
+# the picture (.mp4), the sound (.wav), both (_av.mp4). Pillow and PyAV come with the trainer's environment.
+SHEET = "sample_sheet.jpg"
+SHEET_COLUMNS = 12        # past this many rounds, as many columns evenly spaced, the first and the last always in
+SHEET_CELL = 320          # pixels across a cell
+SHEET_SETTLE = 5          # seconds: a sample written more recently may be unfinished, and waits for the next sheet
+SAMPLE_FILE = re.compile(r"_(e?)(\d{6})_(\d\d)_\d{14}_\d+(_av)?\.(png|jpg|jpeg|webp|mp4)$")
+AI_SOURCE = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+SHEET_XMP = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+             'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" '
+             'xmlns:Iptc4xmpExt="http://iptc.org/std/Iptc4xmpExt/2008-02-29/" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+             '<Iptc4xmpExt:DigitalSourceType>{}</Iptc4xmpExt:DigitalSourceType><dc:description><rdf:Alt>'
+             '<rdf:li xml:lang="x-default">{}</rdf:li></rdf:Alt></dc:description></rdf:Description></rdf:RDF>'
+             '</x:xmpmeta>\n<?xpacket end="w"?>')
+
+
+def sample_grid(names):
+    """{step: {prompt: name}} of a run's sample files; for a video, the picture alone, else the file with sound."""
+    grid = {}
+    for name in sorted(names):
+        m = SAMPLE_FILE.search(name)
+        if not m or (m.group(1) == "e" and int(m.group(2))):
+            continue
+        cell = grid.setdefault(int(m.group(2)), {})
+        prompt = int(m.group(3))
+        if prompt not in cell or cell[prompt].endswith("_av.mp4"):
+            cell[prompt] = name
+    return grid
+
+
+def sheet_steps(steps, limit=SHEET_COLUMNS):
+    """The rounds the sheet shows: every one up to limit; past it, limit of them evenly spaced, with the first and the
+    last."""
+    if len(steps) <= limit:
+        return list(steps)
+    return [steps[i] for i in sorted({round(k * (len(steps) - 1) / (limit - 1)) for k in range(limit)})]
+
+
+def sample_picture(path):
+    """A sample as a picture: an image as it is; of a clip, its middle frame."""
+    from PIL import Image
+    if path.suffix.lower() != ".mp4":
+        with Image.open(path) as im:
+            return im.convert("RGB")
+    import av
+    with av.open(str(path)) as c:
+        v = c.streams.video[0]
+        middle, frames = (int(v.frames) // 2 if v.frames else None), []
+        for k, frame in enumerate(c.decode(v)):
+            if k == middle:
+                return frame.to_image().convert("RGB")
+            frames.append(frame)
+        if not frames:
+            raise ValueError("no frame in " + path.name)
+        return frames[len(frames) // 2].to_image().convert("RGB")
+
+
+def make_sheet(run, name):
+    """Writes sample_sheet.jpg in the run's folder, from the samples there; returns (prompts, steps), or None when
+    there is no sample yet. A sample that cannot be read leaves its cell empty."""
+    from PIL import Image, ImageDraw, ImageFont
+    folder = run / "sample"
+    now = time.time()
+    files = [f for f in folder.iterdir() if f.is_file() and now - f.stat().st_mtime >= SHEET_SETTLE] if folder.is_dir() else []
+    grid = sample_grid(f.name for f in files)
+    if not grid:
+        return None
+    try:
+        rows = len(prompt_lines((run / "prompts.txt").read_text(encoding="utf-8")))
+    except OSError:
+        rows = 0
+    rows = max([rows] + [p + 1 for cell in grid.values() for p in cell])
+    steps = sheet_steps(sorted(grid))
+    pictures = {}
+    for step in steps:
+        for prompt, file in grid[step].items():
+            try:
+                pictures[step, prompt] = sample_picture(folder / file)
+            except Exception:                             # unfinished, or unreadable: an empty cell
+                pass
+    if not pictures:
+        return None
+    first = next(iter(pictures.values()))
+    cell_w, gap, band = SHEET_CELL, 8, 48
+    cell_h = max(1, round(cell_w * first.height / first.width))
+    sheet = Image.new("RGB", (len(steps) * (cell_w + gap) - gap, band + rows * (cell_h + gap) - gap), "white")
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.load_default(size=28)
+    except TypeError:                                     # Pillow before 10.1
+        font = ImageFont.load_default()
+    for c, step in enumerate(steps):
+        x, label = c * (cell_w + gap), "{:,}".format(step).replace(",", " ")
+        draw.text((x + (cell_w - draw.textlength(label, font=font)) / 2, 8), label, fill="#0A0A0A", font=font)
+        for prompt in range(rows):
+            if (step, prompt) in pictures:
+                sheet.paste(pictures[step, prompt].resize((cell_w, cell_h), Image.LANCZOS),
+                            (x, band + prompt * (cell_h + gap)))
+    tmp = run / (".tmp_" + SHEET)
+    xmp = SHEET_XMP.format(AI_SOURCE, escape("AI-generated samples of the training run " + name))
+    sheet.save(tmp, "JPEG", quality=88, xmp=xmp.encode("utf-8"))
+    os.replace(tmp, run / SHEET)
+    return rows, steps
+
+
+def sample_sheet(run, name, state, note, final=False):
+    """Makes the sheet again when the run's samples changed, and at the end of the run. It never fails the run: one
+    [AINVFX] line says why a sheet cannot be made."""
+    folder = run / "sample"
+    try:
+        seen = sorted((f.name, f.stat().st_size) for f in folder.iterdir()) if folder.is_dir() else []
+    except OSError:
+        seen = []
+    if not seen or (seen == state.get("seen") and not final):
+        return
+    state["seen"] = seen
+    try:
+        made = make_sheet(run, name)
+    except Exception as e:
+        why = (str(e).splitlines() or [type(e).__name__])[0][:200]
+        if state.get("why") != why:
+            state["why"] = why
+            note("no sample sheet: {}".format(why))
+        return
+    if made and (final or not state.get("said")):
+        state["said"] = True
+        note("sample sheet: {} · {} prompt(s) · {}".format(run / SHEET, made[0], "steps {} to {}".format(
+            made[1][0], made[1][-1]) if len(made[1]) > 1 else "step {}".format(made[1][0])) + (
+            "" if final else ", made again after each round of samples"))
+
+
 def free_comfy_memory():
     """ComfyUI, when it runs on this pod, unloads its models: a training run needs the GPU's memory."""
     req = urllib.request.Request(COMFY_URL + "/free", data=b'{"unload_models": true, "free_memory": true}',
@@ -1205,12 +1342,14 @@ def run_stage(recipe, st, i, n):
             t0 = last = time.time()
             p = subprocess.Popen(cmd, cwd=st["cwd"], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                  env=trainer_env())
+            sheet = {}
             while p.poll() is None:
                 time.sleep(2)
                 if time.time() - last >= BEAT:
                     update_job(beat=time.time())          # the record of a run in progress keeps moving
                     if title == "training":
                         publish(recipe, run, st["name"])
+                        sample_sheet(run, st["name"], sheet, note)
                     last = time.time()
             if p.returncode:
                 note("FAILED · {} ended with code {} after {}: the lines above say why".format(
@@ -1218,6 +1357,7 @@ def run_stage(recipe, st, i, n):
                 return p.returncode
             note("{} done in {}".format(title, duration(time.time() - t0)))
         publish(recipe, run, st["name"], final=True)
+        sample_sheet(run, st["name"], sheet, note, final=True)
         final = run / (st["name"] + ".safetensors")
         if not final.is_file():
             note("FAILED · the trainer ended without writing {}".format(final.name))

@@ -129,6 +129,7 @@ LOG_VIEW = "/view?filename=bootstrap.log&subfolder=ainvfx&type=input"
 OUTPUT_DIRS = ("workspace/ComfyUI/output", "ComfyUI/output")   # the output folder seen from JupyterLab's root
 DATASET_DIRS = ("workspace/dataset", "dataset")                 # and the datasets' folder
 SKIP_NAMES = {"_output_images_will_be_put_here"}               # the empty placeholder ComfyUI creates
+SHEET = "sample_sheet.jpg"     # train.py makes it again after each round of samples: each pull downloads it when it changed
 # Training: a pod with `train` also holds the trainers' environments, the caption model, caches and checkpoints.
 TRAIN_RESERVE_GB = 70
 UPLOAD_CHUNK = env_num("AINVFX_UPLOAD_CHUNK", str(8 << 20))   # bytes per request through JupyterLab, far under the
@@ -1985,11 +1986,14 @@ def cmd_pull(args):
 
 def tensorboard_next(folders):
     """The Next line once a training run's files are here: TensorBoard on the outputs folder, and where the samples
-    are. Nothing when none of these pods' folders holds a run."""
+    are. Before it, where each run's sample sheet is. Nothing when none of these pods' folders holds a run."""
     runs = sorted(d for f in folders for d in (f / "train").glob("*")
                   if d.is_dir() and any(x.name not in PREP_FILES for x in d.iterdir()))   # more than what prep downloads
     if not runs:
         return
+    for run in runs:
+        if (run / SHEET).is_file():
+            say("The sample sheet of {}: {}".format(run.name, run / SHEET))
 
     def shown(p):
         try:
@@ -2918,12 +2922,21 @@ def pull(rec, report=None):
         if edited_here(rel):
             return
         target = dest.joinpath(*rel.split("/"))
-        if target.exists() and (size is None or target.stat().st_size == size):
+        again = rel.rsplit("/", 1)[-1] == SHEET              # made again under its name: read again at each pull
+        if target.exists() and not again and (size is None or target.stat().st_size == size):
             return
         try:
-            n = fetch_to(url, target, headers=headers)
-        except ApiError as e:
-            say("  skipped {} ({})".format(rel, e.code or e.detail[:100]))
+            if again:
+                data = request("GET", url, headers=dict({"Accept": "*/*"}, **(headers or {})), timeout=600, raw=True)
+                if not write_if_changed(target, data):
+                    return
+                n = len(data)
+                if report is not None:
+                    report.setdefault("sheets", []).append(target)
+            else:
+                n = fetch_to(url, target, headers=headers)
+        except (ApiError, OSError) as e:
+            say("  skipped {} ({})".format(rel, getattr(e, "code", 0) or getattr(e, "detail", str(e))[:100]))
             failed.append(rel)
             return
         count += 1
@@ -3080,13 +3093,16 @@ def wait_for_run(cfg, rec, pull_every=None):
             say("  {} (waited {})".format(note, fmt_duration((now - start) / 3600)))
             said, noted = note, now
         if run is not None and pull_every is not None and (pulled is None or now - pulled >= pull_every):
+            report = {}
             try:
-                count = pull(rec)
+                count = pull(rec, report)
             except (ApiError, OSError) as e:          # the wait continues: the next download tries again
                 say("  download skipped ({}); the next one tries again".format(e))
             else:
                 if count:
                     say("  {} new file(s) in {}".format(count, outputs_of(rec)))
+                for sheet in report.get("sheets") or []:
+                    say("  the sample sheet, with the samples so far: {}".format(sheet))
             pulled = time.time()
         time.sleep(RUN_POLL)
 

@@ -41,6 +41,14 @@ class Packet:
     size = 1
 
 
+class Frame:
+    def __init__(self, image):
+        self.image = image
+
+    def to_image(self):
+        return self.image
+
+
 class Container:
     def __init__(self, path):
         with io.open(path, encoding="utf-8") as f:
@@ -51,6 +59,12 @@ class Container:
 
     def demux(self, stream):
         return [Packet() for _ in range(self.packets)]
+
+    def decode(self, stream):
+        """The frames, each a plain picture whose red value is the frame's number (Pillow is needed)."""
+        from PIL import Image
+        for k in range(stream.frames):
+            yield Frame(Image.new("RGB", (64, 36), (k, 0, 0)))
 
     def __enter__(self):
         return self
@@ -650,6 +664,96 @@ class Units(unittest.TestCase):
         self.assertFalse([l for l in view if "HTTP" in l or "epoch is" in l or "warnings.warn" in l])
         pieces = train.LogView()
         self.assertEqual(("".join(pieces.feed(c) for c in log) + pieces.flush(final=True)).splitlines(), view)
+
+    def test_the_rows_and_columns_of_the_sample_sheet(self):
+        """The 21 samples of a moss run of 1,500 steps give 3 rows and 7 columns, the samples before the first step at
+        step 0. The LTX trainer's second render of the last step (e000039) is left out, and of its three files a
+        sample's picture is read. Past 12 rounds, 12 columns evenly spaced, with the first and the last."""
+        names = [
+            "ainvfx_oldspace_moss_v1_000250_00_20261119160518_42.png",
+            "ainvfx_oldspace_moss_v1_000250_01_20261119160535_42.png",
+            "ainvfx_oldspace_moss_v1_000250_02_20261119160552_42.png",
+            "ainvfx_oldspace_moss_v1_000500_00_20261119160907_42.png",
+            "ainvfx_oldspace_moss_v1_000500_01_20261119160924_42.png",
+            "ainvfx_oldspace_moss_v1_000500_02_20261119160941_42.png",
+            "ainvfx_oldspace_moss_v1_000750_00_20261119161256_42.png",
+            "ainvfx_oldspace_moss_v1_000750_01_20261119161313_42.png",
+            "ainvfx_oldspace_moss_v1_000750_02_20261119161331_42.png",
+            "ainvfx_oldspace_moss_v1_001000_00_20261119161645_42.png",
+            "ainvfx_oldspace_moss_v1_001000_01_20261119161702_42.png",
+            "ainvfx_oldspace_moss_v1_001000_02_20261119161720_42.png",
+            "ainvfx_oldspace_moss_v1_001250_00_20261119162034_42.png",
+            "ainvfx_oldspace_moss_v1_001250_01_20261119162051_42.png",
+            "ainvfx_oldspace_moss_v1_001250_02_20261119162108_42.png",
+            "ainvfx_oldspace_moss_v1_001500_00_20261119162423_42.png",
+            "ainvfx_oldspace_moss_v1_001500_01_20261119162440_42.png",
+            "ainvfx_oldspace_moss_v1_001500_02_20261119162457_42.png",
+            "ainvfx_oldspace_moss_v1_e000000_00_20261119160129_42.png",
+            "ainvfx_oldspace_moss_v1_e000000_01_20261119160146_42.png",
+            "ainvfx_oldspace_moss_v1_e000000_02_20261119160203_42.png",
+        ]
+        self.assertEqual(len(names), 21)
+        grid = train.sample_grid(names + ["notes.txt", "x_e000039_00_20261118181237_42.png"])
+        self.assertEqual(sorted(grid), [0, 250, 500, 750, 1000, 1250, 1500])
+        self.assertTrue(all(sorted(cell) == [0, 1, 2] for cell in grid.values()))
+        trio = ["r_001500_00_20261118180806_42{}".format(end) for end in (".mp4", ".wav", "_av.mp4")]
+        self.assertEqual(train.sample_grid(trio + ["r_e000039_00_20261118181237_42_av.mp4"]),
+                         {1500: {0: "r_001500_00_20261118180806_42.mp4"}})
+        self.assertEqual(train.sample_grid(["r_000250_01_20261118163144_42_av.mp4"]),
+                         {250: {1: "r_000250_01_20261118163144_42_av.mp4"}}, "with sound, when the picture alone is missing")
+        steps = list(range(0, 7501, 250))
+        picked = train.sheet_steps(steps)
+        self.assertEqual((len(picked), picked[0], picked[-1]), (12, 0, 7500))
+        self.assertEqual(train.sheet_steps(steps[:12]), steps[:12])
+
+    @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow is in the trainer's environment")
+    def test_the_sample_sheet(self):
+        """A round in progress (two of its three samples written) leaves an empty cell; a sample written seconds ago
+        waits for the next sheet; a clip gives its middle frame. The sheet carries the IPTC label of generated
+        pictures. A sheet that cannot be made writes one [AINVFX] line, once, and the run goes on."""
+        from PIL import Image
+        run = TMP / "sheet_run"
+        (run / "sample").mkdir(parents=True)
+        (run / "prompts.txt").write_text(train.PROMPTS_HEAD + "one\ntwo\nthree\n", encoding="utf-8")
+        old = time.time() - 60
+        for step, prompts, colour in ((0, (0, 1, 2), (0, 0, 255)), (250, (0, 1), (0, 255, 0))):
+            for p in prompts:
+                f = run / "sample" / "r_{}_{:02d}_20261119160129_42.png".format("e000000" if not step else "000250", p)
+                Image.new("RGB", (400, 300), colour).save(f)
+                os.utime(f, (old, old))
+        Image.new("RGB", (400, 300), "red").save(run / "sample" / "r_000500_00_20261119170000_42.png")   # just written
+        notes = []
+        state = {}
+        train.sample_sheet(run, "r", state, notes.append)
+        sheet = Image.open(run / train.SHEET)
+        self.assertEqual(sheet.size, (2 * 320 + 8, 48 + 3 * 240 + 2 * 8), "3 rows of 4:3 cells, steps 0 and 250")
+        self.assertEqual(sheet.convert("RGB").getpixel((320 + 8 + 160, 48 + 2 * 248 + 120)), (255, 255, 255),
+                         "the sample not written yet: an empty cell")
+        self.assertGreater(sheet.convert("RGB").getpixel((160, 48 + 120))[2], 200)
+        self.assertIn(train.AI_SOURCE.encode(), (run / train.SHEET).read_bytes())
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("sample sheet: {} · 3 prompt(s) · steps 0 to 250".format(run / train.SHEET), notes[0])
+        train.sample_sheet(run, "r", state, notes.append)
+        self.assertEqual(len(notes), 1, "nothing changed: no new sheet, no new line")
+        video = TMP / "sheet_video"
+        for step in (0, 250):
+            clip(video / "sample" / "v_{}_00_20261118163018_42.mp4".format("e000000" if not step else "000250"), 65)
+            os.utime(video / "sample" / "v_{}_00_20261118163018_42.mp4".format("e000000" if not step else "000250"),
+                     (old, old))
+        self.assertEqual(train.make_sheet(video, "v"), (1, [0, 250]))
+        self.assertEqual(Image.open(video / train.SHEET).convert("RGB").getpixel((160, 48 + 90))[0], 32,
+                         "the middle frame of 65: frame 32")
+        real = train.make_sheet
+        train.make_sheet = lambda run, name: (_ for _ in ()).throw(RuntimeError("cannot read the samples\nmore"))
+        try:
+            lines, state = [], {}
+            train.sample_sheet(video, "v", state, lines.append)
+            os.utime(video / "sample" / "v_000250_00_20261118163018_42.mp4", (old, old - 5))
+            (video / "sample" / "v_000500_00_20261118163018_42.mp4").write_text("{}", encoding="utf-8")
+            train.sample_sheet(video, "v", state, lines.append)
+        finally:
+            train.make_sheet = real
+        self.assertEqual(lines, ["no sample sheet: cannot read the samples"])
 
     def test_the_caption_prompt_of_each_kind(self):
         """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is

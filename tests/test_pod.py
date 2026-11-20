@@ -1897,6 +1897,27 @@ class EndToEnd(unittest.TestCase):
         out, rc = self.run_pod("down", "-y")
         self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
 
+    def test_a_sample_sheet_made_again_is_downloaded_again(self):
+        """train.py makes the sample sheet again after each round of samples, under the same name and perhaps the same
+        size: each pull reads it again, and downloads it when it changed. The message names its place here."""
+        out, rc = self.run_pod("setup", "-y")
+        self.assertEqual(rc, 0, out)
+        out, rc = self.run_pod("up", "image", "-y", "--wait", "1", timeout=90)
+        self.assertEqual(rc, 0, out)
+        STATE["outfiles"] = {"train/r1/sample_sheet.jpg": b"sheet at step 0", "train/r1/r1.safetensors": b"weights"}
+        out, rc = self.run_pod("pull")
+        self.assertEqual(rc, 0, out)
+        here = os.path.join(self.home, "outputs", STATE["pods"]["fakepod1"]["name"], "train", "r1", "sample_sheet.jpg")
+        self.assertIn("The sample sheet of r1: " + here, out)
+        STATE["outfiles"]["train/r1/sample_sheet.jpg"] = b"sheet at step 1"            # made again, the same size
+        out, rc = self.run_pod("pull")
+        self.assertIn("1 file(s) new", out)
+        self.assertEqual(read_text(here), "sheet at step 1")
+        out, rc = self.run_pod("pull")
+        self.assertIn("0 file(s) new", out, "unchanged: not counted again")
+        out, rc = self.run_pod("down", "-y")
+        self.assertTrue(STATE["pods"]["fakepod1"]["deleted"], out)
+
     def test_whole_session_with_both_log_sources(self):
         """The live stream keeps its keepalives and never delivers READY; the pod's copy does."""
         self.whole_session()
