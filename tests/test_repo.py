@@ -178,6 +178,19 @@ class Repo(unittest.TestCase):
         beat = float(re.search(r'^BEAT = float\(os\.environ\.get\("AINVFX_BEAT", "(\d+)"\)\)', train, re.M).group(1))
         self.assertGreaterEqual(pod.RUN_STALE, 5 * beat, "a run is not called dead for one late mark")
 
+    def test_the_readme_names_every_option_of_train(self):
+        """Every option that train.py's commands take has its row in README's option tables, under « Options of a run »;
+        an option kept only to explain that it is gone (--prompts) has none."""
+        source = read("train.py")
+        options = set(re.findall(r'add_argument\((?:"-\w", )?"(--[\w-]+)"', source))
+        options |= set(re.findall(r'a == "(--[\w-]+)"', source))          # --then, read before argparse
+        gone = set(re.findall(r'add_argument\("(--[\w-]+)"[^\n]*argparse\.SUPPRESS', source))
+        part = README.split("\n### Options of a run\n", 1)[1].split("\n### ", 1)[0]
+        rows = set(re.findall(r"^\| `(--[\w-]+)", part, re.M))
+        self.assertTrue(options and gone == {"--prompts"}, (options, gone))
+        self.assertEqual(sorted(options - gone - rows), [], "options of train.py without a row in README")
+        self.assertEqual(sorted(rows - options), [], "rows of README for options train.py does not take")
+
     def test_bootstrap_sh_reads_a_share_link_as_pod_py_does(self):
         """A models list on Google Drive, Dropbox or GitHub: pod.py reads it to size the disk, then the pod downloads
         it. Both turn the share link into the same link to the file itself."""
