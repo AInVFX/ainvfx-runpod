@@ -575,6 +575,25 @@ class Units(unittest.TestCase):
         self.assertEqual(out.getvalue(), "[1/1] a.png\n  trg, The scene is lit.\n  the request to rewrite this caption "
                          "failed (text-only request refused): it is kept as first written\n")
         self.assertEqual(train.clean_caption(' "the scene ,  is lit" '), "the scene , is lit")
+        faulty = []
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):     # what the picture is, an absence: rewritten once
+            train.caption_files(todo, "trg", [], 40, ask=model("The image shows a rocket. No people are visible.",
+                                                                "A rocket stands on its pad."), faulty=faulty)
+        self.assertEqual(((folder / "a.txt").read_text(), faulty, len(calls)), ("trg, A rocket stands on its pad.\n", [], 2))
+        self.assertIn("Start with the main subject", calls[0][-1]["content"][-1]["text"])
+        self.assertIn("never what is absent", calls[0][-1]["content"][-1]["text"])
+        self.assertTrue(calls[0][-1]["content"][-1]["text"].endswith(" Maximum 40 words."))
+        asked = calls[1][-1]["content"][0]["text"]
+        self.assertTrue(asked.startswith("Rewrite this caption: start with its subject, never with what the picture is; "
+                                         "say only what is seen, never what is absent."), asked)
+        with contextlib.redirect_stdout(io.StringIO()):     # a model that keeps it: named
+            train.caption_files(todo, "trg", [], 40, ask=model("The image shows a rocket.", "This image shows a rocket."),
+                                faulty=faulty)
+        self.assertEqual(faulty, [(folder / "a.txt", ["it starts with « This image »"])])
+        self.assertEqual(train.caption_faults("A rocket stands on its pad. There is no movement and nothing else."),
+                         ["it says « There is no »"])
+        self.assertEqual(train.caption_faults("A rocket climbs into a clear sky, its exhaust bright."), [])
         self.assertEqual(train.avoided_in("Grainy scenes, a scenery", ["scene", "grain"]), ["scene"])
 
     @unittest.skipIf(importlib.util.find_spec("huggingface_hub") is None, "huggingface_hub is in the trainer's environment")
@@ -919,6 +938,7 @@ class Runs(unittest.TestCase):
                                  env={"FAKE_CAPTION": "stubborn"})
         self.assertEqual(rc, 0, out)
         self.assertIn("2 caption(s) still use a word of --avoid: {} (scene)".format(folder / "a.txt"), out)
+        self.assertNotIn("still start with", out, "a caption that breaks no other rule")
         self.assertEqual((folder / "a.txt").read_text(), "av, A rocket stands in the scene, framed from above.\n")
         log.unlink()
         out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--overwrite", env={"FAKE_CAPTION_LOG": str(log)})

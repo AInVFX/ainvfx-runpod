@@ -216,15 +216,23 @@ DATA = {
     "clip pairs": "targets/ (the result clips, with their captions) and control/ (the control clips, same names)",
     "mixed": "images/ (stills), clips/ (any length, with or without a sound track) and audio/ (sound files), each optional, every file with its caption",
 }
+# A caption starts with its subject and says only what is seen (and, for a clip with sound, what is heard): never
+# what is absent, and no word about the picture's own quality, grain, blur, colour cast, age or lens faults. For a
+# style LoRA those belong to the trigger word, which learns them from the pictures.
 CAPTION_PROMPTS = {
-    "image": "Describe this image in two sentences: subject, action, framing, lighting, setting. Present tense, "
-             "no opinions, no artistic style words.",
-    "video": "Describe this short video clip in two sentences: the subject and its action, the camera movement, the "
-             "framing, the lighting and the setting. Present tense, no opinions.",
-    "audio": "Describe this short video clip in three sentences: the subject and its action, the camera movement, the "
-             "framing, the lighting and the setting, then WHAT is heard (a voice, a radio, an ambience, a noise), "
-             "without describing how it sounds: no words about texture, quality, distortion or age of the sound. "
-             "Present tense, no opinions.",
+    "image": "Write a caption of this image for a training dataset: one or two short sentences, in the present tense. "
+             "Start with the main subject, then what it does and where it is. Say only what is seen, never what is "
+             "absent. Use no word about the picture itself: its quality, grain, blur, colour cast, age or lens faults. "
+             "No opinions.",
+    "video": "Write a caption of this video clip for a training dataset: one or two short sentences, in the present "
+             "tense. Start with the main subject and its action, then the camera's movement. Say only what is seen, "
+             "never what is absent. Use no word about the picture itself: its quality, grain, blur, colour cast, age "
+             "or lens faults. No opinions.",
+    "audio": "Write a caption of this video clip for a training dataset: two short sentences, in the present tense. "
+             "First the main subject, its action and the camera's movement; then WHAT is heard (a voice and its words, "
+             "a radio, an ambience, a noise), never how it sounds. Say only what is seen and heard, never what is "
+             "absent. Use no word about the picture or the sound themselves: their quality, grain, blur, colour cast, "
+             "distortion, age or lens faults. No opinions.",
     "edit": "You see two images. The first is the SOURCE, the second is the RESULT after an edit. Write the single "
             "instruction, in the imperative, one sentence, that turns the first image into the second: what to change "
             "(style, shading, colours, rendering, objects) and what to keep (subject, pose, framing). Do not describe "
@@ -234,8 +242,17 @@ CAPTION_PROMPTS = {
 # uses a word. No code deletes a word from a caption: a sentence without its word is no sentence.
 AVOID_RULE = ("You write captions for a training dataset, in complete sentences. Never use these words, in any form "
               "(singular, plural or any other): {}. Describe the picture with other words, or leave that detail out.")
-REWRITE = ("Rewrite this caption without the words {}, in any form. Keep every fact and complete sentences. Answer "
-           "with the caption only.\n\n{}")
+REWRITE = ("Rewrite this caption: {}. Keep every other fact, in complete sentences. Answer with the caption only."
+           "\n\n{}")
+# What a test can see of the caption rules: a caption that starts with what the picture is (« The image shows »), or
+# that states an absence (« No visible people », « There is no movement »).
+OPENING = re.compile(r"(?i)^(?:in |on )?(?:the|this|an?)\s+(?:image|picture|photo(?:graph)?|still|video|clip|footage|"
+                     r"frame|shot|scene\s+(?:shows|depicts|features|captures|presents))\b")
+ABSENCE = re.compile(r"(?i)\b(?:no|without(?: any)?)\s+(?:visible\s+|other\s+|discernible\s+|apparent\s+)?(?:people|"
+                     r"person|persons|one|humans?|figures?|movement|motion|action|activity|text|writing|sound|audio|life|"
+                     r"living|signs?|animals?|vehicles?|clouds?|stars?|objects?|details?)\b|\b(?:nothing|nobody|"
+                     r"no one|none)\b|\bnot\s+(?:visible|present|shown|seen|moving|occurring)\b|\bthere (?:is|are) no\b|"
+                     r"\babsen(?:t|ce)\b")
 STOP_WORDS = set("""a an the and or of in on at to with from by for is are was were be been this that these those it its
 as into over under near behind against while during their his her they them he she we you very soft hard light dark""".split())
 
@@ -1816,6 +1833,21 @@ def avoided_in(text, avoid):
     return [w for w in avoid if re.search(r"\b{}(?:e?s)?\b".format(re.escape(w)), text, re.I)]
 
 
+def caption_faults(text):
+    """The caption rules a caption breaks, of those a test can see: it starts with what the picture is, or it states
+    an absence."""
+    return (["it starts with « {} »".format(OPENING.match(text).group(0))] if OPENING.match(text) else []) + (
+        ["it says « {} »".format(ABSENCE.search(text).group(0))] if ABSENCE.search(text) else [])
+
+
+def rewrite_request(words, faults, text):
+    """The one request to rewrite a caption: what to change, then the caption."""
+    asks = (["use none of the words {}, in any form".format(", ".join(words))] if words else []) + (
+        ["start with its subject, never with what the picture is"] if any("starts with" in f for f in faults) else []) + (
+        ["say only what is seen, never what is absent"] if any("says" in f for f in faults) else [])
+    return REWRITE.format("; ".join(asks), text)
+
+
 def model_on_disk(repo, cache_dir=None):
     """True when Hugging Face's cache on this pod holds every weights file of the model."""
     try:
@@ -1896,10 +1928,12 @@ def word_report(files, trigger):
     say("A word in most captions that describes the style: add it to --avoid, then run again with --overwrite.")
 
 
-def caption_files(todo, trigger, avoid, max_words, ask=None):
+def caption_files(todo, trigger, avoid, max_words, ask=None, faulty=None):
     """Writes the caption of each file, and prints it whole under the file's name. With words to avoid, the model is
-    told never to use them; a caption that still uses one is rewritten once, and when it still does, or when that
-    request fails, it is written whole all the same. Returns those: [(caption file, [words])]."""
+    told never to use them. A caption that still uses one, or that breaks a caption rule a test can see
+    (caption_faults), is rewritten once; when it still does, or when that request fails, it is written whole all the
+    same. Returns those that keep a word: [(caption file, [words])]; those that still break a rule go into `faulty`,
+    a list, when one is given: [(caption file, [rules])]."""
     ask = ask or caption_model()
     rule = [{"role": "system", "content": [{"type": "text", "text": AVOID_RULE.format(", ".join(avoid))}]}] if avoid else []
     kept = []
@@ -1918,17 +1952,19 @@ def caption_files(todo, trigger, avoid, max_words, ask=None):
             content = [{"type": "image", "image": str(f), "max_pixels": 1024 * 1024}]
         prompt = CAPTION_PROMPTS[mode] + " Maximum {} words.".format(max_words)
         text = clean_caption(ask(rule + [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]))
-        words = avoided_in(text, avoid)
+        words, faults = avoided_in(text, avoid), caption_faults(text)
         failed = None
-        if words:                                         # once: a rewrite of the text alone, every fact kept
+        if words or faults:                               # once: a rewrite of the text alone, every other fact kept
             try:
                 text = clean_caption(ask(rule + [{"role": "user", "content": [
-                    {"type": "text", "text": REWRITE.format(", ".join(words), text)}]}])) or text
+                    {"type": "text", "text": rewrite_request(words, faults, text)}]}])) or text
             except Exception as e:                        # a request of its own: when it fails, the caption written
                 failed = (str(e).splitlines() or [type(e).__name__])[0][:120]   # from the picture stays, and is named
-            words = avoided_in(text, avoid)
+            words, faults = avoided_in(text, avoid), caption_faults(text)
             if words:
                 kept.append((f.with_suffix(".txt"), words))
+            if faults and faulty is not None:
+                faulty.append((f.with_suffix(".txt"), faults))
         caption = "{}, {}".format(trigger, text)
         f.with_suffix(".txt").write_text(caption + "\n", encoding="utf-8", newline="\n")
         say("[{}/{}] {}".format(k, len(todo), f.name))
@@ -1947,7 +1983,8 @@ def cmd_caption(argv):
                                                "describe the style. The caption model is told to write without them")
     p.add_argument("--overwrite", action="store_true", help="write every caption again")
     p.add_argument("--audio", action="store_true", help="clips: say also what is heard (the ltx_av recipe)")
-    p.add_argument("--max-words", type=int, default=60)
+    p.add_argument("--max-words", type=int, default=40, help="the most words a caption may have, the trigger word left "
+                                                             "out (40)")
     p.add_argument("--dry-run", action="store_true", help="list the files to caption, write nothing")
     a = p.parse_args(argv)
     if not re.fullmatch(r"[^\s,]+", a.trigger):
@@ -1957,7 +1994,7 @@ def cmd_caption(argv):
     seen = [t for t in targets if t["mode"] != "sound"]
     todo = [(t, f) for t in seen for f in t["files"] if a.overwrite or not caption_of(f)]
     unheard = [f for t in targets if t["mode"] == "sound" for f in t["files"] if not caption_of(f)]
-    kept = []
+    kept, faulty = [], []
     say("{} file(s), {} to caption{}".format(sum(len(t["files"]) for t in seen), len(todo),
                                               "" if a.overwrite else " (the captions already written are kept; "
                                                                      "--overwrite writes them again)"))
@@ -1967,7 +2004,7 @@ def cmd_caption(argv):
     elif todo:
         if active_job():
             say("A training run is in progress: captioning shares the GPU with it.")
-        kept = caption_files(todo, a.trigger, avoid, a.max_words)
+        kept = caption_files(todo, a.trigger, avoid, a.max_words, faulty=faulty)
     if unheard:
         say("{} sound file(s) without a caption. The caption model hears nothing, so write each yourself, in a .txt of "
             "the same name: the trigger word {}, then what is heard (a voice and its words, a place, a noise): {}".format(
@@ -1979,6 +2016,9 @@ def cmd_caption(argv):
     if kept:
         say("{} caption(s) still use a word of --avoid: {}. Edit each of them by hand before training.".format(
             len(kept), ", ".join("{} ({})".format(f, ", ".join(w)) for f, w in kept)))
+    if faulty:
+        say("{} caption(s) still start with what the picture is, or say what is absent: {}. Edit each of them by hand "
+            "before training.".format(len(faulty), ", ".join("{} ({})".format(f, "; ".join(r)) for f, r in faulty)))
     if not VIA:                                           # from a computer, pod.py downloads them and says where they are
         say("The captions are beside their files in {}. Read each one before training: the model makes mistakes, and a "
             "wrong word is learned like the others.".format(", ".join(
