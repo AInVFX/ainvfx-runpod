@@ -21,7 +21,7 @@ There are two ways to create a pod. Both give the same machine.
 | **Browser** | a Runpod account with credit | open the template's deploy page, pick a GPU, deploy, read the log until `READY` |
 | **Script** | the same, plus Python 3.8 or newer and Git | `python pod.py up image`, then `open`, `pull`, `down` |
 
-**No Runpod account yet?** Create it through [our referral link](https://www.runpod.io/?ref=iad0yzht), and sign up with Google. Once you add 10 USD of credit, Runpod adds a bonus to your account: 5 USD in Europe, elsewhere a random amount from 5 to 500 USD, most often 5. Runpod also gives AInVFX a small credit, a share of what you spend for six months, which pays for the pods this toolkit is tested on. It costs you nothing more, and it is a simple way to say thank you. The rules are on [Runpod's referral page](https://docs.runpod.io/accounts-billing/referrals).
+**No Runpod account yet?** Create it through [our referral link](https://www.runpod.io/?ref=iad0yzht), and sign up with Google. Once you add 10 USD of credit, Runpod adds a bonus to your account: 5 USD in Europe, elsewhere a random amount from 5 to 500 USD. Runpod also gives AInVFX a small credit, a share of what you spend for six months, which pays for the pods this toolkit is tested on. It costs you nothing more, and it is a simple way to say thank you. The rules are on [Runpod's referral page](https://docs.runpod.io/accounts-billing/referrals).
 
 ## Quick start, browser
 
