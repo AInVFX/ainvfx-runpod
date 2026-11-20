@@ -23,6 +23,9 @@ musubi-tuner commit that bootstrap.sh pins; `moss` follows the MOSS-Image guide 
 bootstrap.sh pins for it. README.md, "Training a LoRA", is the guide.
 """
 import argparse
+import codecs
+import collections
+import contextlib
 import json
 import math
 import os
@@ -978,9 +981,19 @@ def stage_commands(recipe, stage, values):
         args = with_rank(args, stage["rank"])
     if stage["start"]:
         args = set_flag(args, "--network_weights", stage["start"])
-    cmds.append(["training", [accelerate, "launch", "--num_cpu_threads_per_process", "1", "--mixed_precision", "bf16",
-                              scripts + r["script"]] + args])
+    if r.get("trainer") == "sd-scripts":
+        args.append("--console_log_simple")      # one line per log record, without colours (library/utils.py)
+    cmds.append(["training", [accelerate, "launch", "--num_cpu_threads_per_process", "1", "--num_processes", "1",
+                              "--num_machines", "1", "--dynamo_backend", "no", "--mixed_precision", "bf16",
+                              scripts + r["script"]] + args])      # the three values accelerate otherwise warns about
     return cmds
+
+
+def trainer_env():
+    """The environment of a trainer's commands. Python's SyntaxWarning, about the libraries' own source code, is
+    silenced: it is never about the run. Output is unbuffered, so train.log follows the run as it goes, in order."""
+    warnings = [w for w in os.environ.get("PYTHONWARNINGS", "").split(",") if w]
+    return dict(os.environ, PYTHONWARNINGS=",".join(warnings + ["ignore::SyntaxWarning"]), PYTHONUNBUFFERED="1")
 
 
 def publish(recipe, run, name, final=False):
@@ -1190,7 +1203,8 @@ def run_stage(recipe, st, i, n):
         for title, cmd in st["commands"]:
             note("{}: {}".format(title, " ".join(shlex.quote(a) for a in cmd)))
             t0 = last = time.time()
-            p = subprocess.Popen(cmd, cwd=st["cwd"], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+            p = subprocess.Popen(cmd, cwd=st["cwd"], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                 env=trainer_env())
             while p.poll() is None:
                 time.sleep(2)
                 if time.time() - last >= BEAT:
@@ -1212,10 +1226,16 @@ def run_stage(recipe, st, i, n):
     return 0
 
 
-def follow(proc=None, tail=None, then_down=False):
-    """Prints the run's log as it grows, stage after stage, until the run ends; returns its code. Ctrl+C stops the
+def follow(proc=None, tail=None, then_down=False, every=False):
+    """Prints the run's log as it grows, stage after stage, until the run ends; returns its code. On screen the log
+    is a view (LogView), the lines that matter; with every, each line as the trainer wrote it. Ctrl+C stops the
     printing only: the run goes on in the background. With then_down, a run that ends well names `down` next."""
-    stage, pos = None, None
+    stage, pos, view, text = None, None, None, None
+
+    def show(out):
+        if out:
+            sys.stdout.write(out)
+            sys.stdout.flush()
     try:
         while True:
             job = read_job()
@@ -1226,6 +1246,8 @@ def follow(proc=None, tail=None, then_down=False):
             log = Path(job["stages"][stage]["run"]) / "train.log"
             if pos is None:
                 pos = max(0, log.stat().st_size - tail) if tail and log.exists() else 0
+            if text is None:
+                view, text = (None if every else LogView()), codecs.getincrementaldecoder("utf-8")("replace")
             chunk = b""
             if log.exists():
                 with open(log, "rb") as f:
@@ -1233,13 +1255,16 @@ def follow(proc=None, tail=None, then_down=False):
                     chunk = f.read()
                 pos += len(chunk)
             if chunk:
-                sys.stdout.write(chunk.decode("utf-8", "replace"))
-                sys.stdout.flush()
+                show(text.decode(chunk) if view is None else view.feed(text.decode(chunk)))
                 continue
+            if view is not None:
+                show(view.flush())
             if stage < current:                                  # the next stage has started: its own log
-                stage, pos = stage + 1, 0
+                show(view.flush(final=True) if view is not None else "")
+                stage, pos, text = stage + 1, 0, None
                 continue
             if job.get("state") not in ACTIVE:
+                show(view.flush(final=True) if view is not None else "")
                 return report_end(job, then_down)
             gone = proc.poll() is not None if proc else bool(job.get("pid")) and not alive(job["pid"])
             late = job.get("state") == "starting" and not job.get("pid") and time.time() - job.get("created", 0) > 60
@@ -1270,19 +1295,246 @@ def report_end(job, then_down=False):
         say("\nThe run was stopped. Its checkpoints stay in {}; `--from <checkpoint> --steps N` continues from one of "
             "them.".format(last["run"]))
     else:
-        say("\nThe run FAILED at {} (code {}): the lines above say why. Its log: {}".format(
-            last["name"], job.get("rc"), Path(last["run"]) / "train.log"))
+        say("\nThe run FAILED at {} (code {}): the lines above say why. Its log: {}; `train log --all` shows every line "
+            "of it.".format(last["name"], job.get("rc"), Path(last["run"]) / "train.log"))
     return job.get("rc") or 1
+
+
+# ----------------------------------------------------------------------------- the run's log on screen
+# The trainers print everything: each step twice, a log record wrapped over several lines, every request to Hugging
+# Face, a progress bar for each sample. On screen a run shows a view of its log: every [AINVFX] line, the caches and
+# their length, the steps with their loss at a calm rate, one line for each round of samples and each checkpoint, and
+# every warning and error, each once. A traceback shows whole, after the hidden lines before it; so do the hidden
+# lines before a FAILED line. train.log keeps every line, and `train log --all` prints it as written.
+VIEW_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]")
+VIEW_RICH = re.compile(r"^(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d| {19}) (DEBUG|INFO|WARNING|ERROR|CRITICAL) +(.*)$")
+VIEW_RICH_MORE = re.compile(r"^ {21,}(\S.*)$")      # the next line of a record that the rich library wraps
+VIEW_RECORD = re.compile(r"^\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL):[\w.]+:(.*)$")   # Python's own logging format
+VIEW_BAR = re.compile(r"^(?P<bar>[^|\r\n]{0,90}?\d+%\|[^|]*\|\s*\d+/\d+ \[[^\]]*\]|[^|\r\n]{0,90}?\b\d+it \[[^\]]*\])"
+                      r"(?P<rest>.*)$")
+VIEW_STEPS = re.compile(r"^steps:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+) \[(?:(\d+):)?(\d+):(\d\d)")
+VIEW_DONE = re.compile(r"\|\s*(\d+)/(\d+) \[")
+VIEW_SAMPLES = re.compile(r"(?i)^generating sample images at step\b\D*(\d+)$")
+VIEW_CACHE = re.compile(r"(?i)^(caching .*\.\.\.|encoding dataset \[\d+\])$")
+VIEW_PYWARN = re.compile(r"^\S.*?:\d+: (\w+Warning): ")    # Python's warnings: <file>:<line>: <Category>: <text>
+VIEW_WORDS = re.compile(r"(?i)\b(errors?|exception|traceback|warnings?|fail|failed|failure|fatal|cannot|can't|could not|"
+                        r"unable|not found|out of memory|killed|abort(ed)?|nan)\b")
+VIEW_NOISE = re.compile(r"HTTP Request: |SyntaxWarning: invalid escape sequence|^The following values were not passed "
+                        r"to `accelerate launch`|^\s*`--\w+` was set to a value of|^To avoid this warning pass in values")
+VIEW_STEP_LINES = 15      # about this many lines of steps a run
+VIEW_QUIET = 600          # and one at least every 10 minutes of training
+VIEW_BEFORE = 15          # the hidden lines shown before a traceback or a FAILED line
+
+
+class LogView:
+    """The view of a run's log: feed(text) takes the log as it comes, in pieces of any size, and returns the lines to
+    show; flush() shows what waits for the next line (the step held back, an open record) once nothing more comes,
+    and flush(final=True) what waits for the end of the stage (a cache's last count). Python's logging format
+    (musubi-tuner) and the rich library's wrapped records (sd-scripts without --console_log_simple) are read as
+    records: an INFO record shows only when it marks samples, a checkpoint, a cache or the end; a WARNING, an ERROR
+    or a CRITICAL always shows, with its level. A line without a level shows when it says a warning or an error."""
+    NICE = (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000)
+
+    def __init__(self):
+        self.part, self.out, self.seen = "", [], set()
+        self.hidden = collections.deque(maxlen=VIEW_BEFORE)
+        self.record = None            # [level, text] of a wrapped record still open
+        self.held = None              # (step, line) of a step to show, held for the same step with its new loss
+        self.last_step, self.next_step, self.every, self.last_time, self.clock = -1, 0, None, 0, 0
+        self.cache, self.cache_bar = None, None
+        self.in_traceback, self.after_warning = False, False
+
+    @classmethod
+    def lines_of(cls, text):
+        """The view of a whole log, as a list of lines."""
+        view = cls()
+        return (view.feed(text) + view.flush(final=True)).splitlines()
+
+    def feed(self, text):
+        pieces = re.split(r"\r\n|\r|\n", self.part + text)
+        self.part = pieces.pop()
+        for piece in pieces:
+            self.piece(piece)
+        return self.take()
+
+    def flush(self, final=False):
+        if final and self.part:
+            self.piece(self.part)
+            self.part = ""
+        self.close_record()
+        self.emit_held()
+        if final:
+            self.end_cache()
+        return self.take()
+
+    def take(self):
+        out, self.out = self.out, []
+        return "".join(line + "\n" for line in out)
+
+    def show(self, line):
+        self.emit_held()
+        self.hidden.clear()
+        self.out.append(line)
+        self.last_time = self.clock
+
+    def hide(self, line):
+        if line.strip():
+            self.hidden.append(line)
+
+    def show_once(self, line):
+        key = re.sub(r"\d+", "#", line)
+        if key not in self.seen:
+            self.seen.add(key)
+            self.show(line)
+
+    def show_hidden(self):
+        lines = list(self.hidden)
+        self.emit_held()
+        self.out.extend(lines)
+        self.hidden.clear()
+
+    def emit_held(self):
+        if self.held:
+            step, line = self.held
+            self.held = None
+            self.out.append(line)
+            self.hidden.clear()
+            self.last_step = step
+
+    def piece(self, raw):
+        line = VIEW_ANSI.sub("", raw).rstrip()
+        if self.in_traceback:
+            return self.traceback_line(line)
+        if self.record and (VIEW_RICH_MORE.match(line) and not VIEW_RICH.match(line)):
+            more, text = line.strip(), self.record[1]
+            self.record[1] += ("" if text and ord(text[-1]) > 0x2E7F and ord(more[0]) > 0x2E7F else " ") + more
+            return
+        self.close_record()
+        bar = VIEW_BAR.match(line)
+        if not bar and self.cache_bar and not VIEW_DONE.search(self.cache_bar):
+            self.end_cache()                      # a count without a total ends with the next line
+        if bar:
+            self.progress(bar.group("bar").strip())
+            if bar.group("rest").strip():
+                self.piece(bar.group("rest"))
+            return
+        rich = VIEW_RICH.match(line)
+        if rich:
+            self.record = [rich.group(1), re.sub(r"\s{2,}[\w./:-]*$", "", rich.group(2).rstrip())]
+            return
+        record = VIEW_RECORD.match(line)
+        if record:
+            return self.record_line(record.group(1), record.group(2).strip(), line)
+        self.plain(line)
+
+    def close_record(self):
+        if self.record:
+            level, text = self.record
+            self.record = None
+            self.record_line(level, text, "{} {}".format(level, text))
+
+    def record_line(self, level, text, raw):
+        if level in ("WARNING", "ERROR", "CRITICAL") and not VIEW_NOISE.search(text):
+            return self.show_once("{}: {}".format(level, text))
+        self.marked(text) or self.hide(raw)
+
+    def marked(self, text):
+        """True when the line marks what the view shows: samples, a checkpoint, a cache, the end of the training."""
+        samples = VIEW_SAMPLES.match(text)
+        if samples:
+            self.show("Generating sample images at step {}".format(samples.group(1)))
+        elif text.startswith("saving checkpoint: ") or text == "model saved.":
+            self.show(text)
+        elif VIEW_CACHE.match(text):
+            self.end_cache()
+            self.cache, self.cache_bar = text, None
+        else:
+            return False
+        return True
+
+    def plain(self, line):
+        if not line.strip():
+            return
+        if line.startswith("Traceback (most recent call last)"):
+            self.show_hidden()
+            self.in_traceback = True
+            return self.out.append(line)
+        if line.startswith("[AINVFX]"):
+            self.end_cache()
+            if " FAILED" in line:
+                self.show_hidden()
+            return self.show(line)
+        if self.after_warning and line[:1].isspace():         # the source line Python prints under a warning
+            self.after_warning = False
+            return self.hide(line)
+        self.after_warning = False
+        if VIEW_NOISE.search(line):
+            return self.hide(line)
+        if VIEW_PYWARN.match(line):
+            self.after_warning = True
+            return self.show_once(line)
+        if self.marked(line.strip()):
+            return
+        if VIEW_WORDS.search(line):
+            return self.show_once(line)
+        self.hide(line)
+
+    def traceback_line(self, line):
+        """Every line of a traceback shows, up to the line that names the exception."""
+        self.out.append(line)
+        top = line.strip()
+        if top and not line[:1].isspace() and not top.startswith(("Traceback", "During handling",
+                                                                   "The above exception")):
+            self.in_traceback = False
+
+    def progress(self, bar):
+        steps = VIEW_STEPS.match(bar)
+        if steps:
+            return self.step(bar, steps)
+        if self.cache:
+            self.cache_bar = bar
+            done = VIEW_DONE.search(bar)
+            if done and done.group(1) == done.group(2):
+                self.end_cache()
+            return
+        self.hide(bar)
+
+    def end_cache(self):
+        if self.cache and self.cache_bar:
+            self.show("{}  {}".format(self.cache, self.cache_bar))
+        self.cache, self.cache_bar = None, None
+
+    def step(self, bar, m):
+        step, total = int(m.group(1)), int(m.group(2))
+        seconds = self.clock = int(m.group(3) or 0) * 3600 + int(m.group(4)) * 60 + int(m.group(5))
+        if self.held and self.held[0] == step:
+            if "avr_loss=" in bar:
+                self.held = (step, bar)               # the same step again, with its new loss
+            return
+        self.emit_held()
+        if "avr_loss=" not in bar or step <= self.last_step:
+            return self.hide(bar)
+        if self.every is None:
+            self.every = next((n for n in self.NICE if n * VIEW_STEP_LINES >= total), self.NICE[-1])
+        if self.last_step < 0 or step >= self.next_step or step == total or seconds - self.last_time >= VIEW_QUIET:
+            self.held = (step, bar)
+            self.next_step = (step // self.every + 1) * self.every
+            self.last_time = seconds
+        else:
+            self.hide(bar)
 
 
 # ----------------------------------------------------------------------------- the other commands
 def cmd_log(argv):
-    argparse.ArgumentParser(prog="train log", description="Follows the log of the run in progress, or prints the end "
-                                                          "of the last one.").parse_args(argv)
+    p = argparse.ArgumentParser(prog="train log", description="Follows the log of the run in progress, or shows the "
+                                "last one: the lines that matter. train.log keeps every line.")
+    p.add_argument("--all", action="store_true", help="every line of the log as the trainer wrote it, from its last "
+                                                      "lines on")
+    a = p.parse_args(argv)
     if not read_job():
         say("No run on this pod yet. `train recipes` lists the recipes.")
         return 0
-    return follow(tail=6000, then_down=True)
+    return follow(tail=6000 if a.all else None, then_down=True, every=a.all)
 
 
 def cmd_status(argv):
@@ -1301,8 +1553,7 @@ def cmd_status(argv):
             st["name"], job["recipe"], job.get("stage", 0) + 1, len(job["stages"]), state, duration(since)))
         log = Path(st["run"]) / "train.log"
         if log.exists():
-            lines = [line.rsplit("\r", 1)[-1] for line in log.read_text(encoding="utf-8", errors="replace").splitlines()]
-            for line in [x for x in lines if x.strip()][-6:]:
+            for line in LogView.lines_of(log.read_text(encoding="utf-8", errors="replace"))[-6:]:
                 say("  " + line[:200])
         weights = sorted(Path(st["run"]).glob("*.safetensors"))
         say("checkpoints: " + (", ".join(f.name for f in weights[-4:]) if weights else "none yet (one every {} steps)".format(
@@ -1438,15 +1689,47 @@ def model_on_disk(repo, cache_dir=None):
         return False
 
 
+DOC_CHECK = re.compile(r"^\[ERROR\] `[^`]+` is part of .+, but not documented\. Make sure to add it to the docstring of "
+                       r"the function in .+\.$")
+
+
+class DropDocCheck:
+    """sys.stdout while the caption model loads. transformers' documentation check (utils/auto_docstring.py) prints a
+    line for each parameter that a class's docstring lacks, "[ERROR] `min_frames` is part of ..., but not
+    documented. ...": a note for the library's developers. Exactly those lines are dropped; every other line passes."""
+    def __init__(self, out):
+        self.out, self.part = out, ""
+
+    def write(self, text):
+        lines = (self.part + text).split("\n")
+        self.part = lines.pop()
+        for line in lines:
+            if not DOC_CHECK.match(line):
+                self.out.write(line + "\n")
+        return len(text)
+
+    def flush(self):
+        self.out.flush()
+
+    def close(self):
+        if self.part and not DOC_CHECK.match(self.part):
+            self.out.write(self.part)
+        self.part = ""
+        self.out.flush()
+
+
 def caption_model():
     """The caption model, loaded once. Returns ask(messages), which gives the text the model writes for a chat: the one
     place where the model is called, so that a test can give a stand-in."""
-    import torch                                          # the trainer's environment holds these
-    from qwen_vl_utils import process_vision_info
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     say("loading {}{}".format(CAPTION_MODEL, "" if model_on_disk(CAPTION_MODEL) else " (17.6 GB, downloaded this time)"))
-    model = Qwen3VLForConditionalGeneration.from_pretrained(CAPTION_MODEL, dtype=torch.bfloat16, device_map="cuda")
-    processor = AutoProcessor.from_pretrained(CAPTION_MODEL)
+    quiet = DropDocCheck(sys.stdout)
+    with contextlib.redirect_stdout(quiet):
+        import torch                                      # the trainer's environment holds these
+        from qwen_vl_utils import process_vision_info
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        model = Qwen3VLForConditionalGeneration.from_pretrained(CAPTION_MODEL, dtype=torch.bfloat16, device_map="cuda")
+        processor = AutoProcessor.from_pretrained(CAPTION_MODEL)
+    quiet.close()
 
     def ask(messages):
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

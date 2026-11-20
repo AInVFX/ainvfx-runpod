@@ -9,7 +9,7 @@ whose `accelerate` runs the script it is given, fake musubi-tuner and sd-scripts
 write (checkpoints, ComfyUI copies, their arguments), the course's models.json with dummy base files, and datasets.
 `Units` tests the pure functions; `Runs` runs the real commands through subprocess, as on the pod.
 """
-import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import contextlib, gzip, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -105,6 +105,11 @@ class _Out:
 class AutoProcessor:
     @classmethod
     def from_pretrained(cls, name):
+        print("[ERROR] `min_frames` is part of Qwen3VLVideoProcessorInitKwargs, but not documented. Make sure to add it "
+              "to the docstring of the function in /x/video_processing_qwen3_vl.py.\\n[ERROR] `max_frames` is part of "
+              "Qwen3VLVideoProcessorInitKwargs, but not documented. Make sure to add it to the docstring of the "
+              "function in /x/video_processing_qwen3_vl.py.")
+        print("the stand-in processor is ready")
         return cls()
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
@@ -156,6 +161,7 @@ if os.environ.get("FAKE_FAIL"):
     print("the fake trainer fails on purpose")
     sys.exit(3)
 out, name = val("--output_dir"), val("--output_name")
+print("environment:", os.environ.get("PYTHONWARNINGS"), os.environ.get("PYTHONUNBUFFERED"))
 with open(os.path.join(out, "args.json"), "w") as f:
     json.dump(a, f)
 for w in (name + "-step00000250.safetensors", name + ".safetensors"):
@@ -573,6 +579,78 @@ class Units(unittest.TestCase):
         (snap / "m-2.safetensors").write_bytes(b"x")
         self.assertTrue(train.model_on_disk(train.CAPTION_MODEL, cache_dir=str(cache)))
 
+    def test_the_view_of_two_real_run_logs(self):
+        """The whole logs of a moss run (sd-scripts, its records wrapped by the rich library) and of an ltx_mix run
+        (musubi-tuner), 5,635 and 6,252 lines: the view keeps every [AINVFX] line, the caches, the steps every 100 with
+        their loss, each round of samples and each checkpoint, every warning once, and the end. Fed in pieces of any
+        size, it shows the same lines."""
+        for name, rounds, most in (("moss_run.log.gz", 7, 45), ("ltx_mix_run.log.gz", 8, 60)):
+            with gzip.open(HERE / "logs" / name, "rt", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            view = train.LogView.lines_of(text)
+            self.assertLessEqual(len(view), most, "\n".join(view))
+            self.assertEqual([l for l in view if l.startswith("[AINVFX]")],
+                             [l.rstrip() for l in text.splitlines() if l.startswith("[AINVFX]")])
+            saved = [l for l in view if l.startswith("saving checkpoint: ")]
+            self.assertEqual([l.rsplit("-step", 1)[-1] for l in saved[:-1]],
+                             ["{:08d}.safetensors".format(n) for n in range(250, 1501, 250)], name)
+            self.assertFalse("-step" in saved[-1], "the final file")
+            samples = [l for l in view if l.startswith("Generating sample images at step ")]
+            self.assertEqual(len(samples), rounds, name)
+            self.assertEqual(samples[:7], ["Generating sample images at step {}".format(n) for n in range(0, 1501, 250)])
+            steps = [int(l.split("/1500")[0].rsplit(" ", 1)[-1]) for l in view if l.startswith("steps:")]
+            self.assertTrue(set(range(100, 1501, 100)) <= set(steps) and steps[0] == 1, steps)
+            self.assertTrue(all("avr_loss=" in l for l in view if l.startswith("steps:")))
+            self.assertEqual(view[-3], "model saved.")
+            self.assertTrue(view[-2].startswith("[AINVFX] training done in ") and view[-1].startswith("[AINVFX] DONE · "))
+            for gone in ("HTTP Request", "epoch is incremented", "SyntaxWarning", "To avoid this warning", "prompt:",
+                         "Denoising", "[BLOCK_SWAP]", "Conversion complete"):
+                self.assertFalse([l for l in view if gone in l], gone)
+            self.assertEqual(len(set(view)), len(view) - (1 if rounds == 8 else 0), "each line once, but the second render")
+            pieces, chunks, at = train.LogView(), [], 0
+            while at < len(text):
+                chunks.append(pieces.feed(text[at:at + 997]))
+                at += 997
+            self.assertEqual(("".join(chunks) + pieces.flush(final=True)).splitlines(), view)
+        moss = train.LogView.lines_of(gzip.open(HERE / "logs" / "moss_run.log.gz", "rt", encoding="utf-8").read())
+        self.assertIn("caching latents...  100%|██████████| 20/20 [00:05<00:00,  3.44it/s]", moss)
+        self.assertIn("WARNING: no regularization images / 正則化画像が見つかりませんでした", moss)
+
+    def test_the_view_of_a_run_as_it_comes(self):
+        """A log as the trainers write it on a pod: a progress bar updated after a carriage return, a record glued to the
+        bar it follows, Hugging Face's requests, a Python warning and the line of code under it, then a traceback.
+        The steps show every 20 of 250 with their new loss; a warning shows once; the traceback shows whole, after the
+        hidden line before it; the hidden lines before FAILED show too."""
+        log = ["[AINVFX] r1 · recipe moss · stage 1 of 1\n", "HTTP Request: HEAD https://huggingface.co/x \"HTTP/1.1 404 Not "
+               "Found\"\n", "caching latents...\n", "\r  0%|          | 0/20 [00:00<?, ?it/s]",
+               "\r100%|##########| 20/20 [00:05<00:00,  3.44it/s]\n", "epoch is incremented. current_epoch: 0, epoch: 1\n"]
+        for n in range(1, 251):
+            bar = "steps: {:3d}%|#  | {}/250 [00:{:02d}<00:10,  1.4it/s".format(n * 100 // 250, n, n % 60)
+            log += ["\r" + bar + ", avr_loss=0.{}]".format(n - 1), "\r" + bar + ", avr_loss=0.{}]".format(n)]
+            if n == 250:
+                log.append("Generating sample images at step 250\nsaving checkpoint: /w/r1-step00000250.safetensors\n")
+        log += ["\n/w/y.py:3: UserWarning: a library warns\n  warnings.warn(\n"] * 2
+        log += ["the last line before the failure\n", "Traceback (most recent call last):\n", '  File "t.py", line 1\n',
+                "    boom()\n", "RuntimeError: CUDA out of memory\n", "a line after it\n",
+                "[AINVFX] FAILED · training ended with code 1 after 3 s: the lines above say why\n"]
+        view = train.LogView.lines_of("".join(log))
+        steps = [int(l.split("/250")[0].rsplit(" ", 1)[-1]) for l in view if l.startswith("steps:")]
+        self.assertEqual(steps, [1] + list(range(20, 241, 20)) + [250])
+        self.assertIn("steps: 100%|#  | 250/250 [00:10<00:10,  1.4it/s, avr_loss=0.250]", view, "the loss after the step")
+        at = view.index("Generating sample images at step 250")
+        self.assertEqual(view[at - 1:at + 2], ["steps: 100%|#  | 250/250 [00:10<00:10,  1.4it/s, avr_loss=0.250]",
+                                               "Generating sample images at step 250",
+                                               "saving checkpoint: /w/r1-step00000250.safetensors"])
+        self.assertEqual(view[1], "caching latents...  100%|##########| 20/20 [00:05<00:00,  3.44it/s]")
+        self.assertEqual(sum("UserWarning" in l for l in view), 1)
+        self.assertEqual(view[-7:], ["the last line before the failure", "Traceback (most recent call last):",
+                                     '  File "t.py", line 1', "    boom()", "RuntimeError: CUDA out of memory",
+                                     "a line after it", "[AINVFX] FAILED · training ended with code 1 after 3 s: the "
+                                     "lines above say why"])
+        self.assertFalse([l for l in view if "HTTP" in l or "epoch is" in l or "warnings.warn" in l])
+        pieces = train.LogView()
+        self.assertEqual(("".join(pieces.feed(c) for c in log) + pieces.flush(final=True)).splitlines(), view)
+
     def test_the_caption_prompt_of_each_kind(self):
         """A mixed folder: a still as an image, a clip with a sound track with what is heard, a silent clip with what is
         seen; sound files get no prompt."""
@@ -615,8 +693,18 @@ class Runs(unittest.TestCase):
         out, rc = self.run_train("zimage", "z1", "--dataset", "chars")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("a run named z1 exists", out)
+        self.assertNotIn("--console_log_simple", args, "an option of sd-scripts only")
+        log = (run / "train.log").read_text()
+        self.assertIn("launch --num_cpu_threads_per_process 1 --num_processes 1 --num_machines 1 --dynamo_backend no ", log)
+        self.assertIn("environment: ignore::SyntaxWarning 1", log, "the trainer's Python hides SyntaxWarning")
+        self.assertNotIn("environment:", out, "a line of the trainer that matters to no one: in train.log only")
         out, rc = self.run_train("status")
         self.assertIn("z1 · recipe zimage · stage 1 of 1 · done", out)
+        out, rc = self.run_train("log")
+        self.assertNotIn("environment:", out)
+        self.assertIn("[AINVFX] DONE · ", out)
+        out, rc = self.run_train("log", "--all")
+        self.assertIn("environment: ignore::SyntaxWarning 1", out, "--all: every line")
 
     def test_a_chain_of_two_stages(self):
         """The second stage starts from the first one's final weights, with its own steps and learning rate; the
@@ -636,6 +724,7 @@ class Runs(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         run = train.RUNS / "m1"
         args = json.loads((run / "args.json").read_text())
+        self.assertIn("--console_log_simple", args, "sd-scripts writes one line per record")
         self.assertTrue(train.arg_value(args, "--pretrained_model_name_or_path").endswith("moss_image_base_bf16.safetensors"))
         self.assertIn("[[datasets.subsets]]", (run / "dataset.toml").read_text())
         self.assertTrue((train.LORAS / "m1" / "m1.safetensors").is_symlink(), "sd-scripts' LoRA loads in ComfyUI as it is")
@@ -715,6 +804,8 @@ class Runs(unittest.TestCase):
         out, rc = self.run_train("caption", "avoid2", "--trigger", "av", "--avoid", "scene",
                                  env={"FAKE_CAPTION_LOG": str(log)})
         self.assertEqual(rc, 0, out)
+        self.assertIn("the stand-in processor is ready", out)
+        self.assertNotIn("[ERROR]", out, "transformers' documentation check, and nothing else, is dropped")
         self.assertIn("[1/2] a.png\n  av, A rocket stands in the crater, framed from above.\n", out)
         self.assertEqual((folder / "b.txt").read_text(), "av, A rocket stands in the crater, framed from above.\n")
         chats = [json.loads(line) for line in log.read_text().splitlines()]
