@@ -1109,13 +1109,14 @@ def sample_picture(path):
         return frames[len(frames) // 2].to_image().convert("RGB")
 
 
-def make_sheet(run, name):
+def make_sheet(run, name, settle=SHEET_SETTLE):
     """Writes sample_sheet.jpg in the run's folder, from the samples there; returns (prompts, steps), or None when
-    there is no sample yet. A sample that cannot be read leaves its cell empty."""
+    there is no sample yet. A sample written in the last `settle` seconds waits; one that cannot be read leaves its
+    cell empty."""
     from PIL import Image, ImageDraw, ImageFont
     folder = run / "sample"
     now = time.time()
-    files = [f for f in folder.iterdir() if f.is_file() and now - f.stat().st_mtime >= SHEET_SETTLE] if folder.is_dir() else []
+    files = [f for f in folder.iterdir() if f.is_file() and now - f.stat().st_mtime >= settle] if folder.is_dir() else []
     grid = sample_grid(f.name for f in files)
     if not grid:
         return None
@@ -1169,7 +1170,7 @@ def sample_sheet(run, name, state, note, final=False):
         return
     state["seen"] = seen
     try:
-        made = make_sheet(run, name)
+        made = make_sheet(run, name, 0 if final else SHEET_SETTLE)    # at the end, the trainer has closed every file
     except Exception as e:
         why = (str(e).splitlines() or [type(e).__name__])[0][:200]
         if state.get("why") != why:

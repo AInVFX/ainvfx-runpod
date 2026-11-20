@@ -754,6 +754,9 @@ class Units(unittest.TestCase):
         self.assertIn("sample sheet: {} · 3 prompt(s) · steps 0 to 250".format(run / train.SHEET), notes[0])
         train.sample_sheet(run, "r", state, notes.append)
         self.assertEqual(len(notes), 1, "nothing changed: no new sheet, no new line")
+        train.sample_sheet(run, "r", state, notes.append, final=True)
+        self.assertEqual(Image.open(run / train.SHEET).size[0], 3 * 320 + 2 * 8, "at the end, every sample, the last too")
+        self.assertIn("steps 0 to 500", notes[-1])
         video = TMP / "sheet_video"
         for step in (0, 250):
             clip(video / "sample" / "v_{}_00_20261118163018_42.mp4".format("e000000" if not step else "000250"), 65)
@@ -763,7 +766,7 @@ class Units(unittest.TestCase):
         self.assertEqual(Image.open(video / train.SHEET).convert("RGB").getpixel((160, 48 + 90))[0], 32,
                          "the middle frame of 65: frame 32")
         real = train.make_sheet
-        train.make_sheet = lambda run, name: (_ for _ in ()).throw(RuntimeError("cannot read the samples\nmore"))
+        train.make_sheet = lambda run, name, settle: (_ for _ in ()).throw(RuntimeError("cannot read the samples\nmore"))
         try:
             lines, state = [], {}
             train.sample_sheet(video, "v", state, lines.append)
